@@ -1,0 +1,88 @@
+{
+  "name": "media-processing",
+  "version": "0.1.0",
+  "description": "WebCodecs-compatible media API for Node.js - encode, decode, mux, demux with zero native bindings. Backed by FFmpeg child processes.",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./index.js",
+  "exports": {
+    ".": {
+      "import": "./index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist/",
+    "index.js",
+    "src/",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "esbuild index.js --bundle --platform=node --format=cjs --outfile=dist/index.cjs --sourcemap --external:ffmpeg-static --external:@ffmpeg-installer/ffmpeg",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "media",
+    "webcodecs",
+    "ffmpeg",
+    "video",
+    "audio",
+    "encoder",
+    "decoder",
+    "codec",
+    "muxer",
+    "demuxer",
+    "vp8",
+    "vp9",
+    "av1",
+    "h264",
+    "h265",
+    "hevc",
+    "opus",
+    "aac",
+    "mp3",
+    "flac",
+    "camera",
+    "capture",
+    "mediastream",
+    "webrtc",
+    "mediarecorder",
+    "screen-capture",
+    "getdisplaymedia",
+    "track-processor",
+    "insertable-streams",
+    "polyfill",
+    "svc",
+    "temporal-layers",
+    "rtp",
+    "realtime"
+  ],
+  "author": {
+    "name": "colocohen"
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/colocohen/media-processing.git"
+  },
+  "bugs": {
+    "url": "https://github.com/colocohen/media-processing/issues"
+  },
+  "homepage": "https://github.com/colocohen/media-processing#readme",
+  "funding": [
+    {
+      "type": "github",
+      "url": "https://github.com/sponsors/colocohen"
+    }
+  ],
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "optionalDependencies": {
+    "ffmpeg-static": "^5.0.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.2"
+  }
+}
