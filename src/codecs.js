@@ -313,12 +313,95 @@ var ENCODER_ARGS = {
 // Codec metadata
 // ═══════════════════════════════════════════
 
+// MP-6: video codec metadata now carries profile/level capabilities,
+// enabling RTCRtpSender.getCapabilities() to report a complete
+// {codec, profile, level} matrix per W3C webrtc-pc §5.2.7. The
+// previous getSupportedVideoCodecs() returned just names, forcing
+// callers in webrtc-server to either hardcode profiles or skip the
+// fmtp negotiation step.
+//
+// Profile lists below reflect what FFmpeg's encoders can produce
+// AND what major browsers commonly negotiate. Levels are conservative
+// — listing the highest commonly-supported level for each profile.
+// SDP fmtp strings use buildCodecString conventions (codec_strings.js).
 var VIDEO_CODEC_META = {
-  vp8:  { pixFmt: 'yuv420p', fourcc: 'VP80' },
-  vp9:  { pixFmt: 'yuv420p', fourcc: 'VP90' },
-  av1:  { pixFmt: 'yuv420p', fourcc: 'AV01' },
-  h264: { pixFmt: 'yuv420p' },
-  h265: { pixFmt: 'yuv420p' },
+  vp8: {
+    pixFmt: 'yuv420p',
+    fourcc: 'VP80',
+    profiles: [
+      // VP8 has no formal profile/level — single profile, no level.
+      // Use empty profile string per common SDP convention.
+      { profile: '', level: '', codecString: 'vp8' },
+    ],
+  },
+  vp9: {
+    pixFmt: 'yuv420p',
+    fourcc: 'VP90',
+    profiles: [
+      // VP9 profiles 0 (8-bit 4:2:0), 2 (10/12-bit 4:2:0).
+      // Level 1 = 240p; Level 4 = 1080p; Level 5 = 4k. We list the
+      // common WebRTC ones.
+      { profile: '0', level: '4.1', codecString: 'vp09.00.41.08' },
+      { profile: '0', level: '5.0', codecString: 'vp09.00.50.08' },
+      { profile: '2', level: '4.1', codecString: 'vp09.02.41.10', bitDepth: 10 },
+    ],
+  },
+  av1: {
+    pixFmt: 'yuv420p',
+    fourcc: 'AV01',
+    profiles: [
+      { profile: 'main', level: '4.0', codecString: 'av01.0.08M.08' },
+      { profile: 'main', level: '5.0', codecString: 'av01.0.12M.08' },
+      { profile: 'high', level: '4.0', codecString: 'av01.1.08M.08' },
+    ],
+  },
+  h264: {
+    pixFmt: 'yuv420p',
+    profiles: [
+      // Constrained Baseline — Chrome WebRTC default. CBP at 3.1
+      // covers up to 720p30. Level 4.0 covers 1080p30.
+      { profile: 'constrained-baseline', level: '3.1', codecString: 'avc1.42E01F' },
+      { profile: 'constrained-baseline', level: '4.0', codecString: 'avc1.42E028' },
+      { profile: 'baseline',             level: '3.1', codecString: 'avc1.42001F' },
+      { profile: 'main',                 level: '3.1', codecString: 'avc1.4D001F' },
+      { profile: 'main',                 level: '4.0', codecString: 'avc1.4D0028' },
+      { profile: 'high',                 level: '4.0', codecString: 'avc1.640028' },
+      { profile: 'high',                 level: '4.2', codecString: 'avc1.64002A' },
+    ],
+  },
+  h265: {
+    pixFmt: 'yuv420p',
+    profiles: [
+      { profile: 'main',   level: '3.1', codecString: 'hev1.1.6.L93.B0' },
+      { profile: 'main',   level: '4.0', codecString: 'hev1.1.6.L120.B0' },
+      { profile: 'main10', level: '4.0', codecString: 'hev1.2.6.L120.B0' },
+    ],
+  },
+};
+
+// Audio codec capabilities — most audio codecs don't have profile/level
+// concepts (Opus is fixed; AAC has profiles 'aac-lc', 'he-aac', etc.
+// but only AAC-LC is relevant for WebRTC).
+var AUDIO_CODEC_META = {
+  opus: {
+    profiles: [
+      { profile: '',      codecString: 'opus' },
+    ],
+    sampleRates: [8000, 12000, 16000, 24000, 48000],
+    channels: [1, 2],
+  },
+  aac: {
+    profiles: [
+      { profile: 'lc',    codecString: 'mp4a.40.2', objectType: 2 },
+      { profile: 'he',    codecString: 'mp4a.40.5', objectType: 5 },
+      { profile: 'he-v2', codecString: 'mp4a.40.29', objectType: 29 },
+    ],
+    sampleRates: [8000, 16000, 22050, 24000, 32000, 44100, 48000],
+    channels: [1, 2],
+  },
+  mp3:    { profiles: [{ profile: '', codecString: 'mp3' }] },
+  flac:   { profiles: [{ profile: '', codecString: 'flac' }] },
+  vorbis: { profiles: [{ profile: '', codecString: 'vorbis' }] },
 };
 
 // ═══════════════════════════════════════════
@@ -354,14 +437,152 @@ function getVideoCodec(name, cfg) {
   };
 }
 
+// ── G.711 sampleRate validation (MP-35) ──
+//
+// G.711 (PCMA/PCMU per ITU-T G.711, RTP payload per RFC 3551 §4.5.14) is
+// defined ONLY at 8000 Hz / mono. The FFmpeg muxer args we emit hardcode
+// '-ar 8000 -ac 1', which means any caller-provided sampleRate ≠ 8000 was
+// silently being overridden — the caller's sampleRate field appeared to
+// be honored (no error, no warning) but FFmpeg was actually resampling
+// behind the scenes (or producing output at 8000Hz with a channel-count
+// mismatch on input). Surface this loudly so misconfigurations are caught
+// at configure() rather than producing surprising output.
+//
+// We do not throw — RFC 3551 only profiles G.711 at 8000Hz, but the
+// underlying PCM A-law / μ-law transforms are sample-rate agnostic;
+// FFmpeg can in principle encode at 16kHz if asked. So this is a soft
+// error: console.warn rather than NotSupportedError. Callers that want
+// strict behavior can opt in via cfg.strictSampleRate=true.
+function _validateG711SampleRate(cfg, codecName) {
+  if (!cfg || cfg.sampleRate === undefined || cfg.sampleRate === null) return;
+  if (cfg.sampleRate === 8000) return;
+  var msg = "[codecs] " + codecName + ": sampleRate=" + cfg.sampleRate +
+            " ignored — RFC 3551 §4.5.14 defines this codec only at 8000 Hz. " +
+            "FFmpeg will resample to 8000 Hz internally.";
+  if (cfg.strictSampleRate) {
+    var e = new Error(msg);
+    e.name = 'NotSupportedError';
+    throw e;
+  }
+  // Lazy console import — codecs.js is a pure function module otherwise.
+  if (typeof console !== 'undefined' && typeof console.warn === 'function') {
+    console.warn(msg);
+  }
+}
+
 var AUDIO_CODECS = {
   aac: function (cfg) {
     var br = cfg.bitrate || 128000;
     return { kind: 'audio', preInput: [], args: ['-c:a', 'aac', '-b:a', String(Math.round(br / 1000)) + 'k'] };
   },
   opus: function (cfg) {
+    // ── Opus sampleRate validation (MP-35) ──
+    // Per RFC 6716 §2.1.4, libopus accepts only {8000, 12000, 16000,
+    // 24000, 48000} Hz at the encoder boundary. Anything else fails
+    // libopus_encoder_init silently or with a confusing error. Validate
+    // here so callers see a clear NotSupportedError at configure() time
+    // rather than an obscure FFmpeg failure at first encode.
+    if (cfg.sampleRate !== undefined && cfg.sampleRate !== null) {
+      var validRates = [8000, 12000, 16000, 24000, 48000];
+      if (validRates.indexOf(cfg.sampleRate) === -1) {
+        var e = new Error(
+          'Opus sampleRate must be one of ' + validRates.join(', ') +
+          ' Hz (RFC 6716 §2.1.4); got ' + cfg.sampleRate
+        );
+        e.name = 'NotSupportedError';
+        throw e;
+      }
+    }
+
+    // MP-5: Opus encoder must respect SDP fmtp parameters per RFC 7587:
+    //   useinbandfec=1       — in-band FEC (recover lost packets)
+    //   usedtx=1             — discontinuous transmission (silence-skip)
+    //   cbr=0|1              — constant bitrate forcing
+    //   maxaveragebitrate=N  — bitrate ceiling
+    //   maxplaybackrate=N    — receiver's reported playback ceiling
+    //
+    // The previous encoder honored only `bitrate`. WebRTC SDP from
+    // most browsers includes these params (e.g. Chrome offers
+    // 'useinbandfec=1; usedtx=0' by default), and FFmpeg exposes
+    // each as a libopus option. Without these the negotiated FEC /
+    // DTX flags from SDP became silently inactive — picky peers
+    // would reject the session, others would just have wrong loss
+    // recovery behavior.
+
+    var args = ['-c:a', 'libopus'];
+
+    // bitrate: prefer caller-supplied. maxaveragebitrate caps it.
     var br = cfg.bitrate || 64000;
-    return { kind: 'audio', preInput: [], args: ['-c:a', 'libopus', '-b:a', String(Math.round(br / 1000)) + 'k'] };
+    if (typeof cfg.maxaveragebitrate === 'number' && cfg.maxaveragebitrate > 0) {
+      br = Math.min(br, cfg.maxaveragebitrate);
+    }
+    args.push('-b:a', String(Math.round(br / 1000)) + 'k');
+
+    // useinbandfec: enable Opus in-band FEC. libopus expects -fec 1.
+    if (cfg.useinbandfec === 1 || cfg.useinbandfec === true) {
+      args.push('-fec', '1');
+      // FEC needs a hint about expected packet loss; default 10% is
+      // conservative. Caller can override via packetlossperc.
+      var loss = (typeof cfg.packetlossperc === 'number')
+        ? cfg.packetlossperc : 10;
+      args.push('-packet_loss', String(Math.max(0, Math.min(100, loss))));
+    } else if (cfg.useinbandfec === 0 || cfg.useinbandfec === false) {
+      args.push('-fec', '0');
+    }
+    // (else: leave libopus default, which is FEC enabled)
+
+    // usedtx: discontinuous transmission. libopus -dtx 1.
+    if (cfg.usedtx === 1 || cfg.usedtx === true) {
+      args.push('-dtx', '1');
+    } else if (cfg.usedtx === 0 || cfg.usedtx === false) {
+      args.push('-dtx', '0');
+    }
+
+    // cbr: force constant bitrate (vs VBR default).
+    if (cfg.cbr === 1 || cfg.cbr === true) {
+      args.push('-vbr', 'off');
+    } else if (cfg.cbr === 0 || cfg.cbr === false) {
+      args.push('-vbr', 'on');
+    }
+
+    // maxplaybackrate: cap output sample rate. libopus -ar handles
+    // this naturally — when caller provides it, we set the encoder's
+    // internal SR to the lower of {input rate, maxplaybackrate}.
+    if (typeof cfg.maxplaybackrate === 'number' && cfg.maxplaybackrate > 0) {
+      args.push('-ar', String(cfg.maxplaybackrate));
+    }
+
+    // Application: 'voip' for low-latency speech, 'audio' for music,
+    // 'lowdelay' for minimum latency. WebRTC default is voip.
+    if (cfg.application) {
+      args.push('-application', String(cfg.application));
+    }
+
+    // Frame duration (ptime) — RFC 7587 default 20ms; WebRTC commonly
+    // negotiates 10/20/40/60. libopus uses -frame_duration in ms.
+    if (typeof cfg.ptimeMs === 'number' && cfg.ptimeMs > 0) {
+      args.push('-frame_duration', String(cfg.ptimeMs));
+    }
+
+    // Complexity (MP-11) — libopus computational complexity, 0..10.
+    // Higher = better quality but more CPU. libopus default is 9 for
+    // realtime use. Maps to FFmpeg's -compression_level. Spec field
+    // OpusEncoderConfig.complexity (W3C webcodecs-opus-codec-registration).
+    if (typeof cfg.complexity === 'number' &&
+        cfg.complexity >= 0 && cfg.complexity <= 10) {
+      args.push('-compression_level', String(cfg.complexity | 0));
+    }
+
+    // Signal (MP-11) — OpusEncoderConfig.signal: 'auto' | 'voice' | 'music'.
+    // libopus exposes this via OPUS_SET_SIGNAL_REQUEST, which FFmpeg's
+    // libopus wrapper does NOT expose as a CLI option. We accept it for
+    // spec compliance (the AudioEncoder.configure() validator allows
+    // 'voice'/'music' through), but it has no effect on the encode —
+    // libopus uses OPUS_AUTO. The closest functional equivalent
+    // available is `-application`, which we wire separately above.
+    // No flag emitted here; this comment is the contract documentation.
+
+    return { kind: 'audio', preInput: [], args: args };
   },
   mp3: function (cfg) {
     var br = cfg.bitrate || 192000;
@@ -375,16 +596,20 @@ var AUDIO_CODECS = {
     var br = cfg.bitrate || 128000;
     return { kind: 'audio', preInput: [], args: ['-c:a', 'libvorbis', '-b:a', String(Math.round(br / 1000)) + 'k'] };
   },
-  'g711-alaw': function () {
+  'g711-alaw': function (cfg) {
+    _validateG711SampleRate(cfg, 'g711-alaw');
     return { kind: 'audio', preInput: [], args: ['-c:a', 'pcm_alaw', '-ar', '8000', '-ac', '1'] };
   },
-  'g711-ulaw': function () {
+  'g711-ulaw': function (cfg) {
+    _validateG711SampleRate(cfg, 'g711-ulaw');
     return { kind: 'audio', preInput: [], args: ['-c:a', 'pcm_mulaw', '-ar', '8000', '-ac', '1'] };
   },
-  alaw: function () {
+  alaw: function (cfg) {
+    _validateG711SampleRate(cfg, 'alaw');
     return { kind: 'audio', preInput: [], args: ['-c:a', 'pcm_alaw', '-ar', '8000', '-ac', '1'] };
   },
-  ulaw: function () {
+  ulaw: function (cfg) {
+    _validateG711SampleRate(cfg, 'ulaw');
     return { kind: 'audio', preInput: [], args: ['-c:a', 'pcm_mulaw', '-ar', '8000', '-ac', '1'] };
   },
   pcm: function (cfg) {
@@ -401,4 +626,66 @@ function getAudioCodec(name, cfg) {
 function getSupportedVideoCodecs() { return Object.keys(VIDEO_CODEC_META); }
 function getSupportedAudioCodecs() { return Object.keys(AUDIO_CODECS); }
 
-export { getVideoCodec, getAudioCodec, getSupportedVideoCodecs, getSupportedAudioCodecs };
+/**
+ * Get full capabilities for a video codec — profile/level matrix
+ * suitable for RTCRtpSender.getCapabilities().codecs[i].sdpFmtpLine
+ * fan-out per W3C webrtc-pc §5.2.7. (MP-6)
+ *
+ * @param {string} name — 'vp8', 'vp9', 'av1', 'h264', 'h265'
+ * @returns {{name, profiles: Array<{profile, level, codecString}>} | null}
+ */
+function getVideoCodecCapabilities(name) {
+  if (!name) return null;
+  var lower = String(name).toLowerCase();
+  var meta = VIDEO_CODEC_META[lower];
+  if (!meta) return null;
+  return {
+    name: lower,
+    pixFmt: meta.pixFmt,
+    fourcc: meta.fourcc || null,
+    // Return a copy so callers can't mutate our static metadata.
+    profiles: meta.profiles.map(function (p) {
+      return Object.assign({}, p);
+    }),
+  };
+}
+
+/**
+ * Same for audio. AAC has multiple object types; Opus has none.
+ *
+ * @param {string} name — 'opus', 'aac', 'mp3', 'flac', 'vorbis'
+ * @returns {{name, profiles, sampleRates?, channels?} | null}
+ */
+function getAudioCodecCapabilities(name) {
+  if (!name) return null;
+  var lower = String(name).toLowerCase();
+  var meta = AUDIO_CODEC_META[lower];
+  if (!meta) return null;
+  return {
+    name: lower,
+    profiles: meta.profiles.map(function (p) {
+      return Object.assign({}, p);
+    }),
+    sampleRates: meta.sampleRates ? meta.sampleRates.slice() : null,
+    channels: meta.channels ? meta.channels.slice() : null,
+  };
+}
+
+/**
+ * Aggregate: get all video codecs + their full profile/level matrix.
+ * Equivalent to getSupportedVideoCodecs().map(getVideoCodecCapabilities).
+ */
+function getAllVideoCodecCapabilities() {
+  return getSupportedVideoCodecs().map(getVideoCodecCapabilities);
+}
+
+function getAllAudioCodecCapabilities() {
+  return getSupportedAudioCodecs().map(getAudioCodecCapabilities);
+}
+
+export {
+  getVideoCodec, getAudioCodec,
+  getSupportedVideoCodecs, getSupportedAudioCodecs,
+  getVideoCodecCapabilities, getAudioCodecCapabilities,
+  getAllVideoCodecCapabilities, getAllAudioCodecCapabilities,
+};

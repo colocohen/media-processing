@@ -7,12 +7,37 @@
 
 import { i420ToRgba, rgbaToI420, rgb24ToI420, i420ToRgb24, nv12ToI420, i420ToNv12 } from './pixel_utils.js';
 import VideoColorSpace from './video_color_space.js';
+import { isBufferSource as _isBufferSource, toBuffer as _bufferSourceToBuffer } from './buffer_source.js';
+import { domException as _domex } from './dom_exception.js';
 
+// Bytes per pixel by format. For planar YUV formats this is the
+// AVERAGE — actual layout: Y plane (W*H) + chroma plane(s) at the
+// chroma subsampling rate.
+//
+//   I420 (4:2:0): Y=WH + U=WH/4 + V=WH/4         = 1.5 * WH
+//   I422 (4:2:2): Y=WH + U=WH/2 + V=WH/2         = 2.0 * WH
+//   I444 (4:4:4): Y=WH + U=WH   + V=WH           = 3.0 * WH
+//   With alpha plane (suffix "A"): + 1.0 * WH for the alpha plane.
+//
+// I422 is common in broadcast/professional capture. I444 is needed
+// for high-fidelity screen-share (especially text, where 4:2:0 chroma
+// subsampling causes color fringing on small text). Both were listed
+// as W3C VideoFrame.format values but rejected by our constructor —
+// MP-34. Adding them is purely a table extension; pixel conversion
+// for these formats can be added later as needed.
 var FORMAT_BPP = {
+  // 4:2:0 chroma subsampling
   'I420':    1.5,
   'YUV420P': 1.5,
-  'I420A':   2.5,   // I420 + alpha plane (Y+U+V+A)
+  'I420A':   2.5,
   'NV12':    1.5,
+  // 4:2:2 chroma subsampling (added MP-34)
+  'I422':    2.0,
+  'I422A':   3.0,
+  // 4:4:4 chroma subsampling (added MP-34)
+  'I444':    3.0,
+  'I444A':   4.0,
+  // Packed RGB
   'RGBA':    4,
   'RGBX':    4,
   'RGB24':   3,
@@ -56,16 +81,25 @@ function VideoFrame(dataOrInit, initArg) {
       duration: over.duration || src.duration,
     };
   }
-  // Form: VideoFrame(data, init) — browser standard
-  else if (initArg && (Buffer.isBuffer(dataOrInit) || dataOrInit instanceof Uint8Array)) {
-    initArg.data = dataOrInit;
+  // Form: VideoFrame(data, init) — browser standard. Accept any
+  // BufferSource per W3C VideoFrame spec (ArrayBuffer / TypedArray /
+  // DataView / Buffer), not just Buffer/Uint8Array (MP-34).
+  else if (initArg && _isBufferSource(dataOrInit)) {
+    initArg.data = _bufferSourceToBuffer(dataOrInit);
     dataOrInit = initArg;
   }
 
   var init = dataOrInit;
   if (!init) throw new TypeError('VideoFrame: init required');
-  if (!Buffer.isBuffer(init.data) && !(init.data instanceof Uint8Array)) {
-    throw new TypeError('VideoFrame: data must be Buffer or Uint8Array');
+  // Normalize init.data through the same coercion used above.
+  if (!Buffer.isBuffer(init.data)) {
+    if (!_isBufferSource(init.data)) {
+      throw new TypeError(
+        'VideoFrame: data must be a BufferSource ' +
+        '(Buffer, ArrayBuffer, TypedArray, or DataView)'
+      );
+    }
+    init.data = _bufferSourceToBuffer(init.data);
   }
   if (!init.codedWidth || !init.codedHeight) {
     throw new TypeError('VideoFrame: codedWidth and codedHeight required');
@@ -131,11 +165,29 @@ VideoFrame.prototype.copyTo = function (destination, options) {
 /** Sync version for internal use. */
 VideoFrame.prototype._copyToSync = function (destination, options) {
   if (this._closed) throw _domex('VideoFrame is closed', 'InvalidStateError');
+
+  // Resolve destination to a Buffer view per MP-34 BufferSource rule.
+  // The previous code only accepted Buffer/Uint8Array; W3C requires
+  // any AllowSharedBufferSource.
+  if (!_isBufferSource(destination)) {
+    throw new TypeError(
+      'VideoFrame.copyTo: destination must be a BufferSource ' +
+      '(Buffer, ArrayBuffer, TypedArray, or DataView)'
+    );
+  }
+  var dst = _bufferSourceToBuffer(destination);
+
   var targetFmt = (options && options.format) || this.format;
 
   if (targetFmt === this.format) {
-    // Same format — direct copy
-    this.data.copy(destination, 0, 0, this.data.length);
+    // Same format — direct copy. Spec: throw if destination too small.
+    if (dst.length < this.data.length) {
+      throw new TypeError(
+        'VideoFrame.copyTo: destination byte length (' + dst.length +
+        ') is less than frame byte length (' + this.data.length + ')'
+      );
+    }
+    this.data.copy(dst, 0, 0, this.data.length);
     return _layoutForFormat(targetFmt, this.codedWidth, this.codedHeight);
   }
 
@@ -159,7 +211,15 @@ VideoFrame.prototype._copyToSync = function (destination, options) {
     throw new TypeError('VideoFrame.copyTo: unsupported conversion ' + this.format + ' → ' + targetFmt);
   }
 
-  if (converted) converted.copy(destination, 0, 0, converted.length);
+  if (converted) {
+    if (dst.length < converted.length) {
+      throw new TypeError(
+        'VideoFrame.copyTo: destination byte length (' + dst.length +
+        ') is less than converted byte length (' + converted.length + ')'
+      );
+    }
+    converted.copy(dst, 0, 0, converted.length);
+  }
   return _layoutForFormat(targetFmt, w, h);
 };
 
@@ -237,6 +297,44 @@ function _layoutForFormat(fmt, w, h) {
       { offset: w * h, stride: w },
     ];
   }
+  // 4:2:2 chroma subsampling — chroma planes are half-width, full-height.
+  if (fmt === 'I422') {
+    var ySz422 = w * h;
+    var uvSz422 = (w >> 1) * h;
+    return [
+      { offset: 0, stride: w },
+      { offset: ySz422, stride: w >> 1 },
+      { offset: ySz422 + uvSz422, stride: w >> 1 },
+    ];
+  }
+  if (fmt === 'I422A') {
+    var yS422a = w * h;
+    var uvS422a = (w >> 1) * h;
+    return [
+      { offset: 0, stride: w },
+      { offset: yS422a, stride: w >> 1 },
+      { offset: yS422a + uvS422a, stride: w >> 1 },
+      { offset: yS422a + uvS422a * 2, stride: w },     // alpha
+    ];
+  }
+  // 4:4:4 chroma subsampling — chroma planes match Y plane.
+  if (fmt === 'I444') {
+    var ySz444 = w * h;
+    return [
+      { offset: 0, stride: w },
+      { offset: ySz444, stride: w },
+      { offset: ySz444 * 2, stride: w },
+    ];
+  }
+  if (fmt === 'I444A') {
+    var yS444a = w * h;
+    return [
+      { offset: 0, stride: w },
+      { offset: yS444a, stride: w },
+      { offset: yS444a * 2, stride: w },
+      { offset: yS444a * 3, stride: w },               // alpha
+    ];
+  }
   if (fmt === 'RGBA' || fmt === 'BGRA') {
     return [{ offset: 0, stride: w * 4 }];
   }
@@ -247,13 +345,10 @@ function _layoutForFormat(fmt, w, h) {
 }
 
 /**
- * Create DOMException if available (Node 17+), otherwise TypeError.
+ * Create DOMException if available (Node 17+), otherwise fallback Error.
+ * Imported from dom_exception.js — see _domex import above.
  */
-function _domex(msg, name) {
-  if (typeof DOMException !== 'undefined') return new DOMException(msg, name);
-  var e = new TypeError(msg);
-  e.name = name || 'InvalidStateError';
-  return e;
-}
+
+// ── BufferSource helpers (MP-34) imported from buffer_source.js ──
 
 export default VideoFrame;

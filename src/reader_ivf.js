@@ -72,7 +72,11 @@ IVFReader.prototype.feed = function (chunk) {
     var payload = Buffer.from(this._buf.subarray(this._start, this._start + frameSize));
     this._start += frameSize;
 
-    var ptsUs = (ts * 1000000 * this._timebaseNum / this._timebaseDen) | 0;
+    // PTS in microseconds. Use Math.floor (NOT `| 0`): the bitwise
+    // operator coerces to a 32-bit signed int, which overflows after
+    // ~35 minutes (2^31 µs). Math.floor stays in JS Number's 53-bit
+    // safe range — at 48 kHz that's >280 years before precision loss.
+    var ptsUs = Math.floor(ts * 1000000 * this._timebaseNum / this._timebaseDen);
     var isKey = false;
     if (this._fourcc === 'VP80') isKey = _keyVP8(payload);
     else if (this._fourcc === 'VP90') isKey = _keyVP9(payload);

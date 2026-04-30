@@ -16,7 +16,7 @@ import { EncodedVideoChunk, EncodedAudioChunk } from './src/encoded_chunk.js';
 
 import { MediaStream, MediaStreamTrack } from './src/media_stream.js';
 import getUserMedia from './src/get_user_media.js';
-import { enumerateDevices, getDisplayMedia } from './src/get_user_media.js';
+import { enumerateDevices, getDisplayMedia, MediaDeviceInfo, InputDeviceInfo } from './src/get_user_media.js';
 
 import { VideoSource, AudioSource, VideoSink, AudioSink } from './src/media_source_sink.js';
 import { MediaStreamTrackProcessor, MediaStreamTrackGenerator } from './src/track_processor.js';
@@ -77,6 +77,8 @@ function installWebCodecsPolyfill() {
   globalThis.MediaRecorder = MediaRecorder;
   globalThis.MediaStream = MediaStream;
   globalThis.MediaStreamTrack = MediaStreamTrack;
+  globalThis.MediaDeviceInfo = MediaDeviceInfo;
+  globalThis.InputDeviceInfo = InputDeviceInfo;
   globalThis.MediaStreamTrackProcessor = MediaStreamTrackProcessor;
   globalThis.MediaStreamTrackGenerator = MediaStreamTrackGenerator;
   if (!globalThis.navigator) globalThis.navigator = {};
@@ -90,7 +92,8 @@ function installWebCodecsPolyfill() {
 export {
   VideoEncoder, VideoDecoder, AudioEncoder, AudioDecoder,
   VideoFrame, VideoColorSpace, AudioData, EncodedVideoChunk, EncodedAudioChunk,
-  MediaStream, MediaStreamTrack, getUserMedia, getDisplayMedia, enumerateDevices,
+  MediaStream, MediaStreamTrack, MediaDeviceInfo, InputDeviceInfo,
+  getUserMedia, getDisplayMedia, enumerateDevices,
   MediaStreamTrackProcessor, MediaStreamTrackGenerator, MediaRecorder,
   VideoSource, VideoSink, AudioSource, AudioSink,
   VideoPlayer, ImageDecoder, MediaEncoder, FramePacer, Demuxer, Muxer, mediaCapabilities,
@@ -106,7 +109,8 @@ export {
 export default {
   VideoEncoder, VideoDecoder, AudioEncoder, AudioDecoder,
   VideoFrame, VideoColorSpace, AudioData, EncodedVideoChunk, EncodedAudioChunk,
-  MediaStream, MediaStreamTrack, getUserMedia, getDisplayMedia, enumerateDevices,
+  MediaStream, MediaStreamTrack, MediaDeviceInfo, InputDeviceInfo,
+  getUserMedia, getDisplayMedia, enumerateDevices,
   MediaStreamTrackProcessor, MediaStreamTrackGenerator, MediaRecorder,
   VideoSource, VideoSink, AudioSource, AudioSink,
   VideoPlayer, ImageDecoder, MediaEncoder, FramePacer, Demuxer, Muxer, mediaCapabilities,

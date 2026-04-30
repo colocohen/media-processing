@@ -7,6 +7,8 @@
  *  - EPIPE handling (normal when FFmpeg closes)
  *  - Listener cleanup on stop/restart (no leaks)
  *  - Graceful shutdown (SIGTERM then SIGKILL)
+ *  - Parent-exit cleanup: registers SIGINT/SIGTERM/exit handlers once
+ *    so a Node crash doesn't leave orphan FFmpeg processes
  */
 
 import { spawn, execSync } from 'node:child_process';
@@ -15,6 +17,40 @@ import { createRequire } from 'node:module';
 
 var _resolvedPath = null;    // cached resolved FFmpeg path
 var _resolveChecked = false;
+
+// ─── Orphan-prevention: track all live FFmpeg children ───
+// On a Node crash, child processes inherit init/launchd/systemd as parent
+// and become daemons. The fix is to register process-exit hooks that send
+// SIGTERM to every tracked child. We use a Set of child_process objects
+// (live ones) and remove them on 'close'.
+var _liveChildren = new Set();
+var _exitHooksInstalled = false;
+
+function _installExitHooks() {
+  if (_exitHooksInstalled) return;
+  _exitHooksInstalled = true;
+  // 'exit' is synchronous — only sync APIs work here. SIGTERM is fast (kernel
+  // call); we can't await graceful shutdown, but at least the children get
+  // signaled. The OS reaps them after we're gone.
+  function killAll() {
+    _liveChildren.forEach(function (proc) {
+      try { proc.kill('SIGTERM'); } catch (e) {}
+    });
+    _liveChildren.clear();
+  }
+  process.on('exit',    killAll);
+  // Also handle signals so Ctrl-C and `kill` clean up. Don't replace
+  // user handlers — `process.on` adds, doesn't override.
+  process.on('SIGINT',  function () { killAll(); process.exit(130); });
+  process.on('SIGTERM', function () { killAll(); process.exit(143); });
+  // uncaughtException leaves children alive by default; we kill them and
+  // rethrow so the user's handler (if any) still sees the error.
+  process.on('uncaughtException', function (err) {
+    killAll();
+    // Rethrow on next tick so default Node handler runs (which logs + exits 1).
+    process.nextTick(function () { throw err; });
+  });
+}
 
 /**
  * Resolve the FFmpeg binary path. Priority:
@@ -132,6 +168,11 @@ FFmpegProcess.prototype.start = function (args, stdio) {
   this._handlers = [];
   this._stderrBuf = '';
 
+  // Track this child for orphan-cleanup on parent exit. Install hooks on
+  // first ever use — cheap, and only Node startup pays for it.
+  _installExitHooks();
+  _liveChildren.add(proc);
+
   function track(target, ev, fn) {
     target.on(ev, fn);
     self._handlers.push({ target: target, ev: ev, fn: fn });
@@ -142,6 +183,9 @@ FFmpegProcess.prototype.start = function (args, stdio) {
   });
 
   track(proc, 'close', function (code) {
+    // Untrack first — even if listeners or emit() throw, we don't want
+    // a permanently-live entry in _liveChildren.
+    _liveChildren.delete(proc);
     self._detachAll();
     self._ee.emit('close', code);
   });
@@ -280,13 +324,19 @@ FFmpegProcess.prototype._detachAll = function () {
 FFmpegProcess.prototype.stop = function () {
   if (!this._proc) return;
   this._detachAll();
-  try { if (this._proc.stdin) this._proc.stdin.end(); } catch (e) {}
-  try { this._proc.kill('SIGTERM'); } catch (e) {}
-  // Force kill after 2 seconds if still alive
   var proc = this._proc;
-  setTimeout(function () {
+  // Untrack now — we're committing to killing it. Even if SIGTERM fails,
+  // we don't want a stale entry lingering in _liveChildren.
+  _liveChildren.delete(proc);
+  try { if (proc.stdin) proc.stdin.end(); } catch (e) {}
+  try { proc.kill('SIGTERM'); } catch (e) {}
+  // Force kill after 2 seconds if still alive. unref() so this timer
+  // doesn't keep the Node event loop alive on its own — if the app has
+  // nothing else to do, we shouldn't hold it open.
+  var killTimer = setTimeout(function () {
     try { proc.kill('SIGKILL'); } catch (e) {}
   }, 2000);
+  if (killTimer.unref) killTimer.unref();
   this._proc = null;
 };
 

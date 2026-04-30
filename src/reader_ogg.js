@@ -6,6 +6,7 @@
 
 import { EventEmitter } from 'node:events';
 import ByteQueue from './byte_queue.js';
+import { getOpusPacketDurationUs } from './opus.js';
 
 function OGGReader(opts) {
   if (!opts) opts = {};
@@ -95,12 +96,23 @@ OGGReader.prototype.feed = function (chunk) {
       }
     }
 
-    // Emit audio events for each packet
+    // Emit audio events for each packet.
+    //
+    // Per-packet duration comes from the Opus TOC byte (RFC 6716 §3.1)
+    // via getOpusPacketDurationUs — NOT a hardcoded 960 samples. The
+    // previous hardcode was correct for 20ms@48kHz only; it produced
+    // 2x-3x drift for any other Opus configuration (10/40/60ms frames,
+    // or non-48kHz sample rates) and is the bug that ROADMAP MP-10 was
+    // supposed to address (in a different file — actual bug was here).
+    //
+    // We could alternatively use the OGG granule_position (parsed
+    // above) which is sample-accurate per RFC 7845 §4. We don't, for
+    // two reasons: (1) granule needs special handling for pre-skip and
+    // partial final packet, and (2) parsing the TOC keeps reader_ogg
+    // useful as a reference for non-OGG callers (RTP payload parsing,
+    // raw-stream debugging) without depending on container framing.
     for (var p = 0; p < packets.length; p++) {
-      // Opus frame duration: 20ms default (960 samples at 48kHz)
-      var durSamples = 960;
-      var durUs = Math.round(durSamples * 1e6 / this._sampleRate);
-
+      var durUs = getOpusPacketDurationUs(packets[p]);
       this._ee.emit('audio', {
         payload: packets[p],
         ptsUs: this._ptsUs,

@@ -8,6 +8,7 @@
 
 import { EventEmitter } from 'node:events';
 import { randomBytes } from 'node:crypto';
+import { domException as _domex } from './dom_exception.js';
 
 // ── MediaStreamTrack ──
 
@@ -29,6 +30,14 @@ MediaStreamTrack.prototype.on = function (ev, fn) { this._ee.on(ev, fn); };
 MediaStreamTrack.prototype.off = function (ev, fn) { this._ee.off(ev, fn); };
 MediaStreamTrack.prototype.addEventListener = function (ev, fn) { this._ee.on(ev, fn); };
 MediaStreamTrack.prototype.removeEventListener = function (ev, fn) { this._ee.off(ev, fn); };
+// prependListener exposes the EE method of the same name. Required so a
+// consumer that needs first-call ordering (e.g. MediaStreamTrackProcessor,
+// which must clone the VideoFrame before any sibling listener calls
+// close() on it) can register itself ahead of pre-existing on() listeners.
+// Without this, processor.handler runs after a diag listener that closes
+// the frame, and processor.clone() throws "VideoFrame is detached".
+MediaStreamTrack.prototype.prependListener = function (ev, fn) { this._ee.prependListener(ev, fn); };
+MediaStreamTrack.prototype.once           = function (ev, fn) { this._ee.once(ev, fn); };
 
 MediaStreamTrack.prototype.stop = function () {
   if (this.readyState === 'ended') return;
@@ -41,8 +50,57 @@ MediaStreamTrack.prototype.stop = function () {
   this._ee.emit('ended');
 };
 
+/**
+ * Clone the track per W3C MediaCapture-Main §4.3.5.
+ *
+ * The cloned track is a separate MediaStreamTrack whose state is
+ * initialized from this track:
+ *   - kind, label, contentHint     — copied
+ *   - enabled, muted, readyState   — copied (initial values match source)
+ *   - constraints                  — copied (current applied)
+ *   - settings                     — copied (current effective)
+ *   - id                           — newly generated
+ * Source-only data (the underlying media source binding, _onStop, the
+ * EventEmitter listeners) is NOT copied — the clone has its own pipeline.
+ *
+ * This was previously copying only kind/label/settings, which meant
+ * disabled/muted state was lost across clone() and contentHint and
+ * constraints were silently dropped (MP-29).
+ */
 MediaStreamTrack.prototype.clone = function () {
-  return new MediaStreamTrack({ kind: this.kind, label: this.label, settings: this._settings });
+  // Shallow-copy settings so the clone's mutations don't leak back
+  // into the source. _constraints is similarly cloned shallow.
+  var settingsCopy = {};
+  for (var k in this._settings) {
+    if (Object.prototype.hasOwnProperty.call(this._settings, k)) {
+      settingsCopy[k] = this._settings[k];
+    }
+  }
+
+  var cloned = new MediaStreamTrack({
+    kind: this.kind,
+    label: this.label,
+    contentHint: this.contentHint,
+    settings: settingsCopy,
+  });
+  cloned.enabled = this.enabled;
+  // muted is a "live" state set by the source; for a clone created
+  // mid-stream it should mirror current value.
+  cloned.muted = this.muted;
+  // readyState: 'ended' source → 'ended' clone (per spec).
+  cloned.readyState = this.readyState;
+
+  if (this._constraints) {
+    var constraintsCopy = {};
+    for (var c in this._constraints) {
+      if (Object.prototype.hasOwnProperty.call(this._constraints, c)) {
+        constraintsCopy[c] = this._constraints[c];
+      }
+    }
+    cloned._constraints = constraintsCopy;
+  }
+
+  return cloned;
 };
 
 MediaStreamTrack.prototype._push = function (data) {
@@ -88,11 +146,40 @@ MediaStreamTrack.prototype.applyConstraints = function (constraints) {
 };
 
 /**
- * Dispatch an event (EventTarget interface).
+ * Dispatch an event (W3C EventTarget interface).
+ *
+ * Per the DOM standard:
+ *   - The argument MUST be an Event object (has .type at minimum).
+ *     Passing a string throws TypeError. The previous implementation
+ *     accepted strings, which is non-compliant.
+ *   - Returns `true` if the event was not canceled, `false` if a
+ *     listener called event.preventDefault() and event.cancelable
+ *     was true. The previous implementation returned undefined.
+ *   - Sets event.target and event.currentTarget on the event object
+ *     before invoking listeners.
+ *
+ * This brings dispatchEvent in line with browser MediaStreamTrack and
+ * lets W3C-compliant callers use the standard contract:
+ *   var ev = new Event('mute', { cancelable: true });
+ *   var notCanceled = track.dispatchEvent(ev);
  */
 MediaStreamTrack.prototype.dispatchEvent = function (event) {
-  var type = (typeof event === 'string') ? event : event.type;
-  this._ee.emit(type, event);
+  if (!event || typeof event !== 'object' || typeof event.type !== 'string') {
+    throw new TypeError(
+      "Failed to execute 'dispatchEvent' on 'EventTarget': " +
+      "parameter 1 is not of type 'Event'."
+    );
+  }
+  // Best-effort: set target/currentTarget. Some Event implementations
+  // freeze these properties; ignore failures rather than throwing.
+  try { if (event.target == null) event.target = this; } catch (e) {}
+  try { if (event.currentTarget == null) event.currentTarget = this; } catch (e) {}
+
+  this._ee.emit(event.type, event);
+
+  // Spec: return false when canceled, true otherwise. cancelable=false
+  // events ignore preventDefault — defaultPrevented stays false.
+  return !event.defaultPrevented;
 };
 
 // ── Handler properties (browser-compatible) ──
@@ -134,12 +221,7 @@ MediaStreamTrack.prototype._setMuted = function (muted) {
   this._ee.emit(muted ? 'mute' : 'unmute');
 };
 
-function _domex(msg, name) {
-  if (typeof DOMException !== 'undefined') return new DOMException(msg, name);
-  var e = new TypeError(msg);
-  e.name = name || 'InvalidStateError';
-  return e;
-}
+// _domex now imported from dom_exception.js (top of file).
 
 // ── MediaStream ──
 
@@ -179,8 +261,21 @@ MediaStream.prototype.addEventListener = function (ev, fn) { this._ee.on(ev, fn)
 MediaStream.prototype.removeEventListener = function (ev, fn) { this._ee.off(ev, fn); };
 
 MediaStream.prototype.dispatchEvent = function (event) {
-  var type = (typeof event === 'string') ? event : event.type;
-  this._ee.emit(type, event);
+  // See MediaStreamTrack.prototype.dispatchEvent for the full spec
+  // commentary. Same algorithm: validate Event, set target, emit,
+  // return !defaultPrevented.
+  if (!event || typeof event !== 'object' || typeof event.type !== 'string') {
+    throw new TypeError(
+      "Failed to execute 'dispatchEvent' on 'EventTarget': " +
+      "parameter 1 is not of type 'Event'."
+    );
+  }
+  try { if (event.target == null) event.target = this; } catch (e) {}
+  try { if (event.currentTarget == null) event.currentTarget = this; } catch (e) {}
+
+  this._ee.emit(event.type, event);
+
+  return !event.defaultPrevented;
 };
 
 Object.defineProperty(MediaStream.prototype, 'onaddtrack', {
@@ -294,4 +389,79 @@ MediaStream.prototype.clone = function () {
 
 function _generateId() { return randomBytes(16).toString('hex'); }
 
-export { MediaStream, MediaStreamTrack };
+
+// ═══════════════════════════════════════════════════════════════════
+//  MediaDeviceInfo / InputDeviceInfo
+//  (W3C Media Capture and Streams §11.1, §11.5)
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * MediaDeviceInfo — describes a single media input/output device.
+ * Constructed from the device-probe results (gst-device-monitor or
+ * platform fallback) and returned from navigator.mediaDevices
+ * .enumerateDevices().
+ *
+ * Standard fields (read-only per W3C):
+ *   - deviceId  string  — opaque, stable identifier
+ *   - kind      string  — 'videoinput' | 'audioinput' | 'audiooutput'
+ *   - label     string  — human-readable name (may be empty until permission granted)
+ *   - groupId   string  — groups devices from the same physical hardware
+ */
+function MediaDeviceInfo(opts) {
+  opts = opts || {};
+  this.deviceId = opts.deviceId || '';
+  this.kind     = opts.kind     || '';
+  this.label    = opts.label    || '';
+  this.groupId  = opts.groupId  || '';
+}
+
+MediaDeviceInfo.prototype.toJSON = function () {
+  return {
+    deviceId: this.deviceId,
+    kind:     this.kind,
+    label:    this.label,
+    groupId:  this.groupId,
+  };
+};
+
+/**
+ * InputDeviceInfo — extends MediaDeviceInfo for input-capable devices
+ * (cameras, microphones). Adds getCapabilities() which exposes the
+ * device's negotiable parameters (resolution ranges, framerate ranges,
+ * channel counts, etc.) BEFORE getUserMedia() is called.
+ *
+ * Per W3C §11.5.2, getCapabilities() returns a fresh object on each
+ * call (caller mutations don't leak into stored capabilities).
+ *
+ * @param {object} opts  same shape as MediaDeviceInfo, plus:
+ *   - capabilities  object  W3C-shaped capabilities map (e.g. for video:
+ *                           { width: {min, max}, height: {min, max},
+ *                             frameRate: {min, max}, ... })
+ *   - _modes        any     non-standard escape hatch — preserves the
+ *                           raw discrete modes returned by gst-device-
+ *                           monitor for callers that need exact mode
+ *                           combinations rather than W3C ranges.
+ */
+function InputDeviceInfo(opts) {
+  MediaDeviceInfo.call(this, opts);
+  this._capabilities = (opts && opts.capabilities) || {};
+  if (opts && opts._modes !== undefined) this._modes = opts._modes;
+}
+
+InputDeviceInfo.prototype = Object.create(MediaDeviceInfo.prototype);
+InputDeviceInfo.prototype.constructor = InputDeviceInfo;
+
+InputDeviceInfo.prototype.getCapabilities = function () {
+  // Return a shallow copy so caller mutations don't leak into our
+  // stored capabilities. Per W3C the returned object is conceptually
+  // a snapshot.
+  var out = {};
+  for (var k in this._capabilities) {
+    if (Object.prototype.hasOwnProperty.call(this._capabilities, k)) {
+      out[k] = this._capabilities[k];
+    }
+  }
+  return out;
+};
+
+export { MediaStream, MediaStreamTrack, MediaDeviceInfo, InputDeviceInfo };

@@ -9,6 +9,27 @@
  */
 
 function FrameQueue(frameSize, onFrame) {
+  // ── Constructor validation (MP-35) ──
+  // Without these, misconfigurations failed in confusing ways:
+  //   - frameSize <= 0  → infinite loop in push() (writePos >= 0 always)
+  //   - frameSize NaN   → Buffer.allocUnsafe(NaN*3) throws RangeError
+  //                       deep in the call stack
+  //   - frameSize float → silent truncation by allocUnsafe; later frames
+  //                       misalign by fractions
+  //   - missing onFrame → push() crashes with "this._onFrame is not a
+  //                       function" at first frame, possibly long after
+  //                       construction made it look fine
+  // Validate up front so the caller sees a clear TypeError at the
+  // construction site.
+  if (typeof frameSize !== 'number' || !Number.isInteger(frameSize) || frameSize <= 0) {
+    throw new TypeError(
+      'FrameQueue: frameSize must be a positive integer, got ' + frameSize
+    );
+  }
+  if (typeof onFrame !== 'function') {
+    throw new TypeError('FrameQueue: onFrame must be a function');
+  }
+
   this._frameSize = frameSize;
   this._onFrame = onFrame;
 
@@ -51,7 +72,36 @@ FrameQueue.prototype.push = function (chunk) {
     }
     this._writePos = remaining;
 
-    this._onFrame(frame);
+    // ── Defensive callback invocation (MP-35) ──
+    // Buffer state above (frame extracted, remaining bytes shifted,
+    // writePos updated) is fully consistent BEFORE this callback runs.
+    // If onFrame throws — say a downstream encoder rejects audioData
+    // for one bad frame, or a video encoder.encode() fails on a
+    // resolution mismatch — we MUST NOT let the throw propagate up
+    // through push(). Doing so would:
+    //   (a) Lose any frames still queued in the buffer (the while
+    //       loop would be aborted; subsequent frames sit in the buffer
+    //       until a future push() call adds enough bytes to retrigger).
+    //   (b) Surface to the source (FFmpeg stdout 'data' handler in our
+    //       case), which has no good way to recover and typically just
+    //       crashes the process or — worse — silently de-pipes.
+    //   (c) Make audio pipelines particularly susceptible to drift:
+    //       a single dropped frame at the source aligns with what the
+    //       receiver expects, but a half-emitted batch leaves writePos
+    //       in a state where the NEXT chunk's bytes are concatenated
+    //       to the leftover of the failed batch, producing
+    //       phase-shifted misaligned frames downstream — exactly the
+    //       symptom we'd want to rule out for the alien-noise
+    //       investigation.
+    // The single-frame loss is acceptable; the persistent corruption
+    // is not. Drop the bad frame, log, continue.
+    try {
+      this._onFrame(frame);
+    } catch (err) {
+      if (typeof console !== 'undefined' && typeof console.error === 'function') {
+        console.error('[FrameQueue] onFrame threw, dropping frame and continuing:', err);
+      }
+    }
   }
 };
 

@@ -163,11 +163,42 @@ FMP4Reader.prototype._parseMediaSegment = function (buf) {
     var payload = Buffer.from(buf.subarray(sampleOffset, end));
     var ptsUs = Math.round((currentTime + sample.compositionOffset) * 1e6 / this._timescale);
 
-    // Keyframe detection from sample_flags:
-    // Bit 26-25 (sample_depends_on): 2 = depends on others (not keyframe)
-    // If sample_depends_on == 2, it's NOT a keyframe
+    // Keyframe detection from sample_flags (ISO/IEC 14496-12 §8.6.4).
+    //
+    // sample_flags is a 32-bit field. Two relevant fields:
+    //
+    //   bit 25-24: sample_depends_on (2 bits)
+    //     0 = unknown
+    //     1 = others depend on this — I-frame
+    //     2 = this depends on others — P/B-frame
+    //     3 = none — independently decodable (I-frame)
+    //
+    //   bit 16: sample_is_non_sync_sample (1 bit)
+    //     0 = this IS a sync (random-access) sample — keyframe
+    //     1 = not a sync sample
+    //
+    // Pre-fix code used only depends_on != 2, which over-classified
+    // depends_on=0 ("unknown") as keyframe. FFmpeg's default fMP4
+    // muxer sets depends_on=0 for every sample unless explicitly
+    // configured, so EVERY P-frame got flagged as keyframe →
+    // unnecessary PLI / RTCP feedback, broken NACK / FEC heuristics
+    // (MP-30).
+    //
+    // Post-fix: trust depends_on when it has a definitive value
+    // (1, 2, or 3), and fall back to is_non_sync only when depends_on
+    // is unknown.
     var dependsOn = (sample.flags >> 24) & 0x03;
-    var isKey = (dependsOn !== 2);
+    var isNonSync = (sample.flags >> 16) & 0x01;
+    var isKey;
+    if (dependsOn === 1 || dependsOn === 3) {
+      isKey = true;
+    } else if (dependsOn === 2) {
+      isKey = false;
+    } else {
+      // dependsOn === 0 (unknown) — defer to is_non_sync_sample bit.
+      // is_non_sync == 0 means it IS a sync sample (keyframe).
+      isKey = (isNonSync === 0);
+    }
     // First sample in fragment with first_sample_flags might override
     if (s === 0 && (trunFlags & 0x000004)) {
       // first_sample_flags was present — already handled above

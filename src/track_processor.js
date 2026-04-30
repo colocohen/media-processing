@@ -59,9 +59,30 @@ function MediaStreamTrackProcessor(init) {
           // Backpressure: consumer is slow, drop frame
           return;
         }
-        controller.enqueue(data);
+        // Clone before enqueue. EventEmitter delivers the same VideoFrame /
+        // AudioData object to every listener, all sharing one ref-counted
+        // buffer. If a sibling listener calls close() before our async reader
+        // pulls from the queue, copyTo on the queued object throws
+        // "VideoFrame is detached". Per W3C WebCodecs, .clone() is cheap —
+        // it just bumps the underlying resource's refcount; pixel/sample
+        // data is not duplicated. This makes the processor independent of
+        // other consumers' lifetimes.
+        var owned = (typeof data.clone === 'function') ? data.clone() : data;
+        controller.enqueue(owned);
       };
-      track.on(eventName, handler);
+      // prependListener (not on()) so this handler ALWAYS fires first when
+      // multiple listeners are attached. Cloning has to happen before any
+      // sibling listener calls close() — clone() on a detached frame throws.
+      // EventEmitter calls listeners in registration order; if a diag/log
+      // listener was attached BEFORE the processor and closes the frame,
+      // a plain on() handler would receive an already-detached frame and
+      // clone() would fail. prependListener guarantees we run first
+      // regardless of when the processor was constructed.
+      if (typeof track.prependListener === 'function') {
+        track.prependListener(eventName, handler);
+      } else {
+        track.on(eventName, handler);
+      }
 
       // End the stream when the track stops
       track.on('ended', function () {

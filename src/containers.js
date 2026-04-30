@@ -67,7 +67,25 @@ var CONTAINERS = {
     createReader: function (opts) {
       return new OGGReader({ sampleRate: opts.sampleRate || 48000 });
     },
-    extra: [],
+    // FFmpeg's default OGG mux for libopus accumulates one full second
+    // of audio per page before flushing pipe:3, producing a burst of
+    // ~50 RTP packets every 1s separated by 1s of silence. Browsers'
+    // jitter buffers cope poorly with that pattern (Chrome's manifests
+    // as "no audible audio" or sporadic clicks even though packets
+    // arrive). -page_duration is in microseconds; 20000 = 20ms = one
+    // Opus frame per OGG page, which makes the OGG → RTP pipeline
+    // emit packets at the encoder's natural cadence instead of in
+    // batches.
+    //
+    // For Vorbis (also OGG-encapsulated) we leave the default; Vorbis
+    // isn't used in real-time scenarios where the burst pattern would
+    // be visible.
+    extra: function (codec) {
+      if (codec === 'opus') {
+        return ['-page_duration', '20000'];
+      }
+      return [];
+    },
   },
   mp3: {
     format: 'mp3',

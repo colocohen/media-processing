@@ -65,9 +65,52 @@ AnnexBReader.prototype.feed = function (chunk) {
   }
 };
 
+/**
+ * Flush any AU still buffered after the upstream pipe has closed.
+ *
+ * The feed() loop emits an AU only when it can find the START of the
+ * NEXT AU (so it knows where the current one ends). At end-of-stream
+ * there's no "next" AUD — the trailing AU sits in the buffer and is
+ * never emitted. flush() handles this case: if a start-code is found
+ * before _end, treat everything from there to _end as the final AU.
+ *
+ * Critical for keyframe-restart correctness: when an old FFmpeg exits,
+ * its reader's tail AU (often a P-frame from the moment just before
+ * the restart) must be emitted before the transition releases.
+ * Otherwise the receiver sees a gap or out-of-order frames after the
+ * new keyframe arrives. See test_restart_real_world.js.
+ */
 AnnexBReader.prototype.flush = function () {
+  var audType = this._codec === 'h265' ? H265_NAL_AUD : H264_NAL_AUD;
+  var isH265 = this._codec === 'h265';
+
+  // If a start code remains and there's data after it, that data is
+  // the trailing AU — emit it.
+  var first = findAUD(this._buf, this._start, this._end, audType, isH265);
+  if (first >= 0 && first < this._end) {
+    var au = Buffer.from(this._buf.subarray(first, this._end));
+    var isKey = isH265 ? hasIDR_H265(au) : hasIDR_H264(au);
+    if (isKey) this._groupId++;
+    var ptsUs = Math.floor(this._index * 1000000 / this._fps);
+
+    this._ee.emit('video', {
+      payload: au,
+      isKeyframe: isKey,
+      ptsUs: ptsUs,
+      index: this._index++,
+      groupId: this._groupId,
+    });
+  }
+
+  // Reset for potential reuse (rare — readers are typically created
+  // per FFmpeg instance, but we keep the contract symmetric).
   this._start = 0;
   this._end = 0;
+
+  // Signal to listeners that no more 'video' events will come from
+  // this reader. The encoder's transition logic uses this to know
+  // when to release the buffered new-FFmpeg outputs.
+  this._ee.emit('flushed');
 };
 
 AnnexBReader.prototype._append = function (chunk) {

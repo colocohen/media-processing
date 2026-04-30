@@ -9,7 +9,8 @@
 
 import { EventEmitter } from 'node:events';
 import ByteQueue from './byte_queue.js';
-import { findAUD, hasIDR_H264, H264_NAL_AUD } from './reader_annexb.js';
+import { hasIDR_H264 } from './reader_annexb.js';
+import { parseAdtsHeader } from './aac.js';
 
 function TSReader(opts) {
   if (!opts) opts = {};
@@ -22,10 +23,6 @@ function TSReader(opts) {
   this._audioPid = null;
 
   this._pesBuf = {};
-
-  this._vBuf = Buffer.allocUnsafe(128 * 1024);
-  this._vStart = 0;
-  this._vEnd = 0;
 
   this._fps = opts.fps || 30;
   this._index = 0;
@@ -49,8 +46,6 @@ TSReader.prototype.feed = function (chunk) {
 TSReader.prototype.flush = function () {
   this._q.reset();
   this._pesBuf = {};
-  this._vStart = 0;
-  this._vEnd = 0;
 };
 
 TSReader.prototype._handlePacket = function (pkt) {
@@ -182,58 +177,81 @@ TSReader.prototype._flushPES = function (pid, kind) {
 };
 
 TSReader.prototype._processVideoES = function (es, pts) {
-  // Append to flat buffer
-  var needed = this._vEnd + es.length;
-  if (needed > this._vBuf.length) {
-    if (this._vStart > 0) {
-      var live = this._vEnd - this._vStart;
-      this._vBuf.copy(this._vBuf, 0, this._vStart, this._vEnd);
-      this._vEnd = live; this._vStart = 0;
-    }
-    if (this._vEnd + es.length > this._vBuf.length) {
-      var nb = Buffer.allocUnsafe(Math.max(this._vBuf.length * 2, this._vEnd + es.length));
-      if (this._vEnd > 0) this._vBuf.copy(nb, 0, 0, this._vEnd);
-      this._vBuf = nb;
-    }
-  }
-  es.copy(this._vBuf, this._vEnd);
-  this._vEnd += es.length;
+  // AU splitting strategy: PES boundary = AU boundary.
+  //
+  // Background: in MPEG-TS, the demux layer (PSI + PES accumulation
+  // via PUSI) already gives us complete PES packets one at a time.
+  // For elementary video streams encoded by a single encoder, the
+  // overwhelmingly common case is 1 PES = 1 AU (per ISO/IEC 13818-1
+  // Annex 2.4.4.10). So when _accumPES flushes a PES via PUSI, the
+  // resulting `es` payload IS one AU.
+  //
+  // The previous implementation tried to find access-unit boundaries
+  // by searching for AUD NAL units (type 9, byte 0x09) in a flat
+  // accumulator buffer. That strategy works ONLY for encoders that
+  // emit AUDs:
+  //   - libx264:        emits AUDs because codecs.js sets aud=1
+  //   - h264_nvenc:     OMITS AUDs by default
+  //   - h264_qsv:       OMITS AUDs
+  //   - h264_vaapi:     OMITS AUDs
+  //   - h264_amf:       OMITS AUDs
+  //   - h264_videotoolbox: OMITS AUDs
+  // For any non-libx264 encoder, the previous code accumulated forever
+  // and never emitted a frame. (MP-21.)
+  //
+  // PES-boundary splitting works for all encoders: PUSI is a TS
+  // packet header bit, set by the muxer, independent of encoder.
+  //
+  // Edge case (rare): some muxers pack multiple AUs into one PES.
+  // For now we treat the whole PES as one AU; if we ever encounter
+  // such streams we can add a secondary AUD-based split as a
+  // refinement. Empirically WebRTC-style streams are 1:1.
+  var au = Buffer.from(es);
+  var isKey = hasIDR_H264(au);
+  if (isKey) this._groupId++;
+  var ptsUs = pts !== null
+    ? Math.floor(pts * (1000000 / 90000))
+    : Math.floor(this._index * 1000000 / this._fps);
 
-  while (true) {
-    var first = findAUD(this._vBuf, this._vStart, this._vEnd, H264_NAL_AUD, false);
-    if (first < 0) break;
-    var second = findAUD(this._vBuf, first + 3, this._vEnd, H264_NAL_AUD, false);
-    if (second < 0) break;
-
-    var au = Buffer.from(this._vBuf.subarray(first, second));
-    this._vStart = second;
-
-    var isKey = hasIDR_H264(au);
-    if (isKey) this._groupId++;
-    var ptsUs = pts !== null ? Math.floor(pts * (1000000 / 90000)) : Math.floor(this._index * 1000000 / this._fps);
-
-    this._ee.emit('video', {
-      payload: au, isKeyframe: isKey, ptsUs: ptsUs,
-      index: this._index++, groupId: this._groupId,
-    });
-  }
+  this._ee.emit('video', {
+    payload: au,
+    isKeyframe: isKey,
+    ptsUs: ptsUs,
+    index: this._index++,
+    groupId: this._groupId,
+  });
 };
 
 TSReader.prototype._processAudioES = function (es, pts) {
   var pos = 0;
   while (pos + 7 <= es.length) {
     if (es[pos] !== 0xFF || (es[pos + 1] & 0xF0) !== 0xF0) { pos++; continue; }
-    var protAbsent = es[pos + 1] & 0x01;
-    var hdrLen = protAbsent ? 7 : 9;
-    if (pos + hdrLen > es.length) break;
-    var frameLen = ((es[pos + 3] & 0x03) << 11) | (es[pos + 4] << 3) | ((es[pos + 5] & 0xE0) >> 5);
-    if (pos + frameLen > es.length) break;
-    var frame = Buffer.from(es.subarray(pos, pos + frameLen));
-    pos += frameLen;
+
+    // Parse the ADTS header for this frame. parseAdtsHeader does the
+    // same validation we used to do inline (sync, protection_absent,
+    // frame_length) and additionally exposes the sample rate and
+    // channel config. Using the header-reported sample rate fixes
+    // PTS drift when the stream rate differs from this._sampleRate
+    // (e.g. caller passed 48000 but stream is 44100) — see MP-32.
+    var info = parseAdtsHeader(es.subarray(pos, pos + 9));
+    if (!info || !info.frameLength) { pos++; continue; }
+    if (pos + info.frameLength > es.length) break;
+
+    var frame = Buffer.from(es.subarray(pos, pos + info.frameLength));
+    pos += info.frameLength;
+
+    var sampleRate = info.sampleRate || this._sampleRate;
+    var durUs = Math.floor(info.samplesPerFrame * 1000000 / sampleRate);
     var ptsUsA = pts !== null ? Math.floor(pts * (1000000 / 90000)) : this._nextAudioPtsUs;
-    var durUs = Math.floor(1024 * 1000000 / this._sampleRate);
     this._nextAudioPtsUs = ptsUsA + durUs;
-    this._ee.emit('audio', { payload: frame, ptsUs: ptsUsA, durationUs: durUs });
+    this._ee.emit('audio', {
+      payload: frame,
+      ptsUs: ptsUsA,
+      durationUs: durUs,
+      sampleRate: sampleRate,
+      channels: info.channels,
+      profile: info.profile,
+    });
   }
 };
 

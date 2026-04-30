@@ -5,6 +5,7 @@
 
 import { getVideoCodec, getAudioCodec, getSupportedVideoCodecs, getSupportedAudioCodecs } from './codecs.js';
 import { getHardwareAccelerationInfo } from './hw_accel.js';
+import { parseCodecString } from './codec_strings.js';
 
 var mediaCapabilities = {
   /**
@@ -84,25 +85,35 @@ var mediaCapabilities = {
 };
 
 /**
- * Parse codec name from MIME string.
- * 'video/mp4; codecs="avc1.42E01E"' → 'h264'
- * 'video/webm; codecs="vp9"' → 'vp9'
- * 'audio/mp4; codecs="mp4a.40.2"' → 'aac'
+ * Parse codec name from a MIME contentType string.
+ *   'video/mp4; codecs="avc1.42E01E"'  → 'h264'
+ *   'video/webm; codecs="vp9"'         → 'vp9'
+ *   'audio/mp4; codecs="mp4a.40.2"'    → 'aac'
+ *
+ * Delegates to codec_strings.parseCodecString for the actual codec
+ * identification (via regex patterns on full strings). The previous
+ * implementation used indexOf substring matching, which gave false
+ * positives like 'avp9' or 'lvp9' → vp9 (MP-28).
  */
 function _parseCodecString(contentType) {
   if (!contentType) return null;
-  var str = String(contentType).toLowerCase();
+  var str = String(contentType);
 
-  // Direct codec names
-  if (str.indexOf('vp8') >= 0 || str.indexOf('vp08') >= 0) return 'vp8';
-  if (str.indexOf('vp9') >= 0 || str.indexOf('vp09') >= 0) return 'vp9';
-  if (str.indexOf('av1') >= 0 || str.indexOf('av01') >= 0) return 'av1';
-  if (str.indexOf('avc') >= 0 || str.indexOf('h264') >= 0 || str.indexOf('h.264') >= 0) return 'h264';
-  if (str.indexOf('hev') >= 0 || str.indexOf('hvc') >= 0 || str.indexOf('h265') >= 0 || str.indexOf('h.265') >= 0) return 'h265';
-  if (str.indexOf('mp4a') >= 0 || str.indexOf('aac') >= 0) return 'aac';
-  if (str.indexOf('opus') >= 0) return 'opus';
+  // Extract the value of the codecs="..." parameter from the MIME
+  // string, if present. Per RFC 6381, the codecs parameter holds
+  // one or more codec strings separated by commas. We use the
+  // first one (matches browser MediaCapabilities behavior).
+  var m = str.match(/codecs\s*=\s*"?([^";]+)/i);
+  var codecPart;
+  if (m) {
+    codecPart = m[1].split(',')[0].trim();
+  } else {
+    // No codecs parameter — caller might have passed a bare codec
+    // string like 'vp9' or 'avc1.42E01E'. Try to parse directly.
+    codecPart = str.trim();
+  }
 
-  return null;
+  return parseCodecString(codecPart);
 }
 
 export default mediaCapabilities;

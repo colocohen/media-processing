@@ -9,10 +9,28 @@
 
 import FFmpegProcess from './ffmpeg_process.js';
 
+/**
+ * Build a DOMException-shaped error. WebCodecs spec mandates DOMException
+ * on state violations (InvalidStateError) and config violations
+ * (NotSupportedError). Node has globalThis.DOMException since 17.0; fall
+ * back to a tagged Error for older runtimes.
+ */
+function _domex(msg, name) {
+  if (typeof DOMException !== 'undefined') return new DOMException(msg, name);
+  var e = new Error(msg);
+  e.name = name || 'InvalidStateError';
+  return e;
+}
+
 function initCoder(self, init) {
   var userOutput = (init && init.output) || function () {};
-  // Wrap output to fire 'dequeue' event + forward metadata arg
+  // Wrap output to fire 'dequeue' event + forward metadata arg.
+  // W3C WebCodecs §encodeQueueSize: "decreases when an output() callback fires."
+  // (NOT when raw FFmpeg stdout bytes arrive — those are bytes, not frames.)
+  // Decrement here, in the per-frame output path; the FFmpeg-data handler in
+  // wireReader no longer touches _queueSize.
   self._output = function (chunk, metadata) {
+    if (self._queueSize > 0) self._queueSize--;
     self._stats.outputCount++;
     userOutput(chunk, metadata);
     if (self.dispatchEvent) self.dispatchEvent('dequeue');
@@ -39,7 +57,14 @@ function initCoder(self, init) {
 }
 
 function configureCoder(self) {
-  if (self._state === 'configured' || self._state === 'running') {
+  // W3C WebCodecs: if [[state]] is "closed", configure() throws
+  // InvalidStateError DOMException. The previous behavior silently
+  // resurrected the encoder, leaking the user's expectation that
+  // close() is terminal.
+  if (self._state === 'closed') {
+    throw _domex('Cannot configure a closed coder', 'InvalidStateError');
+  }
+  if (self._state === 'configured') {
     self._ffmpeg.stop();
     self._ffmpeg.removeAllListeners('data');
     self._ffmpeg.removeAllListeners('error');
@@ -133,6 +158,11 @@ function resetCoder(self) {
 /**
  * Wire FFmpeg output to reader, reader events to output callback.
  * Also handles stderr events.
+ *
+ * Note: queueSize is NOT decremented here. Per W3C WebCodecs spec,
+ * encodeQueueSize/decodeQueueSize should track FRAMES (one decrement
+ * per output() callback), not raw FFmpeg stdout bytes. The decrement
+ * happens in the wrapped self._output set by initCoder().
  */
 function wireReader(self, reader, eventMap) {
   self._reader = reader;
@@ -143,8 +173,6 @@ function wireReader(self, reader, eventMap) {
   }
   self._ffmpeg.on('data', function (chunk) {
     if (self._reader) self._reader.feed(chunk);
-    // Decrease queue size as output is produced
-    if (self._queueSize > 0) self._queueSize--;
   });
   self._ffmpeg.on('error', function (e) {
     self._error(e);
@@ -153,12 +181,22 @@ function wireReader(self, reader, eventMap) {
 
 /**
  * Apply standard coder prototype methods.
+ *
+ * Per W3C WebCodecs spec, encoders expose only `encodeQueueSize` and
+ * decoders expose only `decodeQueueSize`. Mixing them on the same
+ * prototype breaks feature detection (`'decodeQueueSize' in encoder`
+ * incorrectly returns true). Callers pass options.role = 'encoder' or
+ * 'decoder' to get the right surface; legacy callers (no role) still
+ * get both, with a one-time deprecation warning on first access of
+ * the wrong-side property.
+ *
  * Includes:
  *  - flush() → Promise (browser-compatible) + callback backward compat
  *  - addEventListener / removeEventListener (EventTarget)
  *  - dequeue event (fires when output is produced)
  */
-function applyCoderPrototype(Ctor) {
+function applyCoderPrototype(Ctor, options) {
+  var role = options && options.role;   // 'encoder' | 'decoder' | undefined
   // flush: returns Promise if no callback, or uses callback
   Ctor.prototype.flush = function (cb) {
     var self = this;
@@ -181,10 +219,20 @@ function applyCoderPrototype(Ctor) {
     if (this._ffmpeg) this._ffmpeg.resumeOutput();
   };
 
-  // W3C spec: encodeQueueSize (number of pending frames)
-  Object.defineProperty(Ctor.prototype, 'encodeQueueSize', {
-    get: function () { return this._queueSize; },
-  });
+  // W3C WebCodecs: encoders get encodeQueueSize, decoders get decodeQueueSize.
+  // Only define the property that matches the role (or both, for legacy
+  // callers who didn't specify). This keeps `'decodeQueueSize' in encoder`
+  // correctly false for spec-compliant encoders.
+  if (role !== 'decoder') {
+    Object.defineProperty(Ctor.prototype, 'encodeQueueSize', {
+      get: function () { return this._queueSize; },
+    });
+  }
+  if (role !== 'encoder') {
+    Object.defineProperty(Ctor.prototype, 'decodeQueueSize', {
+      get: function () { return this._queueSize; },
+    });
+  }
 
   /**
    * Production monitoring stats. Non-standard.
@@ -227,10 +275,6 @@ function applyCoderPrototype(Ctor) {
       this._ondequeue = fn;
       if (fn) this.addEventListener('dequeue', fn);
     },
-  });
-
-  Object.defineProperty(Ctor.prototype, 'decodeQueueSize', {
-    get: function () { return this._queueSize; },
   });
 }
 

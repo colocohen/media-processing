@@ -5,60 +5,198 @@
  *  - track.stop() kills the associated GStreamer/FFmpeg process
  *  - enumerateDevices() lists available cameras/mics
  *  - Shared _startCapture to avoid duplication between video/screen
+ *  - W3C MediaCapture compatibility: accepts ConstrainULong/Double
+ *    constraint objects ({ exact, ideal, min, max }), the spec-name
+ *    aliases (frameRate, deviceId), and stores original constraints
+ *    on the track for getConstraints().
  */
 
 import GStreamerProcess from './gstreamer_process.js';
 import FFmpegProcess from './ffmpeg_process.js';
 import FrameQueue from './frame_queue.js';
-import { MediaStream, MediaStreamTrack } from './media_stream.js';
+import { MediaStream, MediaStreamTrack, MediaDeviceInfo, InputDeviceInfo } from './media_stream.js';
 import VideoFrame from './video_frame.js';
 import AudioData from './audio_data.js';
 import { execSync } from 'node:child_process';
 import { platform } from 'node:os';
 
 /**
- * @param {object} constraints — { video, audio, screen }
- * @param {function} cb — function(err, mediaStream)
+ * Resolve a W3C ConstrainULong / ConstrainDouble / ConstrainBoolean
+ * /ConstrainDOMString value to a single concrete value.
+ *
+ * Spec (https://www.w3.org/TR/mediacapture-streams/#dom-constrainulong):
+ *   ConstrainULong = unsigned long
+ *                  | { exact?, ideal?, min?, max? }
+ *
+ * Browser code commonly writes
+ *   { width: { ideal: 1280 }, height: { ideal: 720 } }
+ *   { facingMode: { exact: 'user' } }
+ * and expects it to "just work". The naive `vOpts.width || default`
+ * pattern grabs the OBJECT, not the number, and downstream
+ * arithmetic returns NaN.
+ *
+ * Resolution priority: exact > ideal > avg(min, max) > min > max.
+ * If none of those keys exist, return undefined (caller falls back
+ * to its own default).
+ */
+function _resolveConstraint(value) {
+  if (value == null) return undefined;
+  // Plain primitives — the most common case
+  if (typeof value !== 'object') return value;
+  // ConstrainXxx object form
+  if ('exact' in value) return value.exact;
+  if ('ideal' in value) return value.ideal;
+  if ('min' in value && 'max' in value) {
+    // Pick the midpoint when both bounds are given but no preference
+    return (value.min + value.max) / 2;
+  }
+  if ('min' in value) return value.min;
+  if ('max' in value) return value.max;
+  return undefined;
+}
+
+/**
+ * Read a video constraint from a constraints object, accepting
+ * either the W3C name (preferred) or a library-specific alias.
+ *
+ * Examples:
+ *   _readConstraint(opts, ['frameRate', 'fps', 'framerate'])
+ *   _readConstraint(opts, ['deviceId', 'device'])
+ *
+ * The first name in the list is the W3C-canonical one; subsequent
+ * names are accepted for back-compat. Browser code uses the first;
+ * existing library users may have used a later one.
+ */
+function _readConstraint(opts, names) {
+  if (!opts) return undefined;
+  for (var i = 0; i < names.length; i++) {
+    if (names[i] in opts) {
+      var resolved = _resolveConstraint(opts[names[i]]);
+      if (resolved !== undefined) return resolved;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * @param {object} constraints — W3C MediaStreamConstraints
+ *   { video: boolean | MediaTrackConstraints,
+ *     audio: boolean | MediaTrackConstraints,
+ *     screen: ... (library extension, not W3C — use getDisplayMedia) }
+ * @param {function} [cb] — node-style callback(err, mediaStream); also
+ *   returns a Promise.
+ *
+ * Browser-compatible: returns a Promise that resolves AFTER the device
+ * probe has populated the track's capabilities, mirroring the browser
+ * contract where getCapabilities() works immediately on the resolved
+ * stream's tracks.
  */
 function getUserMedia(constraints, cb) {
+  // W3C: getUserMedia() with no MediaStreamConstraints rejects with
+  // a TypeError. The previous error message is preserved for callers
+  // that match on the string.
   if (!constraints) {
-    var err = new Error('getUserMedia: constraints required');
+    var err = new TypeError('getUserMedia: constraints required');
     if (cb) { cb(err); return; }
     return Promise.reject(err);
   }
 
+  // W3C: at least one of {video, audio} must be requested. The library
+  // also accepts 'screen' as an extension.
+  var wantsAnything = constraints.video || constraints.audio || constraints.screen;
+  if (!wantsAnything) {
+    var err2 = new TypeError(
+      'getUserMedia: at least one of {video, audio} must be requested'
+    );
+    if (cb) { cb(err2); return; }
+    return Promise.reject(err2);
+  }
+
   var stream = new MediaStream();
+  var pending = [];
 
   if (constraints.video) {
-    _startCapture(stream, constraints.video, 'camera');
+    pending.push(_startCapture(stream, constraints.video, 'camera'));
   }
 
   if (constraints.screen) {
-    _startCapture(stream, constraints.screen, 'screen');
+    pending.push(_startCapture(stream, constraints.screen, 'screen'));
   }
 
   if (constraints.audio) {
-    _startAudioCapture(stream, constraints.audio);
+    pending.push(_startAudioCapture(stream, constraints.audio));
   }
 
-  if (cb) { setTimeout(function () { cb(null, stream); }, 0); return stream; }
-  return Promise.resolve(stream);
+  // Resolve once every capture's setup (probe + track capability
+  // population) has completed. The actual media data may still take a
+  // few frames to start flowing, but track.getCapabilities() and
+  // track.getSettings() are guaranteed to be ready — matching browser
+  // semantics where getUserMedia resolves with a "ready to query" stream.
+  var promise = Promise.all(pending).then(function () { return stream; });
+
+  if (cb) {
+    promise.then(function (s) { cb(null, s); }, function (e) { cb(e); });
+    return stream;
+  }
+  return promise;
 }
 
 function _startCapture(stream, opts, mode) {
-  var vOpts = (typeof opts === 'object') ? opts : {};
-  var w = vOpts.width || 1280;
-  var h = vOpts.height || 720;
-  var fps = vOpts.fps || vOpts.framerate || 30;
+  // opts may be `true` ("any video"), false/undefined (caller already
+  // filtered this out before calling us), or a MediaTrackConstraints
+  // object. Treat boolean true as empty constraints.
+  var vOpts = (opts && typeof opts === 'object') ? opts : {};
+
+  // Resolve W3C constraint forms ({ exact, ideal, min, max }) and
+  // accept the spec-canonical names (frameRate, deviceId) alongside
+  // the library's older aliases (fps, framerate, device). _resolveConstraint
+  // returns undefined when no value was supplied, so we can fall back
+  // to defaults cleanly.
+  var w   = _readConstraint(vOpts, ['width']) || 1280;
+  var h   = _readConstraint(vOpts, ['height']) || 720;
+  var fps = _readConstraint(vOpts, ['frameRate', 'fps', 'framerate']) || 30;
+  var device = _readConstraint(vOpts, ['deviceId', 'device']);
+
+  // Other W3C constraints we accept for compatibility but don't
+  // currently honor in the FFmpeg/GStreamer pipeline. Storing them
+  // on the track means getConstraints() echoes them back, which is
+  // what the spec requires and what browser code expects.
+  var facingMode  = _readConstraint(vOpts, ['facingMode']);
+  var aspectRatio = _readConstraint(vOpts, ['aspectRatio']);
+  var resizeMode  = _readConstraint(vOpts, ['resizeMode']);
+  var groupId     = _readConstraint(vOpts, ['groupId']);
+
+  // Coerce numeric values — { ideal: '1280' } from a string-typed
+  // signaling channel shouldn't end up as 'NaN' downstream.
+  w   = Number(w);
+  h   = Number(h);
+  fps = Number(fps);
+  if (!Number.isFinite(w) || w <= 0)   w = 1280;
+  if (!Number.isFinite(h) || h <= 0)   h = 720;
+  if (!Number.isFinite(fps) || fps <= 0) fps = 30;
+
   var bytesPerFrame = ((w * h * 3) >> 1);
 
   var track = new MediaStreamTrack({
     kind: 'video', label: mode,
     settings: {
       width: w, height: h, frameRate: fps,
+      // Echo back W3C settings the caller supplied, even if we don't
+      // act on them — getSettings() must mirror what was negotiated.
+      deviceId:    device,
+      facingMode:  facingMode,
+      aspectRatio: aspectRatio,
+      resizeMode:  resizeMode,
+      groupId:     groupId,
       displaySurface: (mode === 'screen') ? (vOpts.displaySurface || 'monitor') : undefined,
     },
   });
+
+  // Store the original (un-normalized) constraints on the track so
+  // getConstraints() returns what the caller passed in, per spec
+  // §5.2 step "set [[constraints]] internal slot".
+  track._constraints = (opts && typeof opts === 'object') ? opts : {};
+
   var gst = new GStreamerProcess();
   stream.addTrack(track);
   stream._processes.push(gst);
@@ -91,45 +229,102 @@ function _startCapture(stream, opts, mode) {
       displaySurface: vOpts.displaySurface,
       windowTitle: vOpts.windowTitle,
       display: vOpts.display,
-      device: vOpts.device,
+      device: device,
       ffmpegPath: vOpts.ffmpegPath,
     });
-  } else {
-    gst.startCamera({ width: w, height: h, fps: fps, device: vOpts.device });
+    // Screen capture has no probe — settings already set, capabilities
+    // intentionally empty (browser getDisplayMedia behaves similarly).
+    return Promise.resolve();
   }
+
+  // Camera path: probe the device list to populate track capabilities
+  // before returning. The probe is also called inside gst.startCamera()
+  // for source-mode pinning, but the result is cached so this is a
+  // single subprocess invocation total.
+  gst.startCamera({ width: w, height: h, fps: fps, device: device });
+
+  return GStreamerProcess.probeAllDevices().then(function (devices) {
+    var match = _findCameraDevice(devices, device);
+    if (match) {
+      track._capabilities = GStreamerProcess.capabilitiesFromModes(match.modes, 'videoinput');
+      // Fill in the actual deviceId/label from the probe — the user
+      // may have passed undefined or a partial hint, but getSettings()
+      // should reflect what we actually opened.
+      track._settings.deviceId = match.deviceId;
+      track._settings.groupId  = match.deviceId;  // groupId === deviceId per design
+      track.label = match.label;
+    }
+    // If probe returned nothing or no camera matched, _capabilities
+    // stays undefined and getCapabilities() returns {} — graceful
+    // degradation without breaking the caller.
+  });
+}
+
+/** Find a camera device by deviceId or label substring; falls back to first. */
+function _findCameraDevice(devices, hint) {
+  for (var i = 0; i < devices.length; i++) {
+    if (devices[i].kind !== 'videoinput') continue;
+    if (!hint) return devices[i];
+    if (devices[i].deviceId === hint) return devices[i];
+    if (devices[i].label.indexOf(hint) >= 0) return devices[i];
+  }
+  for (var j = 0; j < devices.length; j++) {
+    if (devices[j].kind === 'videoinput') return devices[j];
+  }
+  return null;
 }
 
 function _startAudioCapture(stream, opts) {
-  var aOpts = (typeof opts === 'object') ? opts : {};
-  var sampleRate = aOpts.sampleRate || 48000;
-  var channels = aOpts.channelCount || aOpts.numberOfChannels || 2;
-  var device = aOpts.device || null;
-  var plat = platform();
+  var aOpts = (opts && typeof opts === 'object') ? opts : {};
+
+  // W3C-aware constraint reads. ConstrainULong objects are resolved
+  // here too so { sampleRate: { ideal: 48000 } } works.
+  var sampleRate = _readConstraint(aOpts, ['sampleRate']);
+  var channels   = _readConstraint(aOpts, ['channelCount', 'numberOfChannels']);
+  var device     = _readConstraint(aOpts, ['deviceId', 'device']);
+
+  // Per-spec audio booleans we accept and store for getConstraints
+  // round-trip, even if the GStreamer pipeline doesn't apply them
+  // yet. A future MP-* item can plumb these through to webrtcdsp.
+  var echoCancellation = _readConstraint(aOpts, ['echoCancellation']);
+  var autoGainControl  = _readConstraint(aOpts, ['autoGainControl']);
+  var noiseSuppression = _readConstraint(aOpts, ['noiseSuppression']);
+
+  sampleRate = Number(sampleRate);
+  channels   = Number(channels);
+  if (!Number.isFinite(sampleRate) || sampleRate <= 0) sampleRate = 48000;
+  if (!Number.isFinite(channels) || channels <= 0)     channels = 2;
 
   var track = new MediaStreamTrack({
     kind: 'audio', label: 'microphone',
-    settings: { sampleRate: sampleRate, channelCount: channels },
+    settings: {
+      sampleRate: sampleRate,
+      channelCount: channels,
+      deviceId: device,
+      echoCancellation: echoCancellation,
+      autoGainControl:  autoGainControl,
+      noiseSuppression: noiseSuppression,
+    },
   });
-  var ffmpeg = new FFmpegProcess();
+  // Echo back original constraints for getConstraints()
+  track._constraints = (opts && typeof opts === 'object') ? opts : {};
+
+  // Mic capture uses GStreamer (pulsesrc / wasapisrc / osxaudiosrc).
+  // The previous FFmpeg-based path with `-f pulse -i default` would
+  // exit silently on systems where pulse wasn't the default audio
+  // server (containers, WSL, some Linux desktops), producing a track
+  // that emits zero AudioData events even though getUserMedia
+  // returned successfully. GStreamer's pulsesrc auto-resolves a
+  // sane source and surfaces failures via stderr. See gstreamer_process.js
+  // startAudio() for the per-platform pipeline.
+  var gst = new GStreamerProcess();
   stream.addTrack(track);
-  stream._processes.push(ffmpeg);
+  stream._processes.push(gst);
 
-  track._onStop = function () { ffmpeg.stop(); };
+  track._onStop = function () { gst.stop(); };
 
-  // Build FFmpeg args for mic capture
-  var args = ['-loglevel', 'error'];
-
-  if (plat === 'win32') {
-    args.push('-f', 'dshow', '-i', 'audio=' + (device || 'Microphone'));
-  } else if (plat === 'darwin') {
-    args.push('-f', 'avfoundation', '-i', ':' + (device || '0'));
-  } else {
-    args.push('-f', 'pulse', '-i', device || 'default');
-  }
-
-  args.push('-f', 's16le', '-ar', String(sampleRate), '-ac', String(channels), 'pipe:1');
-
-  // 10ms chunks of PCM
+  // 10ms chunks of PCM. Frame queue is pre-sized so the sample-count
+  // arithmetic below stays exact for the entire session.
   var samplesPerChunk = Math.floor(sampleRate / 100);
   var bytesPerChunk = samplesPerChunk * channels * 2;
   var chunkIdx = 0;
@@ -148,115 +343,87 @@ function _startAudioCapture(stream, opts) {
     track._push(ad);
   });
 
-  ffmpeg.on('stdout', function (chunk) { fq.push(chunk); });
-  ffmpeg.on('error', function (e) { track._ee.emit('error', e); });
-  ffmpeg.on('close', function () { track.stop(); });
+  gst.on('data', function (chunk) { fq.push(chunk); });
+  gst.on('error', function (e) { track._ee.emit('error', e); });
+  gst.on('close', function () { track.stop(); });
 
-  ffmpeg.start(args, ['ignore', 'pipe', 'pipe']);
+  gst.startAudio({
+    sampleRate: sampleRate,
+    channels: channels,
+    device: device,
+  });
+
+  // Probe the device list to populate track capabilities. The probe
+  // is cached, so this is free if a video capture also ran the probe.
+  return GStreamerProcess.probeAllDevices().then(function (devices) {
+    var match = _findAudioDevice(devices, device);
+    if (match) {
+      track._capabilities = GStreamerProcess.capabilitiesFromModes(match.modes, 'audioinput');
+      // Augment capabilities with W3C audio booleans the spec
+      // advertises for input devices, even though we don't apply
+      // these in the pipeline yet. echoCancellation/autoGainControl/
+      // noiseSuppression each map to "we'd accept it as a constraint"
+      // — exposing the boolean array follows browser conventions.
+      track._capabilities.echoCancellation = [true, false];
+      track._capabilities.autoGainControl  = [true, false];
+      track._capabilities.noiseSuppression = [true, false];
+
+      track._settings.deviceId = match.deviceId;
+      track._settings.groupId  = match.deviceId;
+      track.label = match.label;
+    }
+  });
+}
+
+/** Find an audio device by deviceId or label substring; falls back to first. */
+function _findAudioDevice(devices, hint) {
+  for (var i = 0; i < devices.length; i++) {
+    if (devices[i].kind !== 'audioinput') continue;
+    if (!hint) return devices[i];
+    if (devices[i].deviceId === hint) return devices[i];
+    if (devices[i].label.indexOf(hint) >= 0) return devices[i];
+  }
+  for (var j = 0; j < devices.length; j++) {
+    if (devices[j].kind === 'audioinput') return devices[j];
+  }
+  return null;
 }
 
 /**
- * Enumerate available media devices (cameras, microphones).
- * Returns an array of { deviceId, kind, label }.
+ * Enumerate available media devices via gst-device-monitor-1.0
+ * (W3C MediaDevices.enumerateDevices()).
  *
- * Platform-specific: uses FFmpeg/GStreamer to discover devices.
+ * Returns Promise<InputDeviceInfo[]> — async to match the browser API
+ * exactly. Each returned object has { deviceId, kind, label, groupId }
+ * plus a getCapabilities() method that returns W3C MediaTrackCapabilities
+ * derived from the device's native modes.
+ *
+ * The probe is cached for the process lifetime, so repeated calls are
+ * effectively free after the first one. If gst-device-monitor-1.0 is
+ * unavailable (binary missing, query timed out, malformed output) this
+ * resolves to [] without throwing — the same fail-soft behavior browsers
+ * exhibit when permissions block device enumeration.
+ *
+ * Note: this replaces an earlier synchronous, platform-specific
+ * implementation that scraped FFmpeg dshow / v4l2-ctl / system_profiler
+ * output. The change to async aligns with the W3C contract; callers
+ * must `await` (or .then()) the result.
  */
 function enumerateDevices() {
-  var devices = [];
-  var plat = platform();
-
-  try {
-    if (plat === 'win32') {
-      // FFmpeg dshow device listing
-      var out = '';
-      try {
-        execSync('ffmpeg -list_devices true -f dshow -i dummy 2>&1', { timeout: 5000, encoding: 'utf8' });
-      } catch (e) {
-        out = e.stdout || e.stderr || (e.output ? e.output.join('') : '');
-      }
-      var lines = out.split('\n');
-      var currentKind = null;
-      for (var i = 0; i < lines.length; i++) {
-        var line = lines[i];
-        if (line.indexOf('DirectShow video') >= 0) currentKind = 'videoinput';
-        else if (line.indexOf('DirectShow audio') >= 0) currentKind = 'audioinput';
-        else if (currentKind) {
-          var match = line.match(/"([^"]+)"/);
-          if (match && line.indexOf('Alternative name') < 0) {
-            devices.push({ deviceId: match[1], kind: currentKind, label: match[1] });
-          }
-        }
-      }
-    } else if (plat === 'linux') {
-      // v4l2 devices
-      try {
-        var v4l2 = execSync('v4l2-ctl --list-devices 2>/dev/null', { timeout: 5000, encoding: 'utf8' });
-        var v4lLines = v4l2.split('\n');
-        for (var j = 0; j < v4lLines.length; j++) {
-          var dev = v4lLines[j].trim();
-          if (dev.indexOf('/dev/video') === 0) {
-            devices.push({ deviceId: dev, kind: 'videoinput', label: dev });
-          }
-        }
-      } catch (e) {}
-      // PulseAudio sources
-      try {
-        var pa = execSync('pactl list short sources 2>/dev/null', { timeout: 5000, encoding: 'utf8' });
-        var paLines = pa.split('\n');
-        for (var k = 0; k < paLines.length; k++) {
-          var parts = paLines[k].split('\t');
-          if (parts.length >= 2) {
-            devices.push({ deviceId: parts[1], kind: 'audioinput', label: parts[1] });
-          }
-        }
-      } catch (e) {}
-    } else if (plat === 'darwin') {
-      // macOS: cameras via system_profiler
-      try {
-        var camOut = execSync('system_profiler SPCameraDataType 2>/dev/null', { timeout: 5000, encoding: 'utf8' });
-        var camLines = camOut.split('\n');
-        for (var m = 0; m < camLines.length; m++) {
-          var camLine = camLines[m].trim();
-          if (camLine && camLine.indexOf(':') === -1 && camLine.indexOf('Camera') === -1 && camLine.length > 0) {
-            // Lines without ':' are device names
-          } else if (camLine.indexOf(':') > 0 && camLine.indexOf('Model') < 0 && camLine.indexOf('Unique') < 0) {
-            continue;
-          }
-          // Match device name lines (indented, no colon usually, or "Name: ...")
-          var camMatch = camLine.match(/^\s*(.+?):\s*$/);
-          if (camMatch && camLine.indexOf('Camera') >= 0) {
-            devices.push({ deviceId: camMatch[1], kind: 'videoinput', label: camMatch[1] });
-          }
-        }
-      } catch (e) {}
-      // macOS: audio devices via FFmpeg avfoundation
-      try {
-        var avfOut = '';
-        try {
-          execSync('ffmpeg -f avfoundation -list_devices true -i "" 2>&1', { timeout: 5000, encoding: 'utf8' });
-        } catch (e2) {
-          avfOut = e2.stdout || e2.stderr || (e2.output ? e2.output.join('') : '');
-        }
-        var avfLines = avfOut.split('\n');
-        var avfKind = null;
-        for (var n = 0; n < avfLines.length; n++) {
-          var avfLine = avfLines[n];
-          if (avfLine.indexOf('video devices') >= 0) avfKind = 'videoinput';
-          else if (avfLine.indexOf('audio devices') >= 0) avfKind = 'audioinput';
-          else if (avfKind) {
-            var avfMatch = avfLine.match(/\[(\d+)\]\s+(.+)/);
-            if (avfMatch) {
-              devices.push({ deviceId: avfMatch[1], kind: avfKind, label: avfMatch[2].trim() });
-            }
-          }
-        }
-      } catch (e) {}
+  return GStreamerProcess.probeAllDevices().then(function (probed) {
+    var out = [];
+    for (var i = 0; i < probed.length; i++) {
+      var d = probed[i];
+      out.push(new InputDeviceInfo({
+        deviceId: d.deviceId,
+        kind:     d.kind,
+        label:    d.label,
+        groupId:  d.deviceId,  // groupId === deviceId per design choice
+        capabilities: GStreamerProcess.capabilitiesFromModes(d.modes, d.kind),
+      }));
     }
-  } catch (e) {
-    // Device enumeration failed silently
-  }
-
-  return devices;
+    return out;
+  });
 }
 
 getUserMedia.enumerateDevices = enumerateDevices;
@@ -278,12 +445,18 @@ getUserMedia.enumerateDevices = enumerateDevices;
 function getDisplayMedia(constraints) {
   if (!constraints) constraints = {};
   var vOpts = constraints.video;
-  if (vOpts === true) vOpts = {};
-  if (vOpts === false || vOpts === undefined) vOpts = {};
+  if (vOpts === true || vOpts === undefined) vOpts = {};
+  if (vOpts === false) {
+    return Promise.reject(new TypeError(
+      'getDisplayMedia: video must not be set to false'
+    ));
+  }
 
   var stream = new MediaStream();
 
-  // Pass displaySurface and windowTitle through to GStreamer/FFmpeg
+  // Pass displaySurface and windowTitle through to GStreamer/FFmpeg.
+  // _startCapture handles ConstrainULong normalization for width /
+  // height / frameRate, so browser-style constraints work here too.
   _startCapture(stream, vOpts, 'screen');
 
   // System audio capture
@@ -307,14 +480,23 @@ function getDisplayMedia(constraints) {
  * @param {object} opts — { sampleRate, channelCount, device }
  */
 function _startSystemAudioCapture(stream, opts) {
-  var sampleRate = opts.sampleRate || 48000;
-  var channels = opts.channelCount || opts.numberOfChannels || 2;
+  // Same W3C-aware constraint reads as _startAudioCapture; system
+  // audio shares the audio-track shape.
+  var sampleRate = _readConstraint(opts, ['sampleRate']);
+  var channels   = _readConstraint(opts, ['channelCount', 'numberOfChannels']);
+  sampleRate = Number(sampleRate);
+  channels   = Number(channels);
+  if (!Number.isFinite(sampleRate) || sampleRate <= 0) sampleRate = 48000;
+  if (!Number.isFinite(channels) || channels <= 0)     channels = 2;
+
   var plat = platform();
 
   var track = new MediaStreamTrack({
     kind: 'audio', label: 'system-audio',
     settings: { sampleRate: sampleRate, channelCount: channels },
   });
+  track._constraints = (opts && typeof opts === 'object') ? opts : {};
+
   var ffmpeg = new FFmpegProcess();
   stream.addTrack(track);
   stream._processes.push(ffmpeg);
@@ -444,4 +626,4 @@ function _findWindowsAudioDevice() {
 }
 
 export default getUserMedia;
-export { enumerateDevices, getDisplayMedia };
+export { enumerateDevices, getDisplayMedia, MediaDeviceInfo, InputDeviceInfo };
