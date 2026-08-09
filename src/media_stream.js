@@ -14,7 +14,14 @@ import { domException as _domex } from './core/dom_exception.js';
 
 function MediaStreamTrack(opts) {
   if (!opts) opts = {};
-  this._ee = new EventEmitter();
+  // Internal plumbing is NON-ENUMERABLE: a MediaStreamTrack in a browser
+  // exposes only its IDL attributes, so anything that walks or serialises
+  // a track (JSON.stringify in tests, structured logging, shallow clones,
+  // deep-equality helpers) must not see _ee/_onStop/_settings. Leaving
+  // them enumerable leaked the EventEmitter and its listener arrays into
+  // every serialised track.
+  Object.defineProperty(this, '_ee', {
+    value: new EventEmitter(), writable: true, enumerable: false, configurable: true });
   this.kind = opts.kind || 'video';
   this.id = opts.id || _generateId();
   this.label = opts.label || '';
@@ -22,8 +29,11 @@ function MediaStreamTrack(opts) {
   this.readyState = 'live';
   this.muted = false;
   this.contentHint = opts.contentHint || '';  // '', 'motion', 'detail', 'text'
-  this._onStop = null;
-  this._settings = opts.settings || {};  // capture-time settings (width, height, frameRate, sampleRate, etc.)
+  Object.defineProperty(this, '_onStop', {
+    value: null, writable: true, enumerable: false, configurable: true });
+  // capture-time settings (width, height, frameRate, sampleRate, …)
+  Object.defineProperty(this, '_settings', {
+    value: opts.settings || {}, writable: true, enumerable: false, configurable: true });
 }
 
 MediaStreamTrack.prototype.on = function (ev, fn) { this._ee.on(ev, fn); };
@@ -47,7 +57,9 @@ MediaStreamTrack.prototype.stop = function () {
     this._onStop();
     this._onStop = null;
   }
-  this._ee.emit('ended');
+  // Same reasoning as addtrack: `ended` is a W3C event, so the handler
+  // is entitled to read `e.type`. It carried no argument at all.
+  this._ee.emit('ended', _event('ended', this));
 };
 
 /**
@@ -234,11 +246,38 @@ MediaStreamTrack.prototype._setMuted = function (muted) {
  *   new MediaStream([track1, track2])    — create from array of tracks
  *   new MediaStream({ tracks: [...] })   — internal form
  */
+/**
+ * Minimal Event / MediaStreamTrackEvent shapes.
+ *
+ * These are not full DOM Events — there is no capture phase, no
+ * preventDefault, no bubbling here — but they carry the members a
+ * handler actually reads, so code written against the browser API works
+ * unchanged. `target` and `currentTarget` are included because handlers
+ * commonly reach for them.
+ */
+function _event(type, target) {
+  return { type: type, target: target || null, currentTarget: target || null,
+           timeStamp: Date.now() };
+}
+
+function _trackEvent(type, track) {
+  var e = _event(type, null);
+  e.track = track;
+  return e;
+}
+
 function MediaStream(arg) {
-  this._ee = new EventEmitter();
+  // Same non-enumerable rule as MediaStreamTrack: a browser MediaStream
+  // exposes only `id` (plus its methods), so the EventEmitter, the track
+  // array and the pipeline processes must stay hidden from serialisation
+  // and property walks.
+  Object.defineProperty(this, '_ee', {
+    value: new EventEmitter(), writable: true, enumerable: false, configurable: true });
   this.id = _generateId();
-  this._tracks = [];
-  this._processes = [];
+  Object.defineProperty(this, '_tracks', {
+    value: [], writable: true, enumerable: false, configurable: true });
+  Object.defineProperty(this, '_processes', {
+    value: [], writable: true, enumerable: false, configurable: true });
 
   if (arg instanceof MediaStream) {
     // Clone from existing stream
@@ -253,6 +292,15 @@ function MediaStream(arg) {
       for (var k = 0; k < arg.tracks.length; k++) this._tracks.push(arg.tracks[k]);
     }
   }
+
+  // Watch tracks supplied to the constructor too — a stream built from
+  // an existing track list must fire `inactive` when that list ends,
+  // not only one built up through addTrack().
+  Object.defineProperty(this, '_trackWatchers', {
+    value: [], writable: true, enumerable: false, configurable: true });
+  Object.defineProperty(this, '_lastActive', {
+    value: this._tracks.length > 0, writable: true, enumerable: false, configurable: true });
+  for (var w = 0; w < this._tracks.length; w++) this._watchTrack(this._tracks[w]);
 }
 
 MediaStream.prototype.on = function (ev, fn) { this._ee.on(ev, fn); };
@@ -315,21 +363,38 @@ Object.defineProperty(MediaStream.prototype, 'oninactive', {
 });
 
 MediaStream.prototype.addTrack = function (track) {
-  if (!(track instanceof MediaStreamTrack)) {
+  // DUCK-TYPED (not instanceof): under node --preserve-symlinks, sibling
+  // packages (webrtc-server, stable-webrtc) resolve media-processing via
+  // DIFFERENT module paths and therefore hold DIFFERENT class identities
+  // for the very same source file — a genuine MediaStreamTrack from one
+  // fails `instanceof` against the other. Shape is identity here.
+  var looksLikeTrack = track && typeof track === 'object' &&
+    (track.kind === 'audio' || track.kind === 'video') &&
+    typeof track.id === 'string';
+  if (!(track instanceof MediaStreamTrack) && !looksLikeTrack) {
     throw new TypeError('MediaStream.addTrack: expected MediaStreamTrack');
   }
   for (var i = 0; i < this._tracks.length; i++) {
     if (this._tracks[i].id === track.id) return;
   }
   this._tracks.push(track);
-  this._ee.emit('addtrack', track);
+  this._watchTrack(track);
+  this._syncActive();
+  // W3C dispatches a MediaStreamTrackEvent — an object carrying `type`
+  // and `track` — not the bare track. Emitting the track itself meant
+  // spec-shaped handler code (`e.track.id`) threw TypeError, and because
+  // core/events.js catches listener exceptions and only logs them, the
+  // symptom was an event that appeared never to have fired at all.
+  this._ee.emit('addtrack', _trackEvent('addtrack', track));
 };
 
 MediaStream.prototype.removeTrack = function (track) {
   for (var i = 0; i < this._tracks.length; i++) {
     if (this._tracks[i].id === track.id) {
       this._tracks.splice(i, 1);
-      this._ee.emit('removetrack', track);
+      this._unwatchTrack(track);
+      this._ee.emit('removetrack', _trackEvent('removetrack', track));
+      this._syncActive();
       return;
     }
   }
@@ -358,6 +423,56 @@ MediaStream.prototype.getTrackById = function (id) {
     if (this._tracks[i].id === id) return this._tracks[i];
   }
   return null;
+};
+
+/**
+ * Fire `active` / `inactive` when the derived active state flips.
+ *
+ * W3C defines a MediaStream as active while at least one of its tracks
+ * has not ended, and requires an `active` / `inactive` event on each
+ * transition. The `active` getter below already computed the state
+ * correctly — but nothing ever observed it. A stream whose last track
+ * ended went quietly from active to inactive, and the `oninactive`
+ * handler this class exposes could never be called.
+ *
+ * Unlike `mute` / `unmute`, this needs no guesswork: the state is a
+ * pure function of the tracks, so the events can be derived exactly.
+ *
+ * Latched on the transition, not on the trigger, so stop() ending five
+ * tracks fires `inactive` once rather than five times.
+ */
+MediaStream.prototype._syncActive = function () {
+  var now = this.active;
+  if (this._lastActive === undefined) this._lastActive = now;
+  if (now === this._lastActive) return;
+  this._lastActive = now;
+  this._ee.emit(now ? 'active' : 'inactive', _event(now ? 'active' : 'inactive', this));
+};
+
+/** Observe a track so its ending can flip the stream's active state. */
+MediaStream.prototype._watchTrack = function (track) {
+  if (!track || typeof track.on !== 'function') return;
+  if (!this._trackWatchers) this._trackWatchers = [];
+  for (var i = 0; i < this._trackWatchers.length; i++) {
+    if (this._trackWatchers[i].track === track) return;
+  }
+  var self = this;
+  var fn = function () { self._syncActive(); };
+  this._trackWatchers.push({ track: track, fn: fn });
+  track.on('ended', fn);
+};
+
+MediaStream.prototype._unwatchTrack = function (track) {
+  if (!this._trackWatchers) return;
+  for (var i = 0; i < this._trackWatchers.length; i++) {
+    if (this._trackWatchers[i].track === track) {
+      if (typeof track.off === 'function') {
+        track.off('ended', this._trackWatchers[i].fn);
+      }
+      this._trackWatchers.splice(i, 1);
+      return;
+    }
+  }
 };
 
 Object.defineProperty(MediaStream.prototype, 'active', {

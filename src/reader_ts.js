@@ -38,15 +38,41 @@ TSReader.prototype.off = function (ev, fn) { this._ee.off(ev, fn); };
 TSReader.prototype.feed = function (chunk) {
   this._q.push(chunk);
   while (this._q.length >= PACKET_SIZE) {
+    // Resync must advance by ONE byte, not by a whole packet.
+    //
+    // The previous loop read 188 bytes, and on a sync-byte mismatch
+    // simply read the next 188. If the stream ever became misaligned
+    // by k bytes — a truncated write, a dropped chunk, joining a live
+    // stream mid-packet — every subsequent read stayed misaligned by
+    // the same k. Alignment could never be recovered and the reader
+    // silently emitted nothing for the rest of the session.
+    //
+    // Discarding a single byte lets the scan walk back onto the packet
+    // grid within at most 188 bytes.
+    if (this._q.byteAt(0) !== SYNC_BYTE) {
+      this._q.discard(1);
+      continue;
+    }
     var pkt = this._q.read(PACKET_SIZE);
-    if (pkt[0] !== SYNC_BYTE) continue;
     this._handlePacket(pkt);
   }
 };
 
+/**
+ * Emit any PES still accumulating, then reset.
+ *
+ * _accumPES only flushes a PES when the NEXT one starts (PUSI). At
+ * end-of-stream there is no next PUSI, so the final access unit sat in
+ * _pesBuf and was discarded — the same trailing-frame loss that
+ * reader_annexb.flush() already exists to prevent, and for the same
+ * reason.
+ */
 TSReader.prototype.flush = function () {
+  if (this._videoPid !== null) this._flushPES(this._videoPid, 'video');
+  if (this._audioPid !== null) this._flushPES(this._audioPid, 'audio');
   this._q.reset();
   this._pesBuf = {};
+  this._ee.emit('flushed');
 };
 
 TSReader.prototype._handlePacket = function (pkt) {
@@ -164,9 +190,26 @@ TSReader.prototype._flushPES = function (pid, kind) {
 
   if (pes.length < 9 + headerDataLen) return;
   if ((flags & 0x80) === 0x80 && headerDataLen >= 5) {
-    pts = ((pes[9] & 0x0E) << 29) | ((pes[10] & 0xFF) << 22) |
-          ((pes[11] & 0xFE) << 14) | ((pes[12] & 0xFF) << 7) |
-          ((pes[13] & 0xFE) >> 1);
+    // PES PTS is 33 bits (ISO/IEC 13818-1 §2.4.3.7). JavaScript's
+    // bitwise operators are 32-bit and SIGNED, so the textbook shift
+    // form silently breaks:
+    //
+    //   ((pes[9] & 0x0E) << 29)  — the top field is 0..14; 8 << 29 is
+    //   2^32, which truncates to 0, and any result above 2^31 comes
+    //   back negative through the `|` chain.
+    //
+    // Measured against synthetic PES headers: correct up to 6.63 hours
+    // of 90 kHz PTS, NEGATIVE beyond it, and wrapped to small wrong
+    // values past 13.26 hours. MPEG-TS PTS also commonly starts at a
+    // large arbitrary value rather than zero, so a stream can land in
+    // the broken range within seconds of starting.
+    //
+    // Multiplication keeps the value in Number's 53-bit safe integer
+    // range, which covers the full 33-bit field with room to spare.
+    var ptsHi  = (pes[9] & 0x0E) >> 1;              // PTS[32:30]
+    var ptsMid = ((pes[10] & 0xFF) << 7) | ((pes[11] & 0xFE) >> 1);   // PTS[29:15]
+    var ptsLo  = ((pes[12] & 0xFF) << 7) | ((pes[13] & 0xFE) >> 1);   // PTS[14:0]
+    pts = (ptsHi * 1073741824) + (ptsMid * 32768) + ptsLo;
   }
 
   var payloadStart = 9 + headerDataLen;

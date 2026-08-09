@@ -9,7 +9,11 @@
  *   });
  *   muxer.addVideoChunk(encodedVideoChunk);
  *   muxer.addAudioChunk(encodedAudioChunk);
- *   await muxer.finalize();
+ *   muxer.finalize(function () {
+ *     // Container trailer written; the output file is complete.
+ *   });
+ *
+ * finalize() also returns a Promise when no callback is given.
  *
  * Video is fed through stdin (pipe:0), audio through pipe:3.
  * FFmpeg muxes them into the output container.
@@ -66,19 +70,69 @@ Muxer.prototype.addAudioChunk = function (chunk) {
 };
 
 /**
- * Finalize: close all inputs, wait for FFmpeg to write container trailer.
+ * Finalize: close all inputs, wait for FFmpeg to write the container
+ * trailer, then complete.
+ *
+ * Three ways this used to never complete, all of which stalled the
+ * caller forever because it waited on a 'close' event that could not
+ * arrive:
+ *
+ *   1. FFmpeg was never started. _start() runs lazily on the first
+ *      chunk, so a recording that produced none has no child process
+ *      and no 'close'. A recording that captured nothing is exactly
+ *      the case a caller is most likely to finalize.
+ *   2. FFmpeg already exited — it failed at startup, or finalize() was
+ *      called twice. The event fired before the listener was attached.
+ *   3. FFmpeg hung. Nothing bounded the wait.
+ *
+ * This matters beyond the Muxer: MediaRecorder.stop() in muxer mode
+ * awaits finalize() before dispatching 'stop', so any of the above
+ * meant onstop never fired and the recording never appeared to end.
+ *
+ * base_coder's flushCoder already solves the same problem with a
+ * bounded wait and paired listener cleanup; this mirrors it.
+ *
+ * @param {Function} [cb] — callback style; omit for a Promise.
+ * @param {number} [timeoutMs=10000] — upper bound on the wait.
  */
-Muxer.prototype.finalize = function (cb) {
+var FINALIZE_TIMEOUT = 10000;
+
+Muxer.prototype.finalize = function (cb, timeoutMs) {
   var self = this;
-  if (typeof cb === 'function') {
-    self._finishInputs();
-    self._ffmpeg.on('close', function () { cb(); });
+  if (typeof cb !== 'function') {
+    var tmo = cb;   // called as finalize(timeoutMs)
+    return new Promise(function (resolve) { self.finalize(resolve, tmo); });
+  }
+
+  // Nothing was ever spawned, or it has already exited: there is no
+  // trailer left to write and no event coming. Complete on the next
+  // tick so the caller always sees consistent async cadence.
+  if (!this._started || !this._ffmpeg.running) {
+    setTimeout(function () { cb(); }, 0);
     return;
   }
-  return new Promise(function (resolve) {
-    self._finishInputs();
-    self._ffmpeg.on('close', function () { resolve(); });
-  });
+
+  var done = false;
+  var timer = null;
+  function finish() {
+    if (done) return;
+    done = true;
+    if (timer) { clearTimeout(timer); timer = null; }
+    self._ffmpeg.off('close', finish);
+    cb();
+  }
+
+  timer = setTimeout(function () {
+    // FFmpeg is wedged. Kill it so the caller isn't held hostage; the
+    // output file may be missing its trailer, which is the lesser
+    // failure compared with never returning.
+    self._ffmpeg.stop();
+    finish();
+  }, timeoutMs || FINALIZE_TIMEOUT);
+  if (timer.unref) timer.unref();
+
+  this._ffmpeg.on('close', finish);
+  this._finishInputs();
 };
 
 Muxer.prototype._finishInputs = function () {
@@ -89,7 +143,14 @@ Muxer.prototype._finishInputs = function () {
   this._ffmpeg.endInput();
 };
 
-Muxer.prototype.close = function () { this._ffmpeg.stop(); };
+Muxer.prototype.close = function () {
+  this._ffmpeg.stop();
+  // Reset so the instance is not left in a half-open state where
+  // _started is true but no process exists — addVideoChunk() would then
+  // write into nothing and finalize() would wait on a dead handle.
+  this._started = false;
+  this._proc = null;
+};
 
 Muxer.prototype._start = function () {
   if (this._started) return;

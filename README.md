@@ -154,7 +154,7 @@ encoder.configure({ codec: 'vp9', width: 1280, height: 720, bitrate: 2_000_000, 
 
 const frame = new VideoFrame({ data: yuvBuffer, format: 'I420', codedWidth: 1280, codedHeight: 720, timestamp: 0 });
 encoder.encode(frame);
-await encoder.flush();
+encoder.flush(function () { /* all chunks delivered */ });
 encoder.close();
 ```
 
@@ -166,7 +166,7 @@ import { VideoDecoder } from 'media-processing';
 const decoder = new VideoDecoder({ output: (frame) => frame.close(), error: console.error });
 decoder.configure({ codec: 'vp9', codedWidth: 1280, codedHeight: 720 });
 decoder.decode(encodedChunk);
-await decoder.flush();
+decoder.flush(function () { /* all frames delivered */ });
 decoder.close();
 ```
 
@@ -220,9 +220,11 @@ Implements [W3C WebCodecs](https://www.w3.org/TR/webcodecs/), [MediaStream Recor
 | Feature | Browser (native) | Node (FFmpeg engine) | Notes |
 |---|---|---|---|
 | Encoding/decoding | Native codec stack | FFmpeg child processes | Same API & results, different engine |
-| Force keyframe | Internal | Restarts FFmpeg (~50 ms) | One-time latency per forced IDR |
+| Force keyframe | Always honoured | Restarts FFmpeg (~50 ms), and a request within `RESTART_COOLDOWN_MS` (1 s) of the last restart is **dropped** — the frame encodes as a P-frame and the request is counted in `stats.keyframeThrottled` | One-time latency per forced IDR. The throttle protects against PLI storms, where a dropped request only delays recovery. It matters when several encoders must agree on GOP boundaries (ABR ladder, simulcast, MoQ alternate group): use `GopCoordinator`, which passes `bypassThrottle` so a coordinated keyframe is never downgraded. A mid-stream **input** resolution change also restarts, and likewise bypasses the cooldown |
 | Per-frame quantizer | Per-frame QP | Global CRF | FFmpeg CLI limitation |
 | Alpha channel | `'keep'` | `'discard'` only | Planned |
+| Encoder output size | Scales input to `config.width/height` | Scales input to `config.width/height` | Per spec, `configure()` dimensions are the **encoded output**; `encode()` accepts frames of any size. Feed one source frame to several differently-configured encoders (simulcast, ABR tiers) — each scales internally |
+| Decoder output size | Follows the stream | Follows the stream, or locked if you pass `codedWidth`/`codedHeight` | Omit them and frames come out at the stream's own resolution, as in the browser. Pass them and every frame is scaled to that size — useful for a fixed render target that survives an upstream resolution drop |
 | First-frame latency | ~0 ms | ~100 ms | Process startup |
 | HW acceleration | Browser-managed | NVENC, QSV, VAAPI, VideoToolbox, AMF | Auto-detect + software fallback |
 | SVC temporal layers | Chrome-only | ✅ L1T2, L1T3 | Drop-safe, integration tested |
@@ -270,7 +272,7 @@ const enc = new MediaEncoder({
 });
 enc.writeVideoFrame(videoFrame);
 enc.writeAudioData(audioData);
-await enc.flush();
+enc.flush(function () { /* done */ });
 ```
 
 **Advanced encoder tuning** — codec strings auto-derive profile/level, with raw-FFmpeg escape hatch:
@@ -439,10 +441,10 @@ Handles real-world manifests: CRLF, reordered/unknown tags (ignored, forward-com
 ### Feature guide
 
 - **LL-HLS** — set `partDuration` (e.g. `1.0`); emits `EXT-X-PART-INF`, `EXT-X-PART` (with `BYTERANGE`), `EXT-X-PRELOAD-HINT`, and `EXT-X-RENDITION-REPORT` (via `setRenditionReport`). fMP4-only here. Sub-2-second glass-to-glass.
-- **Encryption** — AES-128 segment-level via Web Crypto. Key bytes never leave the encoder (imported into a `CryptoKey`); only `keyUri` appears in `EXT-X-KEY`. `await ready()` before feeding.
+- **Encryption** — AES-128 segment-level via Web Crypto. Key bytes never leave the encoder (imported into a `CryptoKey`); only `keyUri` appears in `EXT-X-KEY`. call `ready(function (err) { ... })` before feeding.
 - **CEA-608 captions** — encoded as SEI NAL units inside the H.264/H.265 bitstream. Latin-Extended escape sequences with ASCII fallback. `addCaption({ start, end, text })`; declare via `closedCaptions` in the master.
 - **WebVTT / IMSC subtitles** — Unicode script-track renditions via `SubtitleEncoder`. WebVTT is universal; IMSC TTML for rich styling/positioning.
-- **ABR ladders** — run one `HLSEncoder` per tier, stitch with `buildMasterPlaylist`. `getStreamInf` auto-derives `BANDWIDTH` (monotonic per spec), `AVERAGE-BANDWIDTH`, `CODECS`, `RESOLUTION`, `FRAME-RATE` from real output.
+- **ABR ladders** — run one `HLSEncoder` per tier, feeding every tier the *same* source `VideoFrame` (each encoder scales to its own configured size), then stitch with `buildMasterPlaylist`. `getStreamInf` auto-derives `BANDWIDTH` (monotonic per spec), `AVERAGE-BANDWIDTH`, `CODECS`, `RESOLUTION`, `FRAME-RATE` from real output.
 - **I-frame playlists (trick play)** — `iFramePlaylist: true` emits a keyframe-byte-range playlist for scrubbing/thumbnails. Plugs into the master via `getIFrameStreamInf` / `iFrameVariants`.
 - **HDR** — `videoRange: 'HLG' | 'PQ'` (+ `supplementalCodecs` for Dolby Vision) auto-populates `colr` / `mdcv` / `clli` boxes and flows `VIDEO-RANGE` / `SUPPLEMENTAL-CODECS` to the master.
 - **Multi-channel audio** — up to 7.1 for fMP4. Built-in libopus 5.1/7.1 mappings; `CHANNELS` auto-derived for the master.

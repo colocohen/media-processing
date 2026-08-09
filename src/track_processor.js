@@ -38,7 +38,14 @@ function MediaStreamTrackProcessor(init) {
   if (!init || !init.track) {
     throw new TypeError('MediaStreamTrackProcessor: track required');
   }
-  if (!(init.track instanceof MediaStreamTrack)) {
+  // DUCK-TYPED (not instanceof) — the preserve-symlinks landmine, third
+  // sighting: sibling packages hold DIFFERENT class identities for this
+  // same source file, so a genuine track resolved through webrtc-server
+  // fails instanceof here. Shape is identity.
+  var _looksLikeTrack = init.track && typeof init.track === 'object' &&
+    (init.track.kind === 'audio' || init.track.kind === 'video') &&
+    typeof init.track.id === 'string';
+  if (!(init.track instanceof MediaStreamTrack) && !_looksLikeTrack) {
     throw new TypeError('MediaStreamTrackProcessor: expected MediaStreamTrack');
   }
 

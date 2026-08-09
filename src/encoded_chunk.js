@@ -32,9 +32,16 @@ function _initChunk(name, self, init) {
   }
 
   // Compute final values before defining read-only properties.
+  //
+  // duration is `unsigned long long?` in the IDL — nullable, defaulting
+  // to null, and browsers return null when the producer did not supply
+  // one. Defaulting to 0 made `chunk.duration === null` false and
+  // `if (chunk.duration)` behave identically for "unknown" and "zero
+  // length", so the same consumer code took different branches in Node
+  // and in the browser with nothing to indicate why.
   var duration = (typeof init.duration === 'number' && Number.isFinite(init.duration))
     ? init.duration
-    : 0;
+    : null;
 
   // Normalize data to a Buffer view. data may be null/undefined for
   // chunks with no payload (rare); otherwise it must be BufferSource.

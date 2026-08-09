@@ -33,9 +33,23 @@ function initCoder(self, init) {
     if (self._queueSize > 0) self._queueSize--;
     self._stats.outputCount++;
     userOutput(chunk, metadata);
-    if (self.dispatchEvent) self.dispatchEvent('dequeue');
+    // W3C WebCodecs fires a plain Event named "dequeue" on the codec.
+    // It was dispatched with no argument, so `e.type` in a handler was
+    // a TypeError on undefined.
+    if (self.dispatchEvent) {
+      self.dispatchEvent('dequeue', { type: 'dequeue', target: self });
+    }
   };
-  self._error = (init && init.error) || function () {};
+  // Wrap the user's error callback so _stats.errorCount is real.
+  // It was declared in _stats below and never incremented anywhere in
+  // the codebase, so `encoder.stats.errorCount` always read 0 — which
+  // is worse than not exposing it, because it looks like a healthy
+  // signal. Wrapping here catches every _error() call site at once.
+  var userError = (init && init.error) || function () {};
+  self._error = function (e) {
+    self._stats.errorCount++;
+    userError(e);
+  };
   self._state = 'unconfigured';
   self._config = null;
   self._ffmpeg = new FFmpegProcess(init);
@@ -86,47 +100,50 @@ function flushCoder(self, cb) {
   if (self._ffmpeg.running) {
     var done = false;
 
-    var timer = setTimeout(function () {
-      if (done) return;
-      done = true;
-      self._ffmpeg.stop();
-      self._state = 'configured';
-      self._queueSize = 0;
-      if (cb) cb();
-    }, self._flushTimeout || FLUSH_TIMEOUT);
-
-    // Wait for output pipe to finish (all data received)
-    // output_end = pipe:3 EOF, stdout_end = pipe:1 EOF (audio decoder)
-    self._ffmpeg.on('output_end', function onEnd() {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
+    // All three completion signals are attached together and MUST be
+    // detached together.
+    //
+    // Previously each handler removed only itself, so the two that
+    // didn't fire stayed attached for the lifetime of the FFmpegProcess.
+    // Every flush() leaked two listeners plus their closures (which
+    // capture `cb`, `timer` and `done`). A long-running pipeline that
+    // flushes per segment — HLS, or any keyframe-boundary muxing —
+    // accumulates them indefinitely, and Node starts printing
+    // MaxListenersExceededWarning long before the memory shows up
+    // anywhere obvious.
+    var timer = null;
+    function cleanup() {
+      if (timer) { clearTimeout(timer); timer = null; }
       self._ffmpeg.off('output_end', onEnd);
-      self._state = 'configured';
-      self._queueSize = 0;
-      if (cb) cb();
-    });
-
-    self._ffmpeg.on('stdout_end', function onStdEnd() {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
       self._ffmpeg.off('stdout_end', onStdEnd);
-      self._state = 'configured';
-      self._queueSize = 0;
-      if (cb) cb();
-    });
+      self._ffmpeg.off('close', onClose);
+    }
 
-    // Fallback: if no pipe:3 (e.g. audio with raw passthrough), use close
-    self._ffmpeg.on('close', function onClose() {
+    function finish(stopProcess) {
       if (done) return;
       done = true;
-      clearTimeout(timer);
-      self._ffmpeg.off('close', onClose);
+      cleanup();
+      if (stopProcess) self._ffmpeg.stop();
       self._state = 'configured';
       self._queueSize = 0;
+      // Spec: flush() sets [[key chunk required]] back to true — after a
+      // flush the codec has no reference frames, so decoding must start
+      // from a key chunk again. Only decoders carry the flag.
+      if (typeof self._keyChunkRequired === 'boolean') self._keyChunkRequired = true;
       if (cb) cb();
-    });
+    }
+
+    // output_end = pipe:3 EOF, stdout_end = pipe:1 EOF (audio decoder),
+    // close = fallback when neither pipe exists (raw passthrough).
+    function onEnd()    { finish(false); }
+    function onStdEnd() { finish(false); }
+    function onClose()  { finish(false); }
+
+    timer = setTimeout(function () { finish(true); }, self._flushTimeout || FLUSH_TIMEOUT);
+
+    self._ffmpeg.on('output_end', onEnd);
+    self._ffmpeg.on('stdout_end', onStdEnd);
+    self._ffmpeg.on('close', onClose);
 
     self._ffmpeg.endInput();
     return;
@@ -186,9 +203,16 @@ function wireReader(self, reader, eventMap) {
  * decoders expose only `decodeQueueSize`. Mixing them on the same
  * prototype breaks feature detection (`'decodeQueueSize' in encoder`
  * incorrectly returns true). Callers pass options.role = 'encoder' or
- * 'decoder' to get the right surface; legacy callers (no role) still
- * get both, with a one-time deprecation warning on first access of
- * the wrong-side property.
+ * 'decoder' to get the right surface; a caller that omits it still
+ * gets both, which is the pre-role behaviour.
+ *
+ * NOTE: all four in-tree call sites now pass a role. Until this change
+ * none of them did, so every codec class exposed BOTH properties and
+ * the feature-detection fix this parameter exists for was inert. The
+ * doc block here also promised "a one-time deprecation warning on first
+ * access of the wrong-side property" — no such warning was ever
+ * implemented. Rather than add a warning nothing can now trigger, the
+ * claim is removed.
  *
  * Includes:
  *  - flush() → Promise (browser-compatible) + callback backward compat

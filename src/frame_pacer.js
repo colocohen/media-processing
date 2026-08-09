@@ -141,8 +141,23 @@ FramePacer.prototype._scheduleNext = function () {
       // process-level uncaughtException as a normal Node async fault.
       try { self._callback(self._frameIndex); }
       catch (e) {
+        // A throwing callback must not break the timer chain, but it
+        // must not vanish either.
+        //
+        // The Node path routes it to process-level uncaughtException.
+        // In a browser `process` is undefined, so the previous code
+        // silently swallowed every callback error — the pacer kept
+        // ticking and the developer saw nothing at all. This module is
+        // in the browser bundle, so that was the common case, not the
+        // exotic one.
+        //
+        // Rethrowing on a fresh macrotask reaches window.onerror in a
+        // browser and the default uncaught handler in Node, with the
+        // caller's own stack, without unwinding the pacer.
         if (typeof process !== 'undefined' && typeof process.emit === 'function') {
           process.emit('uncaughtException', e);
+        } else {
+          setTimeout(function () { throw e; }, 0);
         }
       }
     }

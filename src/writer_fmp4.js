@@ -1060,6 +1060,20 @@ FMP4Writer.prototype.setAudioConfig = function (configBytes, opts) {
  * writeInit() will succeed. Caller can poll this if it wants to defer
  * init emission.
  */
+/**
+ * The captured avcC / hvcC bytes, or null before the first keyframe.
+ *
+ * Exists because HLSEncoder needs the DecoderConfigurationRecord to
+ * derive the playlist's CODECS attribute, and was reaching in for
+ * `writer._videoConfig` directly — the only cross-file private access in
+ * hls_encoder.js, and a hole in this file's own "the writer owns the
+ * format" boundary. A reader keeps the boundary intact and lets the
+ * field be renamed without breaking a caller.
+ */
+FMP4Writer.prototype.getVideoConfig = function () {
+  return this._videoConfig || null;
+};
+
 FMP4Writer.prototype.canWriteInit = function () {
   if (this._video && !this._videoConfig) return false;
   // For AAC the AudioSpecificConfig is mandatory in esds — players

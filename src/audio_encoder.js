@@ -186,7 +186,7 @@ function AudioEncoder(init) {
   };
 }
 
-applyCoderPrototype(AudioEncoder);
+applyCoderPrototype(AudioEncoder, { role: 'encoder' });
 
 AudioEncoder.prototype.configure = function (config) {
   if (!config || !config.codec) throw new TypeError('AudioEncoder.configure: codec required');
@@ -578,7 +578,25 @@ AudioEncoder.prototype._takeFirstChunkMetadata = function () {
 };
 
 AudioEncoder.isConfigSupported = function (config) {
-  return Promise.resolve({ supported: !!getAudioCodec(config.codec, config) });
+  // W3C AudioEncoderSupport carries `config` alongside `supported`;
+  // see the matching note on VideoEncoder.isConfigSupported.
+  return Promise.resolve({
+    supported: !!getAudioCodec(config.codec, config),
+    config: _cloneAudioEncoderConfig(config),
+  });
 };
+
+var _AUDIO_ENCODER_CONFIG_KEYS = [
+  'codec', 'sampleRate', 'numberOfChannels', 'bitrate', 'bitrateMode',
+];
+function _cloneAudioEncoderConfig(config) {
+  var out = {};
+  if (!config) return out;
+  for (var i = 0; i < _AUDIO_ENCODER_CONFIG_KEYS.length; i++) {
+    var k = _AUDIO_ENCODER_CONFIG_KEYS[i];
+    if (config[k] !== undefined) out[k] = config[k];
+  }
+  return out;
+}
 
 export default AudioEncoder;

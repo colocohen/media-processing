@@ -92,9 +92,19 @@ MediaRecorder.prototype.addEventListener = function (type, listener) { this._ee.
 MediaRecorder.prototype.removeEventListener = function (type, listener) { this._ee.off(type, listener); };
 
 MediaRecorder.prototype._dispatch = function (type, data) {
-  this._ee.emit(type, data);
+  // Every dispatched object carries `type`. The W3C handlers here
+  // (ondataavailable, onstart, onstop, onerror, onpause, onresume) all
+  // receive an Event, and handler code routinely reads e.type — often
+  // when one function is wired to several events. The payloads already
+  // carried their own members (`data`, `error`); only `type` was
+  // missing, so the failure looked like a handler that fired but did
+  // nothing rather than an error.
+  var ev = data || {};
+  if (ev.type === undefined) ev.type = type;
+  if (ev.target === undefined) ev.target = this;
+  this._ee.emit(type, ev);
   var handler = this['on' + type];
-  if (typeof handler === 'function') handler(data);
+  if (typeof handler === 'function') handler(ev);
 };
 
 /**
@@ -245,27 +255,55 @@ MediaRecorder.prototype._startMuxerMode = function (codecInfo, videoTracks, audi
 MediaRecorder.prototype._wireTrackHandlers = function (videoTracks, audioTracks, hasVideo, hasAudio, mode) {
   var self = this;
 
-  if (hasVideo && videoTracks.length) {
-    this._videoHandler = function (frame) {
+  // These handlers run inside the track's EventEmitter.emit(), i.e. on
+  // the stack of whoever pushed the frame (a capture source, a decoder,
+  // a MediaStreamTrackGenerator write).
+  //
+  // core/events.js catches listener exceptions and logs them, so a
+  // throw here will not crash the producer or skip the other
+  // listeners — but it turns a recording failure into a console.error
+  // line and nothing else. The caller's onerror never fires, state
+  // stays 'recording', and the recording quietly produces nothing.
+  //
+  // encode() throws by design: W3C WebCodecs requires a synchronous
+  // InvalidStateError when the codec is not "configured", and there is
+  // an unavoidable window where a frame already in flight arrives after
+  // stop() has closed the encoder. In the browser MediaRecorder is
+  // internal to the user agent; here it is an ordinary consumer of
+  // VideoEncoder and has to behave like one.
+  //
+  // Browser MediaRecorder surfaces failures as an `error` event. Match
+  // that, so the failure reaches the application instead of the log.
+  function guarded(fn) {
+    return function (data) {
       if (self.state !== 'recording') return;
+      try {
+        fn(data);
+      } catch (e) {
+        self._dispatch('error', { error: e });
+      }
+    };
+  }
+
+  if (hasVideo && videoTracks.length) {
+    this._videoHandler = guarded(function (frame) {
       if (mode === 'muxer' && self._videoEncoder) {
         self._videoEncoder.encode(frame);
       } else if (mode === 'pipe' && self._encoder) {
         self._encoder.writeVideoFrame(frame);
       }
-    };
+    });
     videoTracks[0].on('frame', this._videoHandler);
   }
 
   if (hasAudio && audioTracks.length) {
-    this._audioHandler = function (audioData) {
-      if (self.state !== 'recording') return;
+    this._audioHandler = guarded(function (audioData) {
       if (mode === 'muxer' && self._audioEncoder) {
         self._audioEncoder.encode(audioData);
       } else if (mode === 'pipe' && self._encoder) {
         self._encoder.writeAudioData(audioData);
       }
-    };
+    });
     audioTracks[0].on('data', this._audioHandler);
   }
 };

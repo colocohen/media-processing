@@ -46,14 +46,19 @@ var H264_PROFILE_IDC = {
 // H.264 §7.4.2.1.1). The middle byte of an avc1 codec string carries
 // these flags; the previous parser dropped it entirely (MP-4).
 //
-//   bit 7: constraint_set0_flag — if set with profile=66, this is
-//          "Constrained Baseline" (CBP). Most browsers / Chrome
-//          WebRTC emit this combination.
-//   bit 6: constraint_set1_flag — with profile=77, this is
-//          "Constrained Main".
-//   bit 5: constraint_set2_flag
-//   bit 4: constraint_set3_flag — with high profiles, indicates
-//          "intra-only" subset.
+//   bit 7 (0x80): constraint_set0_flag
+//   bit 6 (0x40): constraint_set1_flag — with profile_idc 66 this is
+//                 "Constrained Baseline" (CBP), the combination Chrome
+//                 WebRTC emits. (An earlier version of this comment
+//                 attributed CBP to constraint_set0; H.264 Annex A
+//                 specifies constraint_set1. The code below was always
+//                 right — the comment was not.)
+//   bit 5 (0x20): constraint_set2_flag
+//   bit 4 (0x10): constraint_set3_flag — with high profiles, the
+//                 "intra-only" subset.
+//   bit 3 (0x08): constraint_set4_flag \
+//   bit 2 (0x04): constraint_set5_flag / with profile_idc 100, BOTH
+//                 set means "Constrained High".
 //   bits 3-0: reserved (zero)
 //
 // For SDP fmtp, profile-level-id like '42E01F' carries:
@@ -108,8 +113,15 @@ function parseCodecDetails(str) {
       // 'high' + constraint_set1 = 'constrained-high'.
       var profileName = baseProfile;
       if (baseProfile === 'baseline' && (cBits & 0x40)) {
+        // profile_idc 66 + constraint_set1 → Constrained Baseline.
         profileName = 'constrained-baseline';
-      } else if (baseProfile === 'high' && (cBits & 0x40)) {
+      } else if (baseProfile === 'high' && (cBits & 0x08) && (cBits & 0x04)) {
+        // profile_idc 100 + constraint_set4 AND constraint_set5 →
+        // Constrained High. This previously tested constraint_set1
+        // (0x40), which is not part of the High-profile signalling at
+        // all: a genuine Constrained High string (avc1.640C28) was
+        // reported as plain 'high', while a meaningless one
+        // (avc1.644028) was reported as 'constrained-high'.
         profileName = 'constrained-high';
       }
 
@@ -175,7 +187,7 @@ function parseCodecDetails(str) {
  *     → 'avc1.42E01F'
  *   { name: 'vp9', profile: '0', level: '1.0', bitDepth: 8 } → 'vp09.00.10.08'
  *   { name: 'h265', profile: 'main', level: '3.1' }         → 'hev1.1.6.L93.B0'
- *   { name: 'av1',  profile: 'main', level: '2.1', bitDepth: 8 } → 'av01.0.04M.08'
+ *   { name: 'av1',  profile: 'main', level: '2.1', bitDepth: 8 } → 'av01.0.01M.08'
  *   { name: 'aac' }                                          → 'mp4a.40.2'
  *   { name: 'opus' }                                         → 'opus'
  *
@@ -203,7 +215,10 @@ function buildCodecString(info) {
     } else if (info.profile === 'constrained-baseline') {
       cBits = 0xE0;   // constraint_set0 + 1 + 2 = standard CBP signaling
     } else if (info.profile === 'constrained-high') {
-      cBits = 0x40;   // constraint_set1
+      // constraint_set4 (0x08) + constraint_set5 (0x04) — H.264 Annex A.
+      // Was 0x40 (constraint_set1), which produced strings no conforming
+      // decoder reads as Constrained High.
+      cBits = 0x0C;
     } else {
       cBits = 0x00;
     }

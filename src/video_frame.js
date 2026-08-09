@@ -68,6 +68,42 @@ function VideoFrame(dataOrInit, initArg) {
     if (dataOrInit._closed) throw _domex('Source VideoFrame is closed', 'InvalidStateError');
     var src = dataOrInit;
     var over = initArg || {};
+
+    // Per W3C, `new VideoFrame(videoFrame, init)` references the SAME
+    // media resource — VideoFrameInit carries only timestamp, duration,
+    // visibleRect, displayWidth/Height, alpha, rotation and flip, none
+    // of which touch pixels. Browsers implement it that way, so
+    // re-wrapping a frame to override its timestamp costs nothing there.
+    //
+    // This used to deep-copy unconditionally, which made
+    // hls_encoder.js's ptsUs-override path copy an entire frame per
+    // frame — its comment reads "Shares the underlying buffer
+    // (zero-copy)", which was true of the browser and not of this
+    // implementation. Same false claim, same shape, as the one in
+    // track_processor.js.
+    //
+    // The one case that genuinely needs a copy is `over.format`: a
+    // format change is a non-spec extension here, and the converted
+    // pixels cannot alias the source.
+    var formatChanges = over.format && over.format !== src.format;
+    if (!formatChanges) {
+      dataOrInit = {
+        _sharedResource: src._res,
+        data: src.data, format: src.format,
+        codedWidth: src.codedWidth, codedHeight: src.codedHeight,
+        displayWidth: over.displayWidth || src.displayWidth,
+        displayHeight: over.displayHeight || src.displayHeight,
+        visibleRect: over.visibleRect || src.visibleRect,
+        colorSpace: over.colorSpace || src.colorSpace,
+        timestamp: (typeof over.timestamp === 'number') ? over.timestamp : src.timestamp,
+        duration: over.duration || src.duration,
+        rotation: (typeof over.rotation === 'number') ? over.rotation : src.rotation,
+        flip: (over.flip !== undefined) ? !!over.flip : src.flip,
+      };
+      return _finishConstruction(this, dataOrInit);
+    }
+
+    // Format override: independent buffer required.
     var copy = new Uint8Array(src.data.length);
     copy.set(src.data);
     dataOrInit = {
@@ -89,6 +125,15 @@ function VideoFrame(dataOrInit, initArg) {
     dataOrInit = initArg;
   }
 
+  return _finishConstruction(this, dataOrInit);
+}
+
+/**
+ * Shared construction tail. Split out so the copy-constructor's
+ * zero-copy path can reach it directly without re-running the
+ * argument-shape detection above.
+ */
+function _finishConstruction(self, dataOrInit) {
   var init = dataOrInit;
   if (!init) throw new TypeError('VideoFrame: init required');
   // Normalize init.data through the same coercion used above.
@@ -120,28 +165,104 @@ function VideoFrame(dataOrInit, initArg) {
     );
   }
 
-  this.data = init.data;
-  this.format = format;
-  this.codedWidth = init.codedWidth;
-  this.codedHeight = init.codedHeight;
-  this.codedRect = { x: 0, y: 0, width: init.codedWidth, height: init.codedHeight };
-  this.displayWidth = init.displayWidth || init.codedWidth;
-  this.displayHeight = init.displayHeight || init.codedHeight;
-  this.visibleRect = init.visibleRect || {
+  // ── Shared, reference-counted pixel buffer ────────────────────────
+  //
+  // W3C describes VideoFrame's bytes as a "media resource" held by
+  // reference: clone() produces a new VideoFrame pointing at the SAME
+  // resource with the refcount raised, and the bytes are released only
+  // when the last reference closes. Browsers implement exactly that,
+  // which is why the spec can describe clone() as cheap.
+  //
+  // This implementation used to deep-copy on every clone(). That made
+  // track_processor.js — which clones every single frame so a sibling
+  // listener's close() cannot detach the queued one — cost a full frame
+  // copy per frame: ~1.4 MB at 720p, about 42 MB/s of fresh allocations
+  // at 30 fps, with the GC pauses to match. The comment there even
+  // asserts "clone() is cheap — it just bumps the refcount", describing
+  // the spec rather than what the code did.
+  //
+  // Refcounting preserves the property track_processor actually needs.
+  // A sibling calling close() decrements but does not free while our
+  // clone still holds a reference, so the queued frame stays readable.
+  var res;
+  if (init._sharedResource) {
+    // Internal path used by clone(): adopt the existing resource.
+    res = init._sharedResource;
+    res.refs++;
+  } else {
+    res = { data: init.data, refs: 1 };
+  }
+  Object.defineProperty(self, '_res', {
+    value: res, writable: true, enumerable: false, configurable: true,
+  });
+
+  // `data` stays a normal-looking property so every existing reader
+  // (encoder stdin writes, ffplay_viewer, media_encoder) is unaffected.
+  Object.defineProperty(self, 'data', {
+    get: function () { return this._closed ? null : this._res.data; },
+    enumerable: true, configurable: true,
+  });
+
+  self.format = format;
+  self.codedWidth = init.codedWidth;
+  self.codedHeight = init.codedHeight;
+  self.codedRect = { x: 0, y: 0, width: init.codedWidth, height: init.codedHeight };
+  self.displayWidth = init.displayWidth || init.codedWidth;
+  self.displayHeight = init.displayHeight || init.codedHeight;
+  self.visibleRect = init.visibleRect || {
     x: 0, y: 0, width: init.codedWidth, height: init.codedHeight,
   };
-  this.colorSpace = new VideoColorSpace(init.colorSpace);
-  this.timestamp = (typeof init.timestamp === 'number') ? init.timestamp : 0;
-  this.duration = init.duration || 0;
-  this.byteLength = this.data.length;
-  this._closed = false;
+  self.colorSpace = new VideoColorSpace(init.colorSpace);
+  self.timestamp = (typeof init.timestamp === 'number') ? init.timestamp : 0;
+  self.duration = init.duration || 0;
+  self.byteLength = res.data.length;
+  self._closed = false;
+
+  // rotation / flip — W3C VideoFrame attributes, previously absent
+  // entirely. VideoEncoder needs them for the spec's [[active
+  // orientation]] check (a mid-stream orientation change is a
+  // DataError), and consumers read them to render correctly.
+  self.rotation = (typeof init.rotation === 'number') ? init.rotation : 0;
+  self.flip = !!init.flip;
+
+  return self;
 }
 
+/**
+ * Has this frame a real crop, i.e. a visibleRect smaller than or offset
+ * from the coded rect? Full-frame rects are treated as "no crop" so the
+ * overwhelmingly common case takes the fast path untouched.
+ */
+VideoFrame.prototype._hasCrop = function () {
+  var v = this.visibleRect;
+  if (!v) return false;
+  return (v.x || 0) !== 0 || (v.y || 0) !== 0 ||
+         v.width !== this.codedWidth || v.height !== this.codedHeight;
+};
+
+/**
+ * allocationSize(options) — bytes needed for a copyTo() result.
+ *
+ * Sized from the VISIBLE rect, not the coded rect. Per W3C, copyTo()
+ * copies the visible region by default, so an allocation based on coded
+ * dimensions over-allocates for a cropped frame and, worse, disagrees
+ * with what copyTo() writes.
+ *
+ * Until now visibleRect was decorative: the constructor stored it and
+ * nothing read it. VideoEncoder now honours it (crop before scale), so
+ * leaving copyTo/allocationSize on coded dimensions would mean the same
+ * frame reports two different geometries depending on which consumer
+ * asks — an inconsistency introduced by fixing the encoder, and closed
+ * here.
+ */
 VideoFrame.prototype.allocationSize = function (options) {
   var fmt = (options && options.format) || this.format;
   var bpp = FORMAT_BPP[fmt];
   if (!bpp) return this.data ? this.data.length : 0;
-  return Math.floor(this.codedWidth * this.codedHeight * bpp);
+  var v = this.visibleRect;
+  var w = (v && v.width) || this.codedWidth;
+  var h = (v && v.height) || this.codedHeight;
+  return Math.floor(w * h * bpp);
 };
 
 /**
@@ -180,18 +301,36 @@ VideoFrame.prototype._copyToSync = function (destination, options) {
   var targetFmt = (options && options.format) || this.format;
 
   if (targetFmt === this.format) {
-    // Same format — direct copy. Spec: throw if destination too small.
-    if (dst.length < this.data.length) {
+    var needed = this.allocationSize({ format: targetFmt });
+    if (dst.length < needed) {
       throw new TypeError(
         'VideoFrame.copyTo: destination byte length (' + dst.length +
-        ') is less than frame byte length (' + this.data.length + ')'
+        ') is less than the required ' + needed + ' bytes'
       );
     }
-    dst.set(this.data.subarray(0, this.data.length), 0);
-    return _layoutForFormat(targetFmt, this.codedWidth, this.codedHeight);
+    if (!this._hasCrop()) {
+      dst.set(this.data.subarray(0, this.data.length), 0);
+      return _layoutForFormat(targetFmt, this.codedWidth, this.codedHeight);
+    }
+    var vr = this.visibleRect;
+    _cropInto(dst, this.data, targetFmt, this.codedWidth, this.codedHeight, vr);
+    return _layoutForFormat(targetFmt, vr.width, vr.height);
   }
 
-  // Format conversion using pixel_utils
+  // Format conversion using pixel_utils.
+  //
+  // The converters operate on whole planes and have no notion of a
+  // sub-rect. Rather than silently returning the UNCROPPED image in a
+  // buffer the caller sized for the cropped one — which would look like
+  // working code and produce shifted pixels — refuse explicitly. Crop
+  // first (copyTo in the source format), then convert.
+  if (this._hasCrop()) {
+    throw new TypeError(
+      'VideoFrame.copyTo: cropping (visibleRect) combined with format ' +
+      'conversion ' + this.format + ' \u2192 ' + targetFmt + ' is not supported. ' +
+      'Copy in the source format first, then convert.'
+    );
+  }
   var w = this.codedWidth, h = this.codedHeight;
   var converted = null;
 
@@ -223,12 +362,18 @@ VideoFrame.prototype._copyToSync = function (destination, options) {
   return _layoutForFormat(targetFmt, w, h);
 };
 
+/**
+ * clone() — new VideoFrame over the SAME pixel buffer, refcount + 1.
+ *
+ * O(1) and allocation-free apart from the wrapper object, matching the
+ * spec and matching what callers already assume. The bytes survive
+ * until every clone (and the original) has been closed.
+ */
 VideoFrame.prototype.clone = function () {
   if (this._closed) throw _domex('VideoFrame is closed', 'InvalidStateError');
-  var copy = new Uint8Array(this.data.length);
-  copy.set(this.data);
   return new VideoFrame({
-    data: copy,
+    _sharedResource: this._res,
+    data: this._res.data,
     format: this.format,
     codedWidth: this.codedWidth,
     codedHeight: this.codedHeight,
@@ -238,14 +383,34 @@ VideoFrame.prototype.clone = function () {
     colorSpace: this.colorSpace,
     timestamp: this.timestamp,
     duration: this.duration,
+    rotation: this.rotation,
+    flip: this.flip,
   });
 };
 
+/**
+ * close() — drop this reference. The buffer is released only when the
+ * last outstanding reference closes.
+ *
+ * Idempotent: a second close() on the same VideoFrame is a no-op rather
+ * than a double-decrement, so one over-eager caller cannot free a
+ * buffer another clone is still reading.
+ */
 VideoFrame.prototype.close = function () {
+  if (this._closed) return;
   this._closed = true;
-  this.data = null;
   this.byteLength = 0;
+  var res = this._res;
+  if (res) {
+    res.refs--;
+    if (res.refs <= 0) res.data = null;
+  }
 };
+
+/** Outstanding references to this frame's buffer. Non-standard; for tests. */
+Object.defineProperty(VideoFrame.prototype, '_refCount', {
+  get: function () { return this._res ? this._res.refs : 0; },
+});
 
 // ── Helpers ──
 
@@ -270,6 +435,87 @@ var _converterOutputFmt = {
   rgb24ToI420: 'I420', i420ToRgb24: 'RGB24',
   nv12ToI420: 'I420', i420ToNv12: 'NV12',
 };
+
+/**
+ * Copy the visible sub-rect out of a full-frame buffer, plane by plane.
+ *
+ * Chroma planes are subsampled, so the rect must be scaled per plane:
+ * 4:2:0 halves both axes, 4:2:2 halves width only, 4:4:4 and packed RGB
+ * use it as-is. Odd offsets on a subsampled plane are rounded down to
+ * the chroma grid — the alternative is resampling chroma, which copyTo
+ * has no business doing.
+ */
+function _cropInto(dst, src, fmt, codedW, codedH, rect) {
+  var planes = _planeSpecs(fmt, codedW, codedH);
+  var dstOff = 0;
+  for (var p = 0; p < planes.length; p++) {
+    var sp = planes[p];
+    var x = Math.floor((rect.x || 0) / sp.subX);
+    var y = Math.floor((rect.y || 0) / sp.subY);
+    var w = Math.floor(rect.width / sp.subX);
+    var h = Math.floor(rect.height / sp.subY);
+    for (var row = 0; row < h; row++) {
+      var from = sp.offset + (y + row) * sp.stride + x * sp.pixBytes;
+      dst.set(src.subarray(from, from + w * sp.pixBytes), dstOff);
+      dstOff += w * sp.pixBytes;
+    }
+  }
+}
+
+/**
+ * Plane geometry per format: byte offset, row stride, per-pixel bytes,
+ * and the chroma subsampling factors that map a luma rect onto it.
+ */
+function _planeSpecs(fmt, w, h) {
+  var y = { offset: 0, stride: w, pixBytes: 1, subX: 1, subY: 1 };
+  var ySize = w * h;
+  switch (fmt) {
+    case 'I420': case 'YUV420P': {
+      var c = (w >> 1) * (h >> 1);
+      return [y,
+        { offset: ySize,     stride: w >> 1, pixBytes: 1, subX: 2, subY: 2 },
+        { offset: ySize + c, stride: w >> 1, pixBytes: 1, subX: 2, subY: 2 }];
+    }
+    case 'I420A': {
+      var ca = (w >> 1) * (h >> 1);
+      return [y,
+        { offset: ySize,          stride: w >> 1, pixBytes: 1, subX: 2, subY: 2 },
+        { offset: ySize + ca,     stride: w >> 1, pixBytes: 1, subX: 2, subY: 2 },
+        { offset: ySize + ca * 2, stride: w,      pixBytes: 1, subX: 1, subY: 1 }];
+    }
+    case 'NV12':
+      // Interleaved UV: one plane, two bytes per chroma sample pair.
+      return [y, { offset: ySize, stride: w, pixBytes: 2, subX: 2, subY: 2 }];
+    case 'I422': {
+      var c422 = (w >> 1) * h;
+      return [y,
+        { offset: ySize,        stride: w >> 1, pixBytes: 1, subX: 2, subY: 1 },
+        { offset: ySize + c422, stride: w >> 1, pixBytes: 1, subX: 2, subY: 1 }];
+    }
+    case 'I422A': {
+      var c422a = (w >> 1) * h;
+      return [y,
+        { offset: ySize,             stride: w >> 1, pixBytes: 1, subX: 2, subY: 1 },
+        { offset: ySize + c422a,     stride: w >> 1, pixBytes: 1, subX: 2, subY: 1 },
+        { offset: ySize + c422a * 2, stride: w,      pixBytes: 1, subX: 1, subY: 1 }];
+    }
+    case 'I444':
+      return [y,
+        { offset: ySize,     stride: w, pixBytes: 1, subX: 1, subY: 1 },
+        { offset: ySize * 2, stride: w, pixBytes: 1, subX: 1, subY: 1 }];
+    case 'I444A':
+      return [y,
+        { offset: ySize,     stride: w, pixBytes: 1, subX: 1, subY: 1 },
+        { offset: ySize * 2, stride: w, pixBytes: 1, subX: 1, subY: 1 },
+        { offset: ySize * 3, stride: w, pixBytes: 1, subX: 1, subY: 1 }];
+    case 'RGBA': case 'RGBX': case 'BGRA': case 'BGRX':
+      return [{ offset: 0, stride: w * 4, pixBytes: 4, subX: 1, subY: 1 }];
+    case 'RGB24':
+      return [{ offset: 0, stride: w * 3, pixBytes: 3, subX: 1, subY: 1 }];
+    default:
+      return [y];
+  }
+}
 
 function _layoutForFormat(fmt, w, h) {
   if (fmt === 'I420' || fmt === 'YUV420P') {

@@ -122,6 +122,13 @@ Demuxer.prototype.start = function (opts) {
     else args.push('-map', '0:a:0', '-c:a', 'copy', '-f', 'wav', 'pipe:1');
   }
 
+  // Declared here so the end-of-stream path can flush them. A streaming
+  // reader emits a frame only once it can see where the NEXT one starts,
+  // so the final frame of every file sits in the reader's buffer until
+  // flush() is called — see the long note on AnnexBReader.flush().
+  var vReader = null;
+  var aReader = null;
+
   // Determine stdio layout
   var stdio = ['ignore', hasAudio ? 'pipe' : 'ignore', 'pipe', hasVideo ? 'pipe' : 'ignore'];
   self._ffmpeg.start(args, stdio);
@@ -131,7 +138,7 @@ Demuxer.prototype.start = function (opts) {
     var vContainer = getDefaultContainer(info.video.codec);
     var vContainerDef = getContainer(vContainer);
     if (vContainerDef && vContainerDef.createReader) {
-      var vReader = vContainerDef.createReader({ codec: info.video.codec, fps: info.video.framerate });
+      vReader = vContainerDef.createReader({ codec: info.video.codec, fps: info.video.framerate });
       vReader.on('video', function (f) {
         // Extract description from first keyframe
         if (f.isKeyframe && !self._videoDescription) {
@@ -160,7 +167,7 @@ Demuxer.prototype.start = function (opts) {
     var aContainer = getDefaultContainer(info.audio.codec);
     var aContainerDef = getContainer(aContainer);
     if (aContainerDef && aContainerDef.createReader) {
-      var aReader = aContainerDef.createReader({ sampleRate: info.audio.sampleRate });
+      aReader = aContainerDef.createReader({ sampleRate: info.audio.sampleRate });
       aReader.on('audio', function (f) {
         self._ee.emit('audio', new EncodedAudioChunk({
           type: 'key',
@@ -188,10 +195,40 @@ Demuxer.prototype.start = function (opts) {
     }
   }
 
-  // End
+  // ── End of stream ───────────────────────────────────────────────
+  //
+  // Two bugs lived here.
+  //
+  // 1. The readers were never flushed. AnnexBReader emits an access
+  //    unit only when it finds the START of the next one, so at EOF the
+  //    trailing AU stayed in its buffer forever — every H.264/H.265
+  //    file lost its last frame, silently. TSReader has the same
+  //    contract. Flushing before 'end' recovers it.
+  //
+  // 2. 'end' fired more than once. output_end and stdout_end set their
+  //    flags and called checkEnd(), which emitted; then 'close' set both
+  //    flags and called checkEnd() again, emitting a second time. A
+  //    consumer that finalizes on 'end' did it twice.
+  //
+  // _ended latches so 'end' is emitted exactly once regardless of which
+  // signals arrive or in what order.
   var videoDone = !hasVideo;
   var audioDone = !hasAudio;
-  function checkEnd() { if (videoDone && audioDone) self._ee.emit('end'); }
+  var ended = false;
+
+  function checkEnd() {
+    if (ended || !videoDone || !audioDone) return;
+    ended = true;
+    // Flush inside the latch: flush() emits the trailing frames, and
+    // those must reach the consumer BEFORE 'end'.
+    if (vReader && typeof vReader.flush === 'function') {
+      try { vReader.flush(); } catch (e) { self._ee.emit('error', e); }
+    }
+    if (aReader && typeof aReader.flush === 'function') {
+      try { aReader.flush(); } catch (e) { self._ee.emit('error', e); }
+    }
+    self._ee.emit('end');
+  }
 
   if (hasVideo) {
     self._ffmpeg.on('output_end', function () { videoDone = true; checkEnd(); });

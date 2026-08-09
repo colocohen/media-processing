@@ -31,6 +31,7 @@ import EventEmitter from './core/events.js';
 import { getVideoCodec } from './codecs.js';
 import { getAudioCodec } from './codecs.js';
 import { getContainer, getContainerFormat, getContainerExtra } from './containers.js';
+import { trackChildProcess, untrackChildProcess } from './ffmpeg_process.js';
 
 function MediaEncoder(opts) {
   if (!opts) opts = {};
@@ -120,10 +121,28 @@ MediaEncoder.prototype.flush = function (cb) {
 
 MediaEncoder.prototype.close = function () {
   if (this._proc) {
-    try { this._proc.kill('SIGTERM'); } catch (e) {}
-    setTimeout(function () {
-      try { this._proc.kill('SIGKILL'); } catch (e) {}
-    }.bind(this), 2000);
+    // Capture the handle BEFORE clearing the field.
+    //
+    // This used to read `this._proc` inside the timer callback, but
+    // `this._proc = null` runs synchronously below — so two seconds
+    // later the callback dereferenced null, threw a TypeError, and the
+    // surrounding catch swallowed it. The SIGKILL fallback could never
+    // fire, and an FFmpeg that ignored SIGTERM survived indefinitely.
+    //
+    // unref() so the timer doesn't hold the event loop open: a script
+    // that closes and exits should exit now, not two seconds later.
+    //
+    // ffmpeg_process.js:stop() already does both correctly — this is
+    // the same intent, and the divergence was accidental.
+    var proc = this._proc;
+    // Untrack now: we are committing to killing it, and a stale entry
+    // would linger in the live set if SIGTERM failed.
+    untrackChildProcess(proc);
+    try { proc.kill('SIGTERM'); } catch (e) {}
+    var killTimer = setTimeout(function () {
+      try { proc.kill('SIGKILL'); } catch (e) {}
+    }, 2000);
+    if (killTimer.unref) killTimer.unref();
   }
   this._proc = null;
   this._started = false;
@@ -198,6 +217,12 @@ MediaEncoder.prototype._start = function () {
   if (ac) stdio.push('pipe');  // pipe:4 for audio
 
   var proc = spawn(self._ffmpegPath, args, { stdio: stdio });
+  // MediaEncoder spawns directly rather than through FFmpegProcess,
+  // because it needs a five-pipe stdio layout (video in, output, audio
+  // in) that FFmpegProcess doesn't model. That bypassed the orphan
+  // prevention every other spawn site gets: on a Node crash this child
+  // was reparented to init and kept running. Register it explicitly.
+  trackChildProcess(proc);
   self._proc = proc;
 
   self._videoStdin = vc ? proc.stdin : null;

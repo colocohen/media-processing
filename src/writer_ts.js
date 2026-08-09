@@ -298,6 +298,14 @@ TSWriter.prototype.reset = function () {
  * no separate codec configuration that needs to be supplied before
  * segments can be produced; SPS/PPS travel inline in Annex-B AUs.
  */
+/**
+ * Parity with FMP4Writer.getVideoConfig(). MPEG-TS carries parameter
+ * sets in-band at every keyframe rather than in an init segment, so
+ * there is no captured record to hand back — but the writer slot is
+ * duck-typed, and a caller should not have to know which writer it got.
+ */
+TSWriter.prototype.getVideoConfig = function () { return null; };
+
 TSWriter.prototype.canWriteInit = function () { return true; };
 
 /**

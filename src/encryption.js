@@ -41,6 +41,19 @@ import { isValidIvHex } from './utils/playlist_utils.js';
  * @returns {Uint8Array}            Exactly 16 bytes.
  */
 export function ivFromSequence(sequenceNumber) {
+  // The shifts below are 32-bit. A sequence at or above 2^32 would wrap
+  // and silently reuse an earlier IV — catastrophic for CBC, since two
+  // segments encrypted under the same key and IV leak their XOR. At six
+  // seconds per segment that is ~800,000 years away, so this is a guard
+  // against a caller passing something wrong (a timestamp, a negative,
+  // a float) rather than against natural growth.
+  if (typeof sequenceNumber !== 'number' || !Number.isInteger(sequenceNumber) ||
+      sequenceNumber < 0 || sequenceNumber > 0xFFFFFFFF) {
+    throw new RangeError(
+      'encryption.ivFromSequence: sequenceNumber must be an integer in ' +
+      '[0, 2^32-1], got ' + sequenceNumber
+    );
+  }
   var iv = new Uint8Array(16);
   // High 12 bytes already zero. Low 4 bytes = sequence in big-endian.
   iv[12] = (sequenceNumber >>> 24) & 0xFF;
@@ -80,6 +93,30 @@ export function ivToHex(iv) {
     s += (h.length === 1 ? '0' : '') + h;
   }
   return s.toUpperCase().replace('0X', '0x');
+}
+
+/**
+ * Hand a value to a Node-style callback without letting the callback's
+ * own exceptions be swallowed into the promise chain.
+ *
+ * `p.then(onFulfilled, onRejected)` registers SIBLINGS: if onFulfilled
+ * throws, onRejected never sees it and the resulting promise rejects
+ * with nobody listening. Since every public function here bridges a
+ * Web Crypto promise to a callback, a bug in the CALLER's callback
+ * surfaced as an unhandled rejection — which Node terminates the
+ * process on by default, and attributes to this file rather than to
+ * the code that actually threw.
+ *
+ * Rethrowing on a fresh tick turns it back into an ordinary uncaught
+ * exception with the caller's stack, which is what a callback-style API
+ * should produce.
+ */
+function _invoke(callback, err, value) {
+  try {
+    callback(err, value);
+  } catch (e) {
+    setTimeout(function () { throw e; }, 0);
+  }
 }
 
 /**
@@ -125,7 +162,7 @@ export function createEncryptor(opts, callback) {
     subtle = _getSubtle();
   } catch (e) {
     // Defer to next tick so the caller sees consistent async cadence.
-    setTimeout(function () { callback(e); }, 0);
+    setTimeout(function () { _invoke(callback, e); }, 0);
     return;
   }
 
@@ -139,9 +176,9 @@ export function createEncryptor(opts, callback) {
     false,
     ['encrypt']
   ).then(function (cryptoKey) {
-    callback(null, new Encryptor(cryptoKey, subtle));
+    _invoke(callback, null, new Encryptor(cryptoKey, subtle));
   }, function (err) {
-    callback(err);
+    _invoke(callback, err);
   });
 }
 
@@ -189,8 +226,8 @@ Encryptor.prototype.encrypt = function (plaintext, iv, callback) {
   ).then(function (buffer) {
     // ArrayBuffer → Uint8Array view. No copy; the caller can use it
     // directly as a Uint8Array (set into a larger buffer, upload, etc.).
-    callback(null, new Uint8Array(buffer));
+    _invoke(callback, null, new Uint8Array(buffer));
   }, function (err) {
-    callback(err);
+    _invoke(callback, err);
   });
 };

@@ -17,6 +17,10 @@ function OggReader(opts) {
   this._granulePos = 0;
   this._headersParsed = 0;
   this._ptsUs = 0;
+  // Segments of a packet that continued past the end of the previous
+  // page. Ogg signals continuation with a final 255-byte segment; the
+  // remainder arrives in the next page and must be joined to this.
+  this._pendingSegments = [];
 }
 
 OggReader.prototype.on = function (ev, fn) { this._ee.on(ev, fn); };
@@ -69,9 +73,20 @@ OggReader.prototype.feed = function (chunk) {
       continue;
     }
 
-    // Extract packets from segments
+    // Extract packets from segments.
+    //
+    // packetBuf carries over from the previous page. Ogg splits a packet
+    // into 255-byte segments and terminates it with a segment of 0..254;
+    // a page whose LAST segment is 255 means the packet continues into
+    // the next page (RFC 3533 §6). packetBuf used to be re-initialised
+    // per page, so every such continued packet was silently discarded
+    // along with everything already collected for it. Opus packets at
+    // 20 ms are well under 255 bytes so this never showed up in the
+    // WebRTC path, but any larger frame — higher bitrate, longer frame
+    // duration, or a non-Opus stream through the same reader — lost
+    // audio without a word.
     var packets = [];
-    var packetBuf = [];
+    var packetBuf = this._pendingSegments;
     var segOff = 0;
     for (var s = 0; s < numSegments; s++) {
       var segSize = header[27 + s];
@@ -79,7 +94,7 @@ OggReader.prototype.feed = function (chunk) {
         packetBuf.push(body.subarray(segOff, segOff + segSize));
       }
       segOff += segSize;
-      // Segment < 255 means end of packet
+      // Segment < 255 terminates the packet; 255 means "continues".
       if (segSize < 255) {
         if (packetBuf.length) {
           // Fast path: single segment = no concat needed
@@ -101,6 +116,8 @@ OggReader.prototype.feed = function (chunk) {
         }
       }
     }
+    // Whatever is left belongs to a packet continuing into the next page.
+    this._pendingSegments = packetBuf;
 
     // Emit audio events for each packet.
     //
@@ -131,6 +148,7 @@ OggReader.prototype.feed = function (chunk) {
 
 OggReader.prototype.flush = function () {
   this._q.reset();
+  this._pendingSegments = [];
 };
 
 export default OggReader;

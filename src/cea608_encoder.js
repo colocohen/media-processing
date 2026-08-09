@@ -102,9 +102,21 @@ var _PAC_TABLE = [
  *
  * Ref: CEA-608-E Annex C, Table 4.
  */
-function _pacForRow(row) {
+function _pacForRow(row, channel) {
   var entry = (row >= 1 && row <= 15) ? _PAC_TABLE[row] : _PAC_TABLE[15];
-  return [_withParity(entry[0]), _withParity(entry[1])];
+  // The table holds channel-1 codes (0x10..0x17). Channel 2 uses the
+  // same codes offset by 0x08 (0x18..0x1F) — the same relationship as
+  // CTRL 0x14 → CTRL_CH2 0x1C above.
+  //
+  // This argument used to not exist. Control codes (RCL/ENM/EOC/EDM)
+  // were correctly switched to channel 2, but the PAC that follows them
+  // was always channel 1 — and a PAC is itself a channel-selecting
+  // control code, so it switched the decoder BACK to channel 1 before
+  // the text bytes arrived. Captions requested on CC2 rendered on CC1,
+  // while a player that selected CC2 (which HLSEncoder advertises via
+  // INSTREAM-ID) saw nothing at all.
+  var b1 = (channel === 2) ? (entry[0] + 0x08) : entry[0];
+  return [_withParity(b1), _withParity(entry[1])];
 }
 
 // CEA-608 Extended Character Set (CEA-608-E Annex F).
@@ -222,13 +234,19 @@ var _EXTENDED_CHARS = {
  *
  * Ref: CEA-608-E Annex F, Tables F.1, F.2, F.3.
  */
-function _encodeChar(ch) {
+function _encodeChar(ch, channel) {
   var code = ch.charCodeAt(0);
   // Extended Latin lookup first — covers both extended chars (à, Ç,
   // etc.) AND certain ASCII codepoints we remap (curly braces, etc.).
   var ext = _EXTENDED_CHARS[code];
   if (ext) {
-    return [_withParity(ext[0]), _withParity(ext[1]), _withParity(ext[2])];
+    // The escape byte is channel-scoped: 0x11/0x12/0x13 for channel 1,
+    // 0x19/0x1A/0x1B for channel 2 — as the table's own header note
+    // says. The table stores the channel-1 form; shift it for channel 2.
+    // Without this, an accented character inside a CC2 caption emitted a
+    // channel-1 escape and dragged the rest of the line onto CC1.
+    var esc = (channel === 2) ? (ext[1] + 0x08) : ext[1];
+    return [_withParity(ext[0]), _withParity(esc), _withParity(ext[2])];
   }
   // Plain printable ASCII.
   if (code >= 0x20 && code <= 0x7E) {
@@ -288,7 +306,7 @@ function _buildCuePairs(text, channel) {
   if (startRow < 1) startRow = 1;
 
   for (var li = 0; li < lines.length; li++) {
-    startPairs.push(_pacForRow(startRow + li));
+    startPairs.push(_pacForRow(startRow + li, channel));
 
     // Encode line characters. _encodeChar may return 1 byte (ASCII)
     // or 3 bytes (extended Latin: ASCII fallback + 2-byte escape).
@@ -296,7 +314,7 @@ function _buildCuePairs(text, channel) {
     var bytes = [];
     var line = lines[li];
     for (var ci = 0; ci < line.length; ci++) {
-      var encoded = _encodeChar(line.charAt(ci));
+      var encoded = _encodeChar(line.charAt(ci), channel);
       for (var ei = 0; ei < encoded.length; ei++) {
         bytes.push(encoded[ei]);
       }

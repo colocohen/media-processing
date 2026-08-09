@@ -26,9 +26,18 @@
  *
  *   encoder.on('error', function (err) { console.error(err); });
  *
- *   // Drive it with frames:
- *   for await (var frame of cameraFrames) encoder.feed(frame);
- *   await encoder.end();
+ *   // Drive it with frames, then finalize:
+ *   cameraFrames.on('frame', function (frame) { encoder.feed(frame); });
+ *   cameraFrames.on('ended', function () {
+ *     encoder.end(function () {
+ *       // Every segment has been emitted and the manifest carries
+ *       // EXT-X-ENDLIST. Safe to play back or finish uploading here.
+ *     });
+ *   });
+ *
+ * end() also returns a Promise when no callback is given, for callers
+ * who prefer that. Either way, the work is NOT finished when end()
+ * returns — the final partial segment is emitted during it.
  *
  * Architecture (top-down):
  *
@@ -1215,7 +1224,8 @@ HLSEncoder.prototype.getStreamInf = function (opts) {
   // Codecs: video first, then audio. Per HLS RFC 8216 §4.3.4.2 this is
   // a comma-separated list, no whitespace. The captured avcC/hvcC
   // (videoConfig on the writer) is non-null only after the first chunk.
-  var capturedConfig = (this._writer && this._writer._videoConfig) || null;
+  var capturedConfig = (this._writer && this._writer.getVideoConfig)
+    ? this._writer.getVideoConfig() : null;
   var vCodecStr = _deriveVideoCodecString(v, capturedConfig);
   var aCodecStr = _deriveAudioCodecString(a);
   var codecsStr;
@@ -1240,8 +1250,23 @@ HLSEncoder.prototype.getStreamInf = function (opts) {
     averageBandwidth: averageBandwidth,
     codecs:           opts.codecs    !== undefined ? opts.codecs    : codecsStr,
     resolution:       opts.resolution !== undefined ? opts.resolution : resolution,
-    frameRate:        opts.frameRate  !== undefined ? opts.frameRate  : (v && v.framerate) || 30,
   };
+  // FRAME-RATE only belongs on a variant that has video. RFC 8216
+  // §4.3.4.2 scopes it to variants with video, and the previous
+  // `(v && v.framerate) || 30` fell through to 30 when there was no
+  // video config at all — so an audio-only variant advertised
+  // FRAME-RATE=30.000 next to no RESOLUTION. Harmless to most players,
+  // but it is a claim about a video stream that does not exist, and
+  // ABR logic that keys on FRAME-RATE has no reason to expect it.
+  if (opts.frameRate !== undefined) {
+    streamInf.frameRate = opts.frameRate;
+  } else if (v && v.framerate) {
+    streamInf.frameRate = v.framerate;
+  } else if (v) {
+    // Video configured but no explicit framerate — the encoder's own
+    // default applies, so advertising it is still correct.
+    streamInf.frameRate = 30;
+  }
   // HDR signaling. videoRange indicates the transfer function
   // (SDR/HLG/PQ); supplementalCodecs carries optional Dolby Vision
   // or HDR10+ profile info as a backwards-compatible add-on. Both
@@ -1319,7 +1344,8 @@ HLSEncoder.prototype.getIFrameStreamInf = function (opts) {
   }
 
   // Codecs: only video — I-frame variant has no audio.
-  var capturedConfig = (this._writer && this._writer._videoConfig) || null;
+  var capturedConfig = (this._writer && this._writer.getVideoConfig)
+    ? this._writer.getVideoConfig() : null;
   var vCodecStr = _deriveVideoCodecString(v, capturedConfig);
 
   var resolution;
@@ -1456,8 +1482,29 @@ HLSEncoder.prototype._resolveReady = function (err) {
  * @param {Function} [callback]  Called when end has fully completed.
  */
 HLSEncoder.prototype.end = function (callback) {
-  if (typeof callback !== 'function') callback = null;
-  var done = function () { if (callback) callback(); };
+  // Dual-mode: callback, or a Promise when none is given.
+  //
+  // end() used to return undefined always. The usage example at the top
+  // of this file — and every caller who followed it — writes
+  // `await encoder.end()`, and awaiting undefined resolves on the very
+  // next microtask. Meanwhile the real work (drain the WebCodecs
+  // encoders, flush SegmentBuilder, wait for encryption, close the
+  // playlist) is asynchronous, so the FINAL partial segment and the
+  // EXT-X-ENDLIST manifest were still to come.
+  //
+  // The visible symptom is a recording that plays short: everything up
+  // to the last whole segment boundary is there, the tail is missing,
+  // and the manifest's EXTINF total undercounts the real duration.
+  // Measured: 150 frames in (5.00s), 120 out (4.00s) — the trailing
+  // second silently absent, with no error anywhere.
+  //
+  // Same shape as base_coder's flush() and Muxer.finalize(): callers
+  // passing a callback are unaffected.
+  if (typeof callback !== 'function') {
+    var self_end = this;
+    return new Promise(function (resolve) { self_end.end(resolve); });
+  }
+  var done = function () { callback(); };
 
   if (this._ended) { done(); return; }
   this._ended = true;
@@ -1654,6 +1701,7 @@ HLSEncoder.prototype._ensureConfigured = function () {
     encryption: encryptionForBuilder,
     onSegment: function (info) { self._onSegment(info); },
     onPart:    function (info) { self._onPart(info); },
+    onError:   function (e) { self._ee.emit('error', e); },
   });
 
   // Now that the builder exists, trigger the async key import. When
@@ -1663,6 +1711,13 @@ HLSEncoder.prototype._ensureConfigured = function () {
     createEncryptor({ key: opts.encryption.key }, function (err, encryptor) {
       if (err) {
         self._ee.emit('error', err);
+        // Release anything waiting on the encryption queue. Without
+        // this the builder holds queued segments forever and end()
+        // never completes, even though the caller was just told about
+        // the failure.
+        if (self._segmentBuilder && self._segmentBuilder.failEncryption) {
+          self._segmentBuilder.failEncryption(err);
+        }
         self._resolveReady(err);
         return;
       }

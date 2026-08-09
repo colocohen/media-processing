@@ -35,6 +35,17 @@ EventEmitter.prototype.off = function (event, fn) {
   var arr = this._listeners[event];
   if (!arr) return this;
   var idx = arr.indexOf(fn);
+  if (idx < 0) {
+    // once() registers a wrapper, not the caller's function, and tags it
+    // with _original so identity can be recovered here. That tag existed
+    // and was documented as "preserve identity for off()" — but off()
+    // only ever did indexOf(fn), so removing a once() listener before it
+    // fired silently did nothing and the listener stayed armed. Node's
+    // EventEmitter matches the wrapper by its original; so do we now.
+    for (var i = 0; i < arr.length; i++) {
+      if (arr[i]._original === fn) { idx = i; break; }
+    }
+  }
   if (idx >= 0) arr.splice(idx, 1);
   return this;
 };

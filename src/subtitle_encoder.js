@@ -178,6 +178,24 @@ SubtitleEncoder.prototype.addCue = function (cue) {
   if (typeof cue.text !== 'string') {
     throw new TypeError('SubtitleEncoder.addCue: cue.text (string) required');
   }
+  // A cue identifier occupies its own line immediately before the
+  // timing line. WebVTT forbids "-->" in it (§4.1) precisely because a
+  // parser would then read that line AS the timing line, fail, and
+  // discard the whole cue. A newline would split it into two lines with
+  // the same effect. Both are unrecoverable in the output format, so
+  // they are rejected at the API boundary rather than silently
+  // producing a file that loses cues.
+  if (cue.identifier !== undefined && cue.identifier !== null) {
+    if (typeof cue.identifier !== 'string') {
+      throw new TypeError('SubtitleEncoder.addCue: cue.identifier must be a string');
+    }
+    if (cue.identifier.indexOf('-->') >= 0 || /[\r\n]/.test(cue.identifier)) {
+      throw new TypeError(
+        'SubtitleEncoder.addCue: cue.identifier must not contain "-->" or a ' +
+        'newline — WebVTT would parse it as the cue timing line and drop the cue'
+      );
+    }
+  }
   if (cue.start < this._currentSegmentStart) {
     throw new RangeError(
       'SubtitleEncoder.addCue: cue.start (' + cue.start +
@@ -440,9 +458,24 @@ function _buildVtt(cues) {
     var timing = _formatVttTime(c.start) + ' --> ' + _formatVttTime(c.end);
     if (c.settings) timing += ' ' + c.settings;
     lines.push(timing);
-    // Cue payload. WebVTT allows multi-line cues; we preserve newlines
-    // verbatim. Empty line after each cue separates them per spec §3.4.
-    lines.push(c.text);
+    // Cue payload, sanitised. WebVTT's block structure makes two things
+    // in the text unrepresentable, and passing them through verbatim
+    // silently corrupted the file:
+    //
+    //   - A BLANK LINE terminates the cue (§3.4). Text like
+    //     "line one\n\nline two" produced a cue containing only
+    //     "line one"; "line two" was then read as the IDENTIFIER of the
+    //     next block, which had no timing line, so that cue was dropped
+    //     too. One blank line cost two cues.
+    //
+    //   - "-->" inside the payload is forbidden and leads parsers to
+    //     treat the line as a timing line.
+    //
+    // Both come from real content (transcripts, translations, ASR
+    // output), so throwing would be hostile. Blank lines collapse to a
+    // single line break, which preserves the visible text; "-->" is
+    // written as the entity form, which WebVTT renders as "-->".
+    lines.push(_sanitizeVttPayload(c.text));
     lines.push('');
   }
 
@@ -453,6 +486,24 @@ function _buildVtt(cues) {
   }
   // Node fallback (older runtimes without global TextEncoder)
   return _utf8Encode(text);
+}
+
+/**
+ * Make arbitrary text safe to place inside a WebVTT cue payload.
+ * See the call site for why each substitution is necessary.
+ */
+function _sanitizeVttPayload(text) {
+  return String(text)
+    // Normalise line endings first so the blank-line collapse below
+    // sees a single form.
+    .replace(/\r\n?/g, '\n')
+    // Two or more line breaks (optionally with whitespace between)
+    // become one: a payload cannot contain an empty line.
+    .replace(/\n[ \t]*(?=\n)/g, '')
+    // Trailing newline would create the terminating blank line early.
+    .replace(/\n+$/, '')
+    // "-->" is structural; the entity form renders identically.
+    .replace(/-->/g, '--&gt;');
 }
 
 /**

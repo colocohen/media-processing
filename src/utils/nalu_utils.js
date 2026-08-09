@@ -206,12 +206,56 @@ export function nalusToAnnexb(nalus) {
  * the caller to declare the format up front.
  */
 export function detectFormat(buf) {
-  if (buf.length < 4) return 'unknown';
-  if (buf[0] === 0 && buf[1] === 0) {
-    if (buf[2] === 1) return 'annexb';
-    if (buf[2] === 0 && buf[3] === 1) return 'annexb';
+  if (!buf || buf.length < 4) return 'unknown';
+
+  var looksLikeStartCode =
+    buf[0] === 0 && buf[1] === 0 &&
+    (buf[2] === 1 || (buf[2] === 0 && buf[3] === 1));
+
+  // No start-code prefix — unambiguously length-prefixed.
+  if (!looksLikeStartCode) return 'avcc';
+
+  // Ambiguous. An AVCC length field ALIASES a start code whenever the
+  // first NALU's size falls in a range whose big-endian encoding begins
+  // 00 00 01 or 00 00 00 01:
+  //
+  //   size 1        → 00 00 00 01
+  //   size 256..511 → 00 00 01 xx      ← a 256-value window
+  //
+  // Sizes in 256..511 are entirely ordinary for a first NALU (an SPS,
+  // a PPS, a small slice), so this is not a corner case. The previous
+  // heuristic returned 'annexb' for all of them, and its comment
+  // reasoned only about the size-1 case ("for any real frame this is at
+  // least a few bytes"), which is why the wider window went unnoticed.
+  //
+  // Consequence: hls_encoder._onVideoChunk runs annexbToAvcc() on a
+  // buffer that is ALREADY AVCC. splitNALUs then scans length fields as
+  // if they were payload, finds start codes inside them, and emits
+  // nonsense — corrupt mdat samples in the fMP4 output, from the
+  // browser path, with no error raised anywhere.
+  //
+  // Resolve it by walking the buffer as AVCC: chained length prefixes
+  // must consume it exactly. Real Annex-B data effectively never does
+  // (its first "length" would be 1, after which the next four bytes are
+  // NAL payload interpreted as a size, which overshoots immediately).
+  return _walksAsAvcc(buf) ? 'avcc' : 'annexb';
+}
+
+/**
+ * True if `buf` parses cleanly as a chain of 4-byte-length-prefixed
+ * NALUs that ends exactly at the buffer's end.
+ */
+function _walksAsAvcc(buf) {
+  var off = 0;
+  var count = 0;
+  while (off + 4 <= buf.length) {
+    var len = readU32BE(buf, off);
+    if (len === 0) return false;          // zero-length NALU is invalid
+    off += 4 + len;
+    if (off > buf.length) return false;   // overshoots — not AVCC
+    count++;
   }
-  return 'avcc';
+  return off === buf.length && count > 0;
 }
 
 /**

@@ -51,7 +51,7 @@ function AudioDecoder(init) {
   };
 }
 
-applyCoderPrototype(AudioDecoder);
+applyCoderPrototype(AudioDecoder, { role: 'decoder' });
 
 AudioDecoder.prototype.configure = function (config) {
   if (!config || !config.codec) throw new TypeError('AudioDecoder.configure: codec required');
@@ -67,6 +67,7 @@ AudioDecoder.prototype.configure = function (config) {
   };
 
   this._descriptionSent = false;
+  this._keyChunkRequired = true;   // reset per configure(), per spec
 
   // Raw-frames mode currently only makes sense for Opus. For any other
   // codec the caller almost certainly has a container already (ADTS for
@@ -109,6 +110,24 @@ AudioDecoder.prototype.decode = function (chunk) {
     );
     stateErr.name = 'InvalidStateError';
     throw stateErr;
+  }
+  // W3C WebCodecs §3.4 [[key chunk required]]: the first chunk after
+  // configure() (and after flush()) MUST be a key chunk, else DataError.
+  // Chrome enforces this. Without it a delta chunk was fed straight to
+  // FFmpeg, which has no reference frame to decode against and emits
+  // either nothing or visibly broken output — a silent failure exactly
+  // where a loud one belongs.
+  if (this._keyChunkRequired) {
+    if (!chunk || chunk.type !== 'key') {
+      var keyErr = new Error(
+        'AudioDecoder.decode: a key chunk is required first (got ' +
+        ((chunk && chunk.type) || 'no chunk') + '). Decoding cannot start ' +
+        'from a delta chunk.'
+      );
+      keyErr.name = 'DataError';
+      throw keyErr;
+    }
+    this._keyChunkRequired = false;
   }
   if (!chunk || !chunk.data || !chunk.data.length) {
     // chunk.data missing/empty is a programmer error — also sync per spec.
@@ -298,10 +317,25 @@ AudioDecoder.prototype._startFFmpeg = function () {
 AudioDecoder.isConfigSupported = function (config) {
   // rawFrames mode adds support for 'opus' even when no default
   // container is registered — the decoder supplies one internally.
-  if (config && config.rawFrames && normalizeCodec(config.codec) === 'opus') {
-    return Promise.resolve({ supported: true });
-  }
-  return Promise.resolve({ supported: !!getDefaultContainer(config.codec) });
+  var supported = (config && config.rawFrames && normalizeCodec(config.codec) === 'opus')
+    ? true
+    : !!getDefaultContainer(config.codec);
+  // W3C AudioDecoderSupport carries `config` alongside `supported`; see
+  // the matching note on VideoDecoder.isConfigSupported.
+  return Promise.resolve({ supported: supported, config: _cloneAudioDecoderConfig(config) });
 };
+
+var _AUDIO_DECODER_CONFIG_KEYS = [
+  'codec', 'sampleRate', 'numberOfChannels', 'description', 'rawFrames',
+];
+function _cloneAudioDecoderConfig(config) {
+  var out = {};
+  if (!config) return out;
+  for (var i = 0; i < _AUDIO_DECODER_CONFIG_KEYS.length; i++) {
+    var k = _AUDIO_DECODER_CONFIG_KEYS[i];
+    if (config[k] !== undefined) out[k] = config[k];
+  }
+  return out;
+}
 
 export default AudioDecoder;

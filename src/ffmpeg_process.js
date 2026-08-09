@@ -362,5 +362,36 @@ FFmpegProcess.prototype.resumeOutput = function () {
   if (this._proc.stdout) this._proc.stdout.resume();
 };
 
+/**
+ * Register an FFmpeg child spawned OUTSIDE this module so it is covered
+ * by the same orphan prevention.
+ *
+ * The exit hooks and the live-children set live here because
+ * FFmpegProcess is the normal way to spawn. But MediaEncoder calls
+ * node:child_process.spawn directly — it needs a five-pipe stdio layout
+ * that FFmpegProcess doesn't model — and was therefore invisible to
+ * this bookkeeping. A Node crash left its FFmpeg reparented to init and
+ * running forever, which is exactly the failure the hooks exist to
+ * prevent.
+ *
+ * Registration is idempotent, and the child unregisters itself on
+ * 'close' so a long-lived process doesn't accumulate dead entries.
+ *
+ * @param {ChildProcess} proc
+ * @returns {ChildProcess} proc, for chaining
+ */
+export function trackChildProcess(proc) {
+  if (!proc) return proc;
+  _installExitHooks();
+  _liveChildren.add(proc);
+  proc.once('close', function () { _liveChildren.delete(proc); });
+  return proc;
+}
+
+/** Stop tracking a child that is being killed deliberately. */
+export function untrackChildProcess(proc) {
+  if (proc) _liveChildren.delete(proc);
+}
+
 export default FFmpegProcess;
 export { checkFFmpeg, resolveFFmpegPath };

@@ -106,6 +106,50 @@ FrameQueue.prototype.push = function (chunk) {
 };
 
 /**
+ * Change the frame size mid-stream.
+ *
+ * Needed because a decoder cannot know its output frame size until
+ * FFmpeg reports the stream's actual dimensions, which happens after
+ * the queue has to exist. The previous design forced the caller to
+ * commit to a size at construction, which is why VideoDecoder pinned
+ * every output to a configured (and by default invented) resolution.
+ *
+ * Any partially-accumulated bytes are discarded: they were framed
+ * against the old size and cannot be reinterpreted under the new one.
+ * That costs at most one incomplete frame at the boundary.
+ *
+ * @param {number} frameSize — new frame size in bytes
+ */
+FrameQueue.prototype.setFrameSize = function (frameSize) {
+  if (typeof frameSize !== 'number' || !Number.isInteger(frameSize) || frameSize <= 0) {
+    throw new TypeError(
+      'FrameQueue.setFrameSize: frameSize must be a positive integer, got ' + frameSize
+    );
+  }
+  if (frameSize === this._frameSize) return;
+  this._frameSize = frameSize;
+  this._writePos = 0;
+
+  // Right-size the backing buffer. Growing is required for correctness
+  // once frames exceed the old capacity; shrinking matters because the
+  // decoder's old 1920x1080 default allocated 9 MB per instance up
+  // front, and a stream that turns out to be 320x240 should not keep
+  // paying for it.
+  var wanted = frameSize * 3;
+  if (wanted !== this._capacity) {
+    this._buf = new Uint8Array(wanted);
+    this._capacity = wanted;
+  }
+};
+
+/**
+ * Current frame size in bytes.
+ */
+Object.defineProperty(FrameQueue.prototype, 'frameSize', {
+  get: function () { return this._frameSize; },
+});
+
+/**
  * How many bytes are buffered (incomplete frame).
  */
 Object.defineProperty(FrameQueue.prototype, 'buffered', {

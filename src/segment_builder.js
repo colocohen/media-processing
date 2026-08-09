@@ -82,6 +82,9 @@ function SegmentBuilder(opts) {
   // invoked when partDuration is set; otherwise this is a no-op
   // function so the hot push paths can call it without a null check.
   this._onPart = opts.onPart || function () {};
+  // Optional. Non-fatal problems (a segment that failed to encrypt)
+  // reach the caller through this instead of vanishing into the log.
+  this._onError = opts.onError || null;
   this._segmentDurationUs = (opts.segmentDuration || 6) * 1000000;
   // Part duration in microseconds. 0 = LL-HLS disabled. The expected
   // value is in the 200ms–1s range; outside that range, players may
@@ -887,7 +890,12 @@ SegmentBuilder.prototype._emit = function (videoChunks, audioChunks, metadataChu
  */
 SegmentBuilder.prototype._processEncryptionQueue = function () {
   if (this._encryptionInProgress) return;
-  if (!this._encryption || !this._encryption.encryptor) return;
+  if (!this._encryption) return;
+  // No encryptor yet: keep waiting — UNLESS the key import has
+  // terminally failed, in which case fall through so drain subscribers
+  // fire and anyone blocked on end() is released.
+  if (!this._encryption.encryptor && !this._encryption.failed) return;
+  if (this._encryption.failed) this._pendingEncryptions = [];
   if (this._pendingEncryptions.length === 0) {
     // Queue is empty — fire all drain subscribers and clear the list.
     if (this._drainCallbacks.length > 0) {
@@ -915,13 +923,16 @@ SegmentBuilder.prototype._processEncryptionQueue = function () {
   enc.encryptor.encrypt(info.bytes, iv, function (err, ciphertext) {
     self._encryptionInProgress = false;
     if (err) {
-      // Log and skip the segment — a single bad segment shouldn't
-      // halt the stream. The 'segment' event simply doesn't fire
-      // for this sequence.
-      if (typeof console !== 'undefined' && console.error) {
-        console.error('SegmentBuilder: segment encryption failed for ' +
-                      'sequence=' + info.sequence + ':', err);
-      }
+      // Skip the segment — one bad segment shouldn't halt the stream,
+      // so 'segment' simply doesn't fire for this sequence.
+      //
+      // But report it. This used to console.error and nothing else, so
+      // a stream could silently drop segments while the caller saw a
+      // healthy-looking playlist with a hole in it.
+      self._reportError(new Error(
+        'SegmentBuilder: segment encryption failed for sequence=' +
+        info.sequence + ': ' + ((err && err.message) || err)
+      ));
     } else {
       info.bytes = ciphertext;
       self._onSegment(info);
@@ -929,6 +940,44 @@ SegmentBuilder.prototype._processEncryptionQueue = function () {
     // Process next regardless of error so the queue keeps moving.
     self._processEncryptionQueue();
   });
+};
+
+/** Report a non-fatal problem to the caller, falling back to the console. */
+SegmentBuilder.prototype._reportError = function (err) {
+  if (typeof this._onError === 'function') {
+    try { this._onError(err); return; } catch (e) { /* fall through */ }
+  }
+  if (typeof console !== 'undefined' && console.error) console.error(err);
+};
+
+/**
+ * Declare that the encryptor will never arrive — the key import failed.
+ *
+ * Without this the builder waits forever: _processEncryptionQueue
+ * returns early while `encryption.encryptor` is null, so it never
+ * reaches the branch that fires drain subscribers. Queued segments
+ * stayed queued, and HLSEncoder.end() — which completes only once
+ * onEncryptionDrained fires — never returned. The caller did receive an
+ * 'error' event for the failed import, but their end() hung anyway, so
+ * the stream never appeared to finish.
+ *
+ * Pending segments are discarded rather than emitted in the clear: the
+ * playlist carries an EXT-X-KEY directive, so plaintext bytes under
+ * that URI would be worse than a missing segment.
+ */
+SegmentBuilder.prototype.failEncryption = function (err) {
+  if (!this._encryption) return;
+  this._encryption.failed = err || new Error('encryption unavailable');
+  var dropped = this._pendingEncryptions;
+  this._pendingEncryptions = [];
+  for (var i = 0; i < dropped.length; i++) {
+    this._reportError(new Error(
+      'SegmentBuilder: dropping segment sequence=' + dropped[i].sequence +
+      ' — encryption unavailable: ' + this._encryption.failed.message
+    ));
+  }
+  this._encryptionInProgress = false;
+  this._processEncryptionQueue();
 };
 
 /**
@@ -972,7 +1021,7 @@ SegmentBuilder.prototype.onEncryptionDrained = function (callback) {
   if (typeof callback !== 'function') {
     throw new TypeError('SegmentBuilder.onEncryptionDrained: callback required');
   }
-  if (!this._encryption ||
+  if (!this._encryption || this._encryption.failed ||
       (!this._encryptionInProgress && this._pendingEncryptions.length === 0)) {
     // Nothing in flight or pending — fire on next tick. We never
     // call back synchronously, even when the answer is trivially

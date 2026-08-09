@@ -39,17 +39,88 @@ var SVC_PATTERNS = {
   'L1T3': { tid: [0, 2, 1, 2], keyExpr: 'eq(mod(n,2),0)', layers: 3 },
 };
 
-// Bytes per pixel for format validation
+// Bytes per pixel for format validation.
+//
+// MUST stay in sync with FORMAT_BPP in video_frame.js. They diverged
+// once already: MP-34 added I422/I422A/I444/I444A to the VideoFrame
+// constructor but not here, so a perfectly valid I444 frame would
+// construct fine and then be rejected by encode() as "unsupported
+// format". Both tables now list the same keys.
 var _FORMAT_BPP = {
+  // 4:2:0
   'I420': 1.5, 'YUV420P': 1.5, 'NV12': 1.5, 'I420A': 2.5,
+  // 4:2:2
+  'I422': 2.0, 'I422A': 3.0,
+  // 4:4:4
+  'I444': 3.0, 'I444A': 4.0,
+  // Packed RGB
   'RGBA': 4, 'RGBX': 4, 'BGRA': 4, 'BGRX': 4, 'RGB24': 3,
 };
 
 // Map VideoFrame format → FFmpeg -pixel_format value
 var _FORMAT_TO_FFMPEG = {
   'I420': 'yuv420p', 'YUV420P': 'yuv420p', 'NV12': 'nv12', 'I420A': 'yuva420p',
+  'I422': 'yuv422p', 'I422A': 'yuva422p',
+  'I444': 'yuv444p', 'I444A': 'yuva444p',
   'RGBA': 'rgba', 'RGBX': 'rgba', 'BGRA': 'bgra', 'BGRX': 'bgra', 'RGB24': 'rgb24',
 };
+
+/**
+ * Merge our own video filters into whatever -vf the codec definition
+ * already carries, producing a SINGLE -vf argument.
+ *
+ * This is load-bearing. Every hardware encoder path in codecs.js
+ * already emits its own -vf (14 of them: hwupload_cuda for nvenc,
+ * hwupload=...,format=qsv for QSV, format=nv12,hwupload for VAAPI,
+ * hwupload_amf for AMF). FFmpeg accepts only ONE -vf per output
+ * stream — a second occurrence silently overrides the first. So
+ * appending our scale filter after codecDef.args would either drop
+ * our scaling or, worse, drop the GPU upload chain and break
+ * hardware encoding, with no error from FFmpeg.
+ *
+ * Ordering: our filters go FIRST. After hwupload the frame lives in
+ * GPU memory and the CPU `scale` filter can no longer touch it, so
+ * scaling must happen before the upload. This costs a CPU scale even
+ * when a GPU is present — using scale_cuda / scale_vaapi / scale_qsv
+ * instead would avoid that, but requires per-vendor branching, which
+ * is exactly the backend coupling this whole change exists to remove.
+ * Revisit only if profiling shows the CPU scale actually matters.
+ *
+ * @param {string[]} codecArgs  — codecDef.args (not mutated)
+ * @param {string[]} ourFilters — e.g. ['crop=...', 'scale=...']
+ * @returns {string[]} new args array with a single merged -vf
+ */
+/** Compare two visibleRect-shaped objects (or nulls) without allocating. */
+function _sameRect(a, b) {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return a.x === b.x && a.y === b.y &&
+         a.width === b.width && a.height === b.height;
+}
+
+function _mergeVideoFilters(codecArgs, ourFilters) {
+  if (!ourFilters || !ourFilters.length) return codecArgs.slice();
+
+  var out = [];
+  var existing = null;
+  for (var i = 0; i < codecArgs.length; i++) {
+    if (codecArgs[i] === '-vf' && i + 1 < codecArgs.length) {
+      // Last -vf wins in FFmpeg; mirror that if a codec ever emits two.
+      existing = codecArgs[i + 1];
+      i++;               // skip the value too
+      continue;
+    }
+    out.push(codecArgs[i]);
+  }
+
+  var chain = ourFilters.slice();
+  if (existing) chain.push(existing);
+
+  // Put -vf at the front of the codec args. Position within the
+  // output-options group is irrelevant to FFmpeg, and front is
+  // easiest to spot when debugging a spawned command line.
+  return ['-vf', chain.join(',')].concat(out);
+}
 
 function VideoEncoder(init) {
   if (!init) throw new TypeError('VideoEncoder: init required');
@@ -84,6 +155,13 @@ function VideoEncoder(init) {
   //                        non-empty, transition is active.
   // _transitionBuffer:     [{chunk, metadata}] queued from new reader.
   // _transitionTimer:      forcing timeout if drain stalls.
+  // Set when a frame arrives with different geometry than the running
+  // FFmpeg was spawned for. Forces a restart on the next encode and
+  // bypasses the keyframe cooldown. See the geometry block in encode().
+  this._pendingResize = false;
+  this._activeOrientation = null;
+  this._activeOutputConfig = null;
+
   this._transitionPendingOld = new Set();
   this._transitionBuffer = null;       // null when no transition active
   this._transitionTimer = null;
@@ -179,7 +257,7 @@ function VideoEncoder(init) {
   };
 }
 
-applyCoderPrototype(VideoEncoder);
+applyCoderPrototype(VideoEncoder, { role: 'encoder' });
 
 var FLUSH_TIMEOUT = 10000;
 
@@ -468,6 +546,11 @@ VideoEncoder.prototype.configure = function (config) {
     codec: normalizeCodec(config.codec),
     width: config.width,
     height: config.height,
+    // W3C VideoEncoderConfig members that were dropped entirely. They do
+    // not affect encoding; they travel to the decoder via decoderConfig
+    // so the display aspect ratio survives the round trip.
+    displayWidth: config.displayWidth || 0,
+    displayHeight: config.displayHeight || 0,
     framerate: config.framerate || 30,
     bitrate: config.bitrate || 0,
     latencyMode: latencyMode,
@@ -490,8 +573,31 @@ VideoEncoder.prototype.configure = function (config) {
   };
 
   this._encodeCount = 0;
-  this._expectedFrameSize = ((config.width * config.height * 3) >> 1);
+
+  // ── Input geometry: learned from the first frame, not configured ──
+  //
+  // Per W3C WebCodecs, VideoEncoderConfig.width/height describe the
+  // ENCODED OUTPUT, and encode() must accept a VideoFrame of any size
+  // and scale it ("The encoder MUST scale any VideoFrame whose
+  // [[visible width]] differs from this value"). The input geometry is
+  // therefore not something the caller tells us — we discover it,
+  // exactly the way _inputPixelFormat is already discovered below.
+  //
+  // These feed two places: -video_size (the raw buffer layout FFmpeg
+  // reads from stdin, which is the CODED size) and the crop/scale
+  // filter chain (which works from the VISIBLE rect, per spec).
+  this._inputWidth = 0;         // codedWidth of the first frame
+  this._inputHeight = 0;        // codedHeight of the first frame
+  this._inputVisible = null;    // {x,y,width,height} when a real crop applies
+
   this._inputPixelFormat = null;  // detected from first frame format
+  this._pendingResize = false;
+  // [[active orientation]] — null until the first frame after configure().
+  this._activeOrientation = null;
+  // [[active output config]] — the decoderConfig most recently emitted.
+  // Spec: decoderConfig is attached to a chunk only when it DIFFERS from
+  // this, not on every key frame.
+  this._activeOutputConfig = null;
   this._hwProbing = false;
   this._pendingWrites = [];
   this._deferredFlush = null;
@@ -508,13 +614,49 @@ VideoEncoder.prototype.configure = function (config) {
 };
 
 VideoEncoder.prototype.encode = function (frame, options) {
+  // Per W3C WebCodecs §6.5: encode() throws InvalidStateError
+  // synchronously when [[state]] is not "configured", and TypeError for
+  // an unusable frame. Reporting these through the error callback
+  // instead meant a caller's try/catch caught nothing and the failure
+  // surfaced asynchronously, far from the call site.
+  //
+  // VideoDecoder.decode() already does this and its comment credits
+  // "MP-19's fix for VideoEncoder" — but the encoder side either never
+  // landed or regressed. This restores the symmetry.
   if (this._state !== 'configured') {
-    this._error(new Error('VideoEncoder: not configured'));
-    return;
+    var stateErr = new Error(
+      'VideoEncoder.encode: state is "' + this._state + '", not "configured"'
+    );
+    stateErr.name = 'InvalidStateError';
+    throw stateErr;
   }
   if (!frame || (!(frame.data instanceof Uint8Array))) {
-    this._error(new Error('VideoEncoder.encode: frame.data must be Buffer'));
-    return;
+    var inputErr = new TypeError('VideoEncoder.encode: frame.data must be a Uint8Array/Buffer');
+    throw inputErr;
+  }
+
+  // W3C WebCodecs §6.5 [[active orientation]]: the first frame after
+  // configure() fixes the stream's rotation/flip, and any later frame
+  // disagreeing is a DataError. Orientation is metadata carried in the
+  // bitstream/container, not something that can change per frame, so a
+  // mid-stream change is a caller bug — and one that would otherwise
+  // produce a stream whose declared orientation contradicts half its
+  // frames.
+  var frameRot = frame.rotation || 0;
+  var frameFlip = !!frame.flip;
+  if (this._activeOrientation === null || this._activeOrientation === undefined) {
+    this._activeOrientation = { rotation: frameRot, flip: frameFlip };
+  } else if (this._activeOrientation.rotation !== frameRot ||
+             this._activeOrientation.flip !== frameFlip) {
+    var orientErr = new Error(
+      'VideoEncoder.encode: frame orientation (rotation=' + frameRot +
+      ', flip=' + frameFlip + ') does not match the active orientation ' +
+      '(rotation=' + this._activeOrientation.rotation +
+      ', flip=' + this._activeOrientation.flip + ') established by the ' +
+      'first frame after configure()'
+    );
+    orientErr.name = 'DataError';
+    throw orientErr;
   }
 
   // Auto-detect pixel format from frame (browser compat: accept any format)
@@ -524,19 +666,104 @@ VideoEncoder.prototype.encode = function (frame, options) {
     this._error(new Error('VideoEncoder.encode: unsupported format "' + fmt + '"'));
     return;
   }
-  var expectedSize = Math.floor(this._config.width * this._config.height * bpp);
-  if (frame.data.length !== expectedSize) {
+  // ── Input geometry ───────────────────────────────────────────────
+  //
+  // W3C WebCodecs does NOT validate frame dimensions in encode(). Its
+  // algorithm checks exactly three things — [[Detached]], [[state]],
+  // and [[active orientation]] — and then queues the frame. Size is
+  // absent by design: config.width/height are the OUTPUT size, and a
+  // conforming encoder scales whatever it is handed.
+  //
+  // The old code compared frame.data.length against config dimensions
+  // and errored on any mismatch, which made the spec-correct simulcast
+  // pattern (configure each layer at native/scaleResolutionDownBy, feed
+  // all layers the same full-size source frame) fail on every frame for
+  // every layer except the one that happened to match.
+  //
+  // What we still check is INTERNAL consistency: does this buffer
+  // actually hold codedWidth × codedHeight pixels in the format it
+  // claims? A real VideoFrame can't fail this — our constructor in
+  // video_frame.js already throws RangeError at construction time, and
+  // the W3C constructor throws TypeError when byteLength is under
+  // allocationSize. But encode() accepts any frame-shaped object, so
+  // this catches hand-rolled inputs before they reach FFmpeg, where a
+  // wrong-length buffer produces silently sheared output rather than
+  // an error.
+  var inW = frame.codedWidth;
+  var inH = frame.codedHeight;
+
+  if (!inW || !inH) {
+    // Frame lacks coded dimensions. Derive them if we already know the
+    // input geometry from an earlier frame; otherwise we genuinely
+    // cannot interpret the buffer.
+    if (this._inputWidth && this._inputHeight &&
+        frame.data.length === Math.floor(this._inputWidth * this._inputHeight * bpp)) {
+      inW = this._inputWidth;
+      inH = this._inputHeight;
+    } else {
+      this._error(new Error(
+        'VideoEncoder.encode: frame has no codedWidth/codedHeight and its ' +
+        'size (' + frame.data.length + ' bytes) does not match the ' +
+        'established input geometry' +
+        (this._inputWidth ? ' (' + this._inputWidth + 'x' + this._inputHeight + ')' : '')
+      ));
+      return;
+    }
+  }
+
+  var codedSize = Math.floor(inW * inH * bpp);
+  if (frame.data.length !== codedSize) {
     this._error(new Error(
-      'VideoEncoder.encode: frame size ' + frame.data.length +
-      ' does not match ' + this._config.width + 'x' + this._config.height +
-      ' ' + fmt + ' (expected ' + expectedSize + ')'
+      'VideoEncoder.encode: frame data length ' + frame.data.length +
+      ' is inconsistent with its own ' + inW + 'x' + inH + ' ' + fmt +
+      ' geometry (expected ' + codedSize + ')'
     ));
     return;
   }
 
+  // Visible rect — the spec scales from the VISIBLE size, not the
+  // coded size. They differ only when the frame carries a real crop;
+  // treat a full-frame rect as "no crop" so the common path adds no
+  // filter at all.
+  var vis = frame.visibleRect;
+  var visNorm = null;
+  if (vis && (vis.width !== inW || vis.height !== inH || vis.x || vis.y)) {
+    visNorm = { x: vis.x || 0, y: vis.y || 0, width: vis.width, height: vis.height };
+  }
+
+  // ── Mid-stream geometry change → reconfigure, don't error ─────────
+  //
+  // FFmpeg's rawvideo demuxer takes a fixed -video_size; the running
+  // process cannot be told the frames just changed shape. A restart is
+  // the only option, and the keyframe-restart machinery below already
+  // knows how to do that without losing the frames in flight.
+  // Field compare, not JSON.stringify. This runs on EVERY frame — the
+  // `||` chain reaches the visibleRect term whenever width and height
+  // are unchanged, which is the normal case. Two stringify calls per
+  // frame per encoder is ~3x the cost of comparing four numbers, and it
+  // allocates two strings each time for the GC to collect.
+  var geometryChanged = this._inputWidth !== 0 &&
+    (inW !== this._inputWidth || inH !== this._inputHeight ||
+     !_sameRect(visNorm, this._inputVisible));
+
+  this._inputWidth = inW;
+  this._inputHeight = inH;
+  this._inputVisible = visNorm;
+
   // Store input format for FFmpeg startup (first frame determines format)
   if (!this._inputPixelFormat) {
     this._inputPixelFormat = _FORMAT_TO_FFMPEG[fmt] || 'yuv420p';
+  }
+
+  if (geometryChanged) {
+    // Warm pool entries were built for the previous geometry. Their
+    // fingerprint no longer matches so _takeWarmFFmpeg would reject
+    // them anyway, but draining now frees the subprocesses instead of
+    // leaving them idle until close().
+    this._drainWarmPool();
+    // Force the restart below regardless of keyframe throttling —
+    // see the resize note in the restart block.
+    this._pendingResize = true;
   }
 
   // Production: track stats
@@ -573,10 +800,38 @@ VideoEncoder.prototype.encode = function (frame, options) {
   // Throttled: if a restart was performed within RESTART_COOLDOWN_MS,
   // we skip and let the frame go through the existing FFmpeg as a
   // P-frame. See the cooldown rationale in the constructor.
-  if (options && options.keyFrame && this._ffmpeg.running) {
+  // A pending resize enters the same restart path: FFmpeg's rawvideo
+  // input geometry is fixed at spawn, so new dimensions require a new
+  // process, and this machinery already drains the old one in order.
+  if ((this._pendingResize || (options && options.keyFrame)) && this._ffmpeg.running) {
     var _kfNow = Date.now();
     var _kfSinceLast = _kfNow - this._lastKeyframeRestart;
-    if (_kfSinceLast < this.RESTART_COOLDOWN_MS) {
+    // The cooldown MUST NOT apply to a resize. Throttling a keyframe
+    // request merely delays recovery — the frame still encodes, just
+    // as a P-frame. Throttling a resize would keep feeding frames of
+    // the new size into an FFmpeg still configured for the old one,
+    // which rawvideo reinterprets as a byte stream and emits as
+    // sheared garbage. Correctness beats restart-storm protection here.
+    // `bypassThrottle` marks a keyframe that is a CORRECTNESS
+    // requirement rather than a best-effort request — GopCoordinator
+    // sets it when opening a group across an alternate group / ABR
+    // ladder / simulcast set.
+    //
+    // The cooldown exists to survive PLI storms, where dropping a
+    // request only delays recovery. It must not apply here: if one
+    // rendition emits an IDR and another is throttled into a P-frame,
+    // their group boundaries diverge permanently and a player switching
+    // renditions lands somewhere with no keyframe. Same reasoning as
+    // _pendingResize above.
+    //
+    // Note this is Node-only in effect. Native browser VideoEncoder has
+    // no restart and no throttle, so keyFrame:true is already
+    // unconditional there; the option exists to make this polyfill match
+    // that. Unknown members of an encode-options dictionary are ignored
+    // by WebIDL, so the same call is valid in a browser.
+    var _kfMandatory = !!(options && options.bypassThrottle);
+    if (!this._pendingResize && !_kfMandatory &&
+        _kfSinceLast < this.RESTART_COOLDOWN_MS) {
       // Throttled. Log only once per cooldown window so a sustained
       // PLI storm doesn't drown the log; the count goes into _stats
       // for after-the-fact diagnosis.
@@ -598,10 +853,11 @@ VideoEncoder.prototype.encode = function (frame, options) {
       // keyframe right now, but it WILL on the next request after
       // the cooldown expires (or on the natural keyframe interval).
     } else {
-      // Cooldown expired (or first keyframe ever). Proceed with the
-      // restart and stamp the timestamp so subsequent requests within
-      // RESTART_COOLDOWN_MS get throttled.
+      // Cooldown expired, or first keyframe ever, or a resize forced
+      // us here. Proceed with the restart and stamp the timestamp so
+      // subsequent requests within RESTART_COOLDOWN_MS get throttled.
       this._lastKeyframeRestart = _kfNow;
+      this._pendingResize = false;
 
     // ════════════════════════ DIAGNOSTIC (PLI-loop test) ════════════════════════
     // Logs every keyframe-induced subprocess restart. Run for ~60s, count
@@ -896,16 +1152,53 @@ VideoEncoder.prototype._buildFFmpegArgs = function (codecDef) {
     Array.prototype.push.apply(args, codecDef.preInput);
   }
 
+  // -video_size describes the INPUT buffer layout, i.e. how many bytes
+  // FFmpeg reads per frame from stdin. That is the frame's CODED size,
+  // learned from the first encode() call — not cfg.width/height, which
+  // are the encoded OUTPUT size and are reached via the scale filter
+  // below. Falling back to cfg dimensions keeps the warm pool able to
+  // pre-spawn before any frame has arrived; the fingerprint check makes
+  // sure such an entry is never actually used for a differently-sized
+  // input.
+  var inW = self._inputWidth || cfg.width;
+  var inH = self._inputHeight || cfg.height;
+
   args.push(
     '-f', 'rawvideo',
     '-pixel_format', self._inputPixelFormat || 'yuv420p',
-    '-video_size', cfg.width + 'x' + cfg.height,
+    '-video_size', inW + 'x' + inH,
     '-framerate', String(cfg.framerate),
     '-i', 'pipe:0'
   );
 
   args.push('-map', '0:v:0');
-  Array.prototype.push.apply(args, codecDef.args);
+
+  // ── Crop + scale to the configured output size ────────────────────
+  //
+  // Built here and merged into the codec's own -vf rather than pushed
+  // as a separate argument — see _mergeVideoFilters for why that
+  // distinction is not cosmetic.
+  //
+  // The crop comes first because the spec scales from the VISIBLE
+  // rect: a frame with a crop should have the crop applied and the
+  // result scaled to the output size.
+  var ourFilters = [];
+  var srcW = inW, srcH = inH;
+  if (self._inputVisible) {
+    var v = self._inputVisible;
+    ourFilters.push('crop=' + v.width + ':' + v.height + ':' + v.x + ':' + v.y);
+    srcW = v.width;
+    srcH = v.height;
+  }
+  if (srcW !== cfg.width || srcH !== cfg.height) {
+    // fast_bilinear: measured adequate for three simulcast layers in
+    // realtime. This is an implementation detail of media-processing —
+    // callers never see it, and a non-FFmpeg backend would express the
+    // equivalent in its own terms.
+    ourFilters.push('scale=' + cfg.width + ':' + cfg.height + ':flags=fast_bilinear');
+  }
+
+  Array.prototype.push.apply(args, _mergeVideoFilters(codecDef.args, ourFilters));
 
   if (!codecDef.isHardware) {
     args.push('-pix_fmt', codecDef.pixFmt || 'yuv420p');
@@ -1004,17 +1297,41 @@ VideoEncoder.prototype._wireReader = function (codecDef) {
         self._svcFrameIndex++;
       }
 
-      // Build decoderConfig metadata (browser passes this on keyframes)
+      // ── decoderConfig ──────────────────────────────────────────
+      //
+      // Per the spec's Output EncodedVideoChunks algorithm, the encoder
+      // builds a VideoDecoderConfig describing the output and attaches
+      // it to chunkMetadata ONLY when it is not an equal dictionary to
+      // [[active output config]]. Emitting it on every key frame — as
+      // this did — means a realtime stream re-sends the same config
+      // (including the SPS/PPS description) at every IDR, which muxers
+      // and receivers then have to diff themselves.
+      //
+      // The config also gained displayAspectWidth/displayAspectHeight,
+      // which the algorithm populates from the encoder config's
+      // displayWidth/displayHeight and which were simply missing.
       if (f.isKeyframe) {
-        metadata.decoderConfig = {
+        var outputConfig = {
           codec: cfg.codec,
           codedWidth: cfg.width,
           codedHeight: cfg.height,
         };
+        if (cfg.displayWidth)  outputConfig.displayAspectWidth  = cfg.displayWidth;
+        if (cfg.displayHeight) outputConfig.displayAspectHeight = cfg.displayHeight;
+        // Orientation travels with the config, per the algorithm's
+        // assignment of the frame's [[rotation]] / [[flip]].
+        if (self._activeOrientation) {
+          if (self._activeOrientation.rotation) outputConfig.rotation = self._activeOrientation.rotation;
+          if (self._activeOrientation.flip)     outputConfig.flip = true;
+        }
         // Extract SPS/PPS (H.264) or VPS/SPS/PPS (H.265) as description
         if (cfg.codec === 'h264' || cfg.codec === 'h265') {
           var desc = extractParameterSetsAnnexB(f.payload, cfg.codec === 'h265');
-          if (desc) metadata.decoderConfig.description = desc;
+          if (desc) outputConfig.description = desc;
+        }
+        if (!_sameDecoderConfig(outputConfig, self._activeOutputConfig)) {
+          metadata.decoderConfig = outputConfig;
+          self._activeOutputConfig = outputConfig;
         }
       }
 
@@ -1042,6 +1359,29 @@ VideoEncoder.prototype._wireReader = function (codecDef) {
   });
 };
 
+/**
+ * Dictionary equality for decoderConfig, per the spec's "equal
+ * dictionaries" comparison. `description` is a byte array, so it needs
+ * a element-wise compare rather than ===; a fresh Uint8Array is
+ * produced on every key frame even when the parameter sets are
+ * identical, and comparing by reference would defeat the whole point.
+ */
+function _sameDecoderConfig(a, b) {
+  if (!a || !b) return false;
+  var keys = ['codec', 'codedWidth', 'codedHeight',
+              'displayAspectWidth', 'displayAspectHeight', 'rotation', 'flip'];
+  for (var i = 0; i < keys.length; i++) {
+    if (a[keys[i]] !== b[keys[i]]) return false;
+  }
+  var da = a.description, db = b.description;
+  if (!da !== !db) return false;
+  if (da && db) {
+    if (da.length !== db.length) return false;
+    for (var j = 0; j < da.length; j++) if (da[j] !== db[j]) return false;
+  }
+  return true;
+}
+
 // ── Warm pool methods (MP-14 Layer 2) ─────────────────────────────────
 
 /**
@@ -1059,6 +1399,16 @@ VideoEncoder.prototype._computeConfigFingerprint = function () {
     height:      cfg.height,
     framerate:   cfg.framerate,
     pixelFormat: this._inputPixelFormat,
+    // Input geometry is baked into the pre-spawned argv twice, via
+    // -video_size and via the scale filter. Without it here, a warm
+    // process built for a 640x480 source could be handed to a 320x240
+    // one: FFmpeg would keep reading 460800-byte frames from a stream
+    // delivering 115200-byte ones and emit sheared output indefinitely,
+    // with no error anywhere. Same failure mode the pixelFormat entry
+    // above already guards against.
+    inputWidth:  this._inputWidth,
+    inputHeight: this._inputHeight,
+    inputVisible: this._inputVisible,
     latencyMode: cfg.latencyMode,
     loglevel:    cfg.loglevel,
     codecOptions: cfg.codecOptions || null,
@@ -1211,7 +1561,29 @@ VideoEncoder.prototype._fallbackToSoftware = function () {
 };
 
 VideoEncoder.isConfigSupported = function (config) {
-  return Promise.resolve({ supported: !!getVideoCodec(config.codec, config) });
+  // See the matching note in VideoDecoder.isConfigSupported: the spec's
+  // VideoEncoderSupport carries `config` alongside `supported`, and it
+  // is the caller's only way to learn which config members this
+  // implementation recognised.
+  return Promise.resolve({
+    supported: !!getVideoCodec(config.codec, config),
+    config: _cloneEncoderConfig(config),
+  });
 };
+
+var _ENCODER_CONFIG_KEYS = [
+  'codec', 'width', 'height', 'displayWidth', 'displayHeight',
+  'bitrate', 'framerate', 'hardwareAcceleration', 'alpha',
+  'scalabilityMode', 'bitrateMode', 'latencyMode', 'contentHint',
+];
+function _cloneEncoderConfig(config) {
+  var out = {};
+  if (!config) return out;
+  for (var i = 0; i < _ENCODER_CONFIG_KEYS.length; i++) {
+    var k = _ENCODER_CONFIG_KEYS[i];
+    if (config[k] !== undefined) out[k] = config[k];
+  }
+  return out;
+}
 
 export default VideoEncoder;

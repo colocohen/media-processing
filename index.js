@@ -89,6 +89,7 @@ export { default as GStreamerProcess } from './src/gstreamer_process.js';
 export { default as VideoPlayer } from './src/video_player.js';
 export { startFfplayViewer } from './src/ffplay_viewer.js';
 export { default as FramePacer } from './src/frame_pacer.js';
+export { default as GopCoordinator } from './src/gop_coordinator.js';
 
 // ── Utilities (pure, shared, browser-safe) ──
 export {
