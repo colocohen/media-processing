@@ -154,11 +154,27 @@ FramePacer.prototype._scheduleNext = function () {
         // Rethrowing on a fresh macrotask reaches window.onerror in a
         // browser and the default uncaught handler in Node, with the
         // caller's own stack, without unwinding the pacer.
-        if (typeof process !== 'undefined' && typeof process.emit === 'function') {
-          process.emit('uncaughtException', e);
-        } else {
-          setTimeout(function () { throw e; }, 0);
-        }
+        // ALWAYS a real throw on a fresh macrotask — never process.emit.
+        //
+        // process.emit('uncaughtException', e) SYNTHESISES the event instead
+        // of raising a fault. Any listener is entitled to rethrow so Node's
+        // default handler still runs, and that rethrow is itself uncaught,
+        // which re-enters the same listener. The two then feed each other:
+        // measured at 11 callbacks producing 204,296 handler invocations in
+        // one second.
+        //
+        // It does not crash. The check and microtask queues starve, so every
+        // await in the process stops progressing and even SIGINT goes
+        // unanswered while timers and sockets keep running — the process
+        // looks wedged, and nothing is logged, because the error never
+        // reaches the default handler that would print it.
+        //
+        // A plain throw on a macrotask is a REAL uncaught exception:
+        // window.onerror in a browser, Node's default handler otherwise,
+        // carrying the caller's stack and leaving the pacer's timer chain
+        // intact. It is exactly what the browser branch already did, and it
+        // behaves correctly in both, so there is no reason to have two paths.
+        setTimeout(function () { throw e; }, 0);
       }
     }
     self._frameIndex++;

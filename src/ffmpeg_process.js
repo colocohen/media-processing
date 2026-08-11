@@ -45,7 +45,27 @@ function _installExitHooks() {
   process.on('SIGTERM', function () { killAll(); process.exit(143); });
   // uncaughtException leaves children alive by default; we kill them and
   // rethrow so the user's handler (if any) still sees the error.
+  var _inFatalHandler = false;
   process.on('uncaughtException', function (err) {
+    // RE-ENTRY GUARD — this handler's own rethrow comes back through here.
+    //
+    // The rethrow below is itself an uncaught exception. When this is the
+    // only listener, Node's default handler runs and the process exits, so
+    // the second pass never happens. But any OTHER listener — an
+    // application's, a framework's, or a synthetic process.emit from
+    // elsewhere in the stack — keeps the process alive, and then the
+    // rethrow re-enters, rethrows again, and the two feed each other.
+    //
+    // Measured: a single throw becomes ~200,000 handler invocations per
+    // second. It does not crash. The check and microtask queues starve, so
+    // every await in the process stops progressing and even SIGINT goes
+    // unanswered, while timers and sockets keep running — the process looks
+    // wedged, and nothing is logged, because the error never reaches the
+    // default handler that would print it.
+    //
+    // Killing the children once is all this handler owes anyone.
+    if (_inFatalHandler) return;
+    _inFatalHandler = true;
     killAll();
     // Rethrow on next tick so default Node handler runs (which logs + exits 1).
     process.nextTick(function () { throw err; });
