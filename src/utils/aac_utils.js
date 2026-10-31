@@ -235,3 +235,92 @@ export function wrapAdts(rawAac, opts) {
   });
   return concat([header, rawAac]);
 }
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  Raw AAC ⇄ ADTS (W3C AAC codec registration)
+//
+//  aac.format = 'aac' (default): chunks are raw AAC access units and
+//                                decoderConfig.description is the
+//                                AudioSpecificConfig.
+//  aac.format = 'adts':          chunks carry their ADTS header; no
+//                                description is needed (a decoder
+//                                given no description assumes ADTS).
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * Length of the ADTS header at the start of `buf` (7, or 9 with CRC),
+ * or 0 when `buf` does not start with an ADTS header.
+ */
+export function adtsHeaderLength(buf) {
+  if (!buf || buf.length < 7) return 0;
+  // syncword 0xFFF, layer '00'
+  if (buf[0] !== 0xFF || (buf[1] & 0xF6) !== 0xF0) return 0;
+  return (buf[1] & 0x01) ? 7 : 9;
+}
+
+/** The raw AAC access unit inside an ADTS frame (a view, no copy). */
+export function stripAdts(frame) {
+  var n = adtsHeaderLength(frame);
+  return n ? frame.subarray(n) : frame;
+}
+
+/**
+ * Parse an AudioSpecificConfig (ISO/IEC 14496-3 §1.6.2.1) — the parts
+ * needed to rebuild ADTS headers: object type, sample rate, channels.
+ * Handles the 5-bit escape for object types ≥ 31 and the explicit
+ * 24-bit sample rate (index 15).
+ *
+ * @returns {{objectType:number, sampleRate:number, channels:number}|null}
+ */
+export function parseAudioSpecificConfig(asc) {
+  if (!asc || asc.length < 2) return null;
+  var bitPos = 0;
+  function bits(n) {
+    var v = 0;
+    for (var i = 0; i < n; i++) {
+      var byte = asc[bitPos >> 3];
+      if (byte === undefined) throw new Error('AudioSpecificConfig truncated');
+      v = (v << 1) | ((byte >> (7 - (bitPos & 7))) & 1);
+      bitPos++;
+    }
+    return v >>> 0;
+  }
+  try {
+    var objectType = bits(5);
+    if (objectType === 31) objectType = 32 + bits(6);
+    var freqIndex = bits(4);
+    var sampleRate = (freqIndex === 15) ? bits(24) : ADTS_SAMPLE_RATES[freqIndex];
+    var channels = bits(4);
+    if (!sampleRate) return null;
+    return { objectType: objectType, sampleRate: sampleRate, channels: channels };
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * Build the AudioSpecificConfig that describes an ADTS stream, from
+ * one of its frames — so the description matches what the encoder
+ * actually produced rather than what was asked for.
+ */
+export function audioSpecificConfigFromAdts(frame) {
+  var h = parseAdtsHeader(frame);
+  if (!h || !h.sampleRate) return null;
+  return buildAudioSpecificConfig({ profile: h.profile || 'lc', sampleRate: h.sampleRate, channels: h.channels });
+}
+
+/**
+ * ADTS-wrap a raw AAC access unit using an AudioSpecificConfig's
+ * parameters. ADTS can only signal object types 1..4 (Main/LC/SSR/LTP);
+ * HE-AAC (5) and HE-AACv2 (29) travel as LC with implicit SBR/PS, which
+ * is how ADTS carries them in practice.
+ */
+export function wrapAdtsWithConfig(rawAac, ascInfo) {
+  var ot = ascInfo.objectType;
+  return wrapAdts(rawAac, {
+    profile: (ot >= 1 && ot <= 4) ? ot - 1 : 1,
+    sampleRate: ascInfo.sampleRate,
+    channels: ascInfo.channels,
+  });
+}

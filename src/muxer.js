@@ -17,10 +17,29 @@
  *
  * Video is fed through stdin (pipe:0), audio through pipe:3.
  * FFmpeg muxes them into the output container.
+ *
+ * Chunks are taken exactly as WebCodecs encoders emit them (browser or
+ * this library's Node encoders) and framed for FFmpeg's raw demuxers:
+ *
+ *   H.264 / H.265   → Annex-B (length-prefixed chunks converted, the
+ *                     description's parameter sets put before key chunks)
+ *   VP8 / VP9 / AV1 → IVF (IVFWriter header + one record per chunk)
+ *   AAC             → ADTS (raw chunks get a header built from the
+ *                     description's AudioSpecificConfig)
+ *   Opus            → OGG (OggWriter headers + one page per packet)
+ *
+ * Pass each chunk's metadata along (addVideoChunk(chunk, metadata)): the
+ * first one carries decoderConfig.description, which decides the form.
  */
 
 import FFmpegProcess from './ffmpeg_process.js';
 import EventEmitter from './core/events.js';
+import { normalizeCodec } from './utils/codec_strings.js';
+import { avccToAnnexb, bitstreamFromDescription } from './utils/nalu_utils.js';
+import { adtsHeaderLength, parseAudioSpecificConfig, wrapAdtsWithConfig } from './utils/aac_utils.js';
+import { toUint8Array } from './core/buffer_source.js';
+import IVFWriter from './writer_ivf.js';
+import OggWriter from './writer_ogg.js';
 
 var FORMAT_MAP = {
   '.mp4': 'mp4', '.m4v': 'mp4', '.m4a': 'mp4',
@@ -32,8 +51,10 @@ var FORMAT_MAP = {
 var VIDEO_INPUT_FMT = {
   h264: 'h264', h265: 'hevc', vp8: 'ivf', vp9: 'ivf', av1: 'ivf',
 };
+// FFmpeg's ADTS demuxer is named 'aac' — there is no 'adts' demuxer
+// ('adts' is only a muxer), so '-f adts' made every AAC mux fail.
 var AUDIO_INPUT_FMT = {
-  aac: 'adts', opus: 'ogg', vorbis: 'ogg', mp3: 'mp3', flac: 'flac',
+  aac: 'aac', opus: 'ogg', vorbis: 'ogg', mp3: 'mp3', flac: 'flac',
   alaw: 'alaw', ulaw: 'mulaw', 'g711-alaw': 'alaw', 'g711-ulaw': 'mulaw',
 };
 
@@ -52,20 +73,93 @@ function Muxer(opts) {
 Muxer.prototype.on = function (ev, fn) { this._ee.on(ev, fn); };
 Muxer.prototype.off = function (ev, fn) { this._ee.off(ev, fn); };
 
-Muxer.prototype.addVideoChunk = function (chunk) {
+/**
+ * Add an EncodedVideoChunk. For H.264 / H.265 pass the encoder's
+ * metadata too: its decoderConfig.description says whether the chunks
+ * are length-prefixed ('avc'/'hevc', the WebCodecs default) or Annex-B.
+ * FFmpeg reads raw H.264/H.265 as Annex-B, so length-prefixed chunks are
+ * converted and the parameter sets are put in front of every key chunk.
+ */
+Muxer.prototype.addVideoChunk = function (chunk, metadata) {
   if (!this._started) this._start();
-  if (chunk.data) this._ffmpeg.write(chunk.data);
+  if (!chunk.data) return;
+  var codec = normalizeCodec((this._video && this._video.codec) || 'h264');
+  if (codec === 'vp8' || codec === 'vp9' || codec === 'av1') {
+    // Raw frames → IVF records (the ivf demuxer needs the framing).
+    if (!this._ivf) {
+      this._ivf = new IVFWriter({ codec: codec, width: this._video.width || 0, height: this._video.height || 0 });
+      this._ffmpeg.write(this._ivf.writeHeader());
+    }
+    this._ffmpeg.write(this._ivf.writeFrame(chunk.data, chunk.timestamp));
+    return;
+  }
+  if (codec !== 'h264' && codec !== 'h265') { this._ffmpeg.write(chunk.data); return; }
+
+  var dc = metadata && metadata.decoderConfig;
+  if (dc && dc.description) {
+    var bs = bitstreamFromDescription(toUint8Array(dc.description), codec === 'h265');
+    if (bs.error) { this._ee.emit('error', new Error('Muxer: ' + bs.error)); return; }
+    this._videoBitstream = bs;
+  }
+  var bsCur = this._videoBitstream;
+  var data = (bsCur && bsCur.lengthSize) ? avccToAnnexb(chunk.data, bsCur.lengthSize) : chunk.data;
+  if (chunk.type === 'key' && bsCur && bsCur.lengthSize && bsCur.paramSets) {
+    var withPs = new Uint8Array(bsCur.paramSets.length + data.length);
+    withPs.set(bsCur.paramSets, 0);
+    withPs.set(data, bsCur.paramSets.length);
+    data = withPs;
+  }
+  this._ffmpeg.write(data);
 };
 
-Muxer.prototype.addAudioChunk = function (chunk) {
+/**
+ * Add an EncodedAudioChunk (pass its metadata too — see the header).
+ */
+Muxer.prototype.addAudioChunk = function (chunk, metadata) {
   if (!this._started) this._start();
-  // Audio goes to pipe:3 (when both tracks) or stdin (audio-only)
-  if (this._video && this._audio) {
-    if (this._proc && this._proc.stdio[3]) {
-      this._proc.stdio[3].write(chunk.data);
+  if (!chunk.data) return;
+  var codec = normalizeCodec((this._audio && this._audio.codec) || 'aac');
+  var dc = metadata && metadata.decoderConfig;
+  var desc = dc && dc.description ? toUint8Array(dc.description) : null;
+
+  if (codec === 'aac') {
+    // Raw access units ('aac' format, the encoder default) → ADTS.
+    if (desc) this._aacConfig = parseAudioSpecificConfig(desc);
+    if (adtsHeaderLength(chunk.data)) { this._writeAudio(chunk.data); return; }
+    var cfg = this._aacConfig || {
+      objectType: 2,
+      sampleRate: this._audio.sampleRate || 48000,
+      channels: this._audio.channels || this._audio.numberOfChannels || 2,
+    };
+    this._writeAudio(wrapAdtsWithConfig(chunk.data, cfg));
+    return;
+  }
+
+  if (codec === 'opus') {
+    // Raw Opus packets → OGG pages. The OpusHead description (if any)
+    // supplies the encoder's pre-skip, so the muxed file trims the
+    // encoder delay exactly like the original stream.
+    if (!this._ogg) {
+      var preSkip = (desc && desc.length >= 12) ? (desc[10] | (desc[11] << 8)) : 0;
+      this._ogg = new OggWriter({
+        channels: this._audio.channels || this._audio.numberOfChannels || 2,
+        preSkip: preSkip,
+      });
+      this._writeAudio(this._ogg.writeHeaders());
     }
+    this._writeAudio(this._ogg.writePacket(chunk.data));
+    return;
+  }
+
+  this._writeAudio(chunk.data);
+};
+
+// Audio goes to pipe:3 (when both tracks) or stdin (audio-only).
+Muxer.prototype._writeAudio = function (bytes) {
+  if (this._video && this._audio) {
+    if (this._proc && this._proc.stdio[3]) this._proc.stdio[3].write(bytes);
   } else {
-    this._ffmpeg.write(chunk.data);
+    this._ffmpeg.write(bytes);
   }
 };
 
@@ -163,17 +257,19 @@ Muxer.prototype._start = function () {
 
   // Video input on stdin (pipe:0)
   if (hasVideo) {
-    var vc = this._video.codec || 'h264';
+    var vc = normalizeCodec(this._video.codec || 'h264');
     var vFmt = VIDEO_INPUT_FMT[vc] || 'h264';
     args.push('-f', vFmt);
-    if (this._video.framerate) args.push('-framerate', String(this._video.framerate));
+    // Raw H.264/H.265 has no timestamps, so the rate is given; IVF
+    // records carry their own (and the ivf demuxer has no -framerate).
+    if (this._video.framerate && vFmt !== 'ivf') args.push('-framerate', String(this._video.framerate));
     args.push('-i', 'pipe:0');
   }
 
   // Audio input on pipe:3 (dual track) or pipe:0 (audio only)
   if (hasAudio) {
-    var ac = this._audio.codec || 'aac';
-    var aFmt = AUDIO_INPUT_FMT[ac] || 'adts';
+    var ac = normalizeCodec(this._audio.codec || 'aac');
+    var aFmt = AUDIO_INPUT_FMT[ac] || 'aac';
     if (hasVideo) {
       args.push('-f', aFmt, '-i', 'pipe:3');
     } else {

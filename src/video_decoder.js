@@ -9,6 +9,8 @@ import FrameQueue from './core/frame_queue.js';
 import { writeU16LE, writeU32LE, fromAscii } from './core/bytes.js';
 import VideoFrame from './video_frame.js';
 import { getDefaultContainer, getContainer, getContainerFormat } from './containers.js';
+import { avccToAnnexb, bitstreamFromDescription } from './utils/nalu_utils.js';
+import { toUint8Array } from './core/buffer_source.js';
 
 function VideoDecoder(init) {
   if (!init) throw new TypeError('VideoDecoder: init required');
@@ -61,7 +63,17 @@ VideoDecoder.prototype.configure = function (config) {
   var w = config.codedWidth || config.width || 1920;
   var h = config.codedHeight || config.height || 1080;
 
+  // H.264 / H.265: the description decides the input format (see
+  // bitstreamFromDescription). FFmpeg is always fed Annex-B.
+  var vcodec = normalizeCodec(config.codec);
+  var bitstream = (vcodec === 'h264' || vcodec === 'h265')
+    ? bitstreamFromDescription(config.description ? toUint8Array(config.description) : null, vcodec === 'h265')
+    : { lengthSize: 0, paramSets: null };
+  if (bitstream.error) throw new TypeError('VideoDecoder.configure: ' + bitstream.error);
+
   configureCoder(this);
+  this._lengthSize = bitstream.lengthSize;      // >0: chunks are length-prefixed
+  this._paramSets = bitstream.paramSets;        // Annex-B, before the first key chunk
 
   this._config = {
     codec: normalizeCodec(config.codec),
@@ -160,19 +172,20 @@ VideoDecoder.prototype.decode = function (chunk) {
     this._queueSize++;
     this._ffmpeg.write(ivfData);
   } else {
-    // AnnexB (H.264/H.265) or other containers
-    // Prepend description (SPS/PPS) before first keyframe if provided
-    if (!this._descriptionSent && this._config.description && chunk.type === 'key') {
-      var desc = this._config.description;
-      var combined = new Uint8Array(desc.length + chunk.data.length);
-      combined.set(desc, 0);
-      combined.set(chunk.data, desc.length);
+    // H.264 / H.265 reach FFmpeg as Annex-B: convert length-prefixed
+    // chunks, and put the parameter sets in front of the first key chunk.
+    var data = this._lengthSize ? avccToAnnexb(chunk.data, this._lengthSize) : chunk.data;
+    if (!this._descriptionSent && this._paramSets && chunk.type === 'key') {
+      var ps = this._paramSets;
+      var combined = new Uint8Array(ps.length + data.length);
+      combined.set(ps, 0);
+      combined.set(data, ps.length);
       this._queueSize++;
       this._ffmpeg.write(combined);
       this._descriptionSent = true;
     } else {
       this._queueSize++;
-      this._ffmpeg.write(chunk.data);
+      this._ffmpeg.write(data);
     }
   }
 
@@ -231,10 +244,8 @@ VideoDecoder.prototype._startFFmpeg = function () {
   //                    smallest value that's reliable across codecs and
   //                    still saves significant first-frame latency.
   //
-  //   -fflags nobuffer Disable internal demuxer buffering (immediate
-  //                    delivery to decoder). Caller's input chunks are
-  //                    already aligned to access-unit boundaries, so
-  //                    this is safe.
+  //   (no -fflags nobuffer — see the note at the args below: it
+  //    discards the probed packets, i.e. the stream's first keyframe)
   //
   //   -flags low_delay
   //                    Codec-level low-latency hint. Disables B-frame
@@ -263,7 +274,13 @@ VideoDecoder.prototype._startFFmpeg = function () {
     '-threads', String(cfg.threads),
     '-probesize', String(cfg.probesize),
     '-analyzeduration', String(cfg.analyzeduration),
-    '-fflags', 'nobuffer',
+    // No '-fflags nobuffer': it DISCARDS the packets read while probing
+    // the stream (up to -probesize, 32 KB here). That is the start of
+    // the stream — including its first keyframe — so a small or
+    // low-bitrate stream decoded to nothing, and a realtime one showed
+    // nothing until the next keyframe (which 'realtime' mode only emits
+    // on request). Measured: 12 chunks in → 0 frames out with it,
+    // 12 out without it. low_delay alone keeps the latency benefit.
     '-flags', 'low_delay',
   ];
 

@@ -14,9 +14,30 @@ import { initCoder, configureCoder, wireReader, applyCoderPrototype } from './ba
 import FFmpegProcess from './ffmpeg_process.js';
 import { EncodedVideoChunk } from './encoded_chunk.js';
 import { getVideoCodec } from './codecs.js';
-import { normalizeCodec, parseCodecDetails } from './utils/codec_strings.js';
+import { normalizeCodec, parseCodecDetails, buildCodecString } from './utils/codec_strings.js';
 import { getDefaultContainer, getContainer, getContainerFormat, getContainerExtra } from './containers.js';
-import { extractParameterSetsAnnexB } from './reader_annexb.js';
+import { splitNALUs, buildAvcCFromAnnexB, buildHvcCFromAnnexB, annexbToAvccSample } from './utils/nalu_utils.js';
+
+// ── H.264 / H.265 bitstream format (W3C AVC & HEVC codec registrations) ──
+//
+//   avc.format  = 'avc'  (default) | 'annexb'
+//   hevc.format = 'hevc' (default) | 'annexb'
+//
+//   'avc' / 'hevc': chunks are 4-byte length-prefixed NALUs with no
+//                   parameter sets; decoderConfig.description is the
+//                   avcC / hvcC record.
+//   'annexb':       chunks keep start codes and in-band parameter sets;
+//                   there is no description.
+//
+// FFmpeg always produces Annex-B, so the 'avc'/'hevc' form is derived
+// here, per chunk. Before this (MP-39) the encoder ignored the option
+// and always emitted Annex-B chunks plus an Annex-B "description" — a
+// combination no browser produces, which broke any consumer that
+// followed the spec (a browser VideoDecoder, an fMP4 muxer, MoQ/LOC).
+var _BITSTREAM_FORMATS = {
+  h264: { option: 'avc',  values: { avc: 1, annexb: 1 } },
+  h265: { option: 'hevc', values: { hevc: 1, annexb: 1 } },
+};
 
 // ═══════════════════════════════════════════
 // SVC Temporal Layer Patterns
@@ -196,6 +217,7 @@ function VideoEncoder(init) {
   this._lastKeyframeRestart = 0;
   this.RESTART_COOLDOWN_MS = 1000;
   this._stats.keyframeThrottled = 0;
+  this._stats.evictedProcesses = 0;
 
   // ── Pre-warmed FFmpeg pool (MP-14 Layer 2) ──
   //
@@ -404,10 +426,25 @@ VideoEncoder.prototype.close = function () {
 // When the last old emits 'output_end' (or the safety timer fires),
 // _flushTransition() releases the buffer and resumes direct mode.
 
+// Every chunk leaves through here, in output order. decoderConfig goes
+// on a chunk only when it differs from the active output config (spec:
+// Output EncodedVideoChunks).
+VideoEncoder.prototype._deliver = function (chunk, metadata) {
+  var oc = metadata && metadata._outputConfig;
+  if (oc) {
+    delete metadata._outputConfig;
+    if (!_sameDecoderConfig(oc, this._activeOutputConfig)) {
+      metadata.decoderConfig = oc;
+      this._activeOutputConfig = oc;
+    }
+  }
+  this._output(chunk, metadata);
+};
+
 VideoEncoder.prototype._emitEncoded = function (chunk, metadata, producingFfmpeg) {
   // Fast path: no transition active → straight through.
   if (this._transitionBuffer === null) {
-    this._output(chunk, metadata);
+    this._deliver(chunk, metadata);
     return;
   }
   // Transition active. If this frame came from an OLD process, emit
@@ -415,7 +452,7 @@ VideoEncoder.prototype._emitEncoded = function (chunk, metadata, producingFfmpeg
   // receiver to see first. The new keyframe is buffered until they
   // all drain.
   if (this._transitionPendingOld.has(producingFfmpeg)) {
-    this._output(chunk, metadata);
+    this._deliver(chunk, metadata);
 
     // Reset watchdog: OLD made progress. As long as OLD keeps
     // emitting, we keep waiting (no premature flush).
@@ -494,7 +531,7 @@ VideoEncoder.prototype._flushTransition = function (reason) {
   });
 
   for (var i = 0; i < buffered.length; i++) {
-    this._output(buffered[i].chunk, buffered[i].metadata);
+    this._deliver(buffered[i].chunk, buffered[i].metadata);
   }
 
   // If timeout-induced flush, the remaining olds are still in the
@@ -526,6 +563,21 @@ VideoEncoder.prototype.configure = function (config) {
   // Extract profile/level from browser codec string (e.g. 'avc1.64002A' → high/4.2)
   var details = parseCodecDetails(config.codec);
 
+  // Bitstream format for H.264 / H.265 (see _BITSTREAM_FORMATS).
+  var normalized = normalizeCodec(config.codec);
+  var bsDef = _BITSTREAM_FORMATS[normalized];
+  var bitstreamFormat = null;
+  if (bsDef) {
+    var opt = config[bsDef.option];
+    var requested = (opt && opt.format !== undefined) ? opt.format : bsDef.option;
+    if (!bsDef.values[requested]) {
+      throw new TypeError('VideoEncoder.configure: ' + bsDef.option + '.format must be ' +
+        Object.keys(bsDef.values).map(function (v) { return "'" + v + "'"; }).join(' or ') +
+        " (got '" + requested + "')");
+    }
+    bitstreamFormat = requested === 'annexb' ? 'annexb' : 'length-prefixed';
+  }
+
   // latencyMode default per W3C WebCodecs — 'realtime' is the spec default
   // and signals that the application manages keyframes (via encode(frame,
   // {keyFrame:true}), typically in response to PLI/FIR in a WebRTC context).
@@ -543,7 +595,12 @@ VideoEncoder.prototype.configure = function (config) {
   var defaultGop = (latencyMode === 'realtime') ? 0x7fffffff : 30;
 
   this._config = {
-    codec: normalizeCodec(config.codec),
+    codec: normalized,
+    // The string the caller configured. decoderConfig.codec must be a
+    // full codec string ('avc1.42001f'), never the short name — a
+    // browser VideoDecoder rejects 'h264'.
+    codecString: String(config.codec),
+    bitstreamFormat: bitstreamFormat,
     width: config.width,
     height: config.height,
     // W3C VideoEncoderConfig members that were dropped entirely. They do
@@ -832,21 +889,8 @@ VideoEncoder.prototype.encode = function (frame, options) {
     var _kfMandatory = !!(options && options.bypassThrottle);
     if (!this._pendingResize && !_kfMandatory &&
         _kfSinceLast < this.RESTART_COOLDOWN_MS) {
-      // Throttled. Log only once per cooldown window so a sustained
-      // PLI storm doesn't drown the log; the count goes into _stats
-      // for after-the-fact diagnosis.
+      // Throttled; counted in _stats for after-the-fact diagnosis.
       this._stats.keyframeThrottled++;
-      if (!this._kfThrottleLogged) {
-        console.log('[encoder] KEYFRAME throttled @ ' +
-                    new Date().toISOString().slice(11, 23) +
-                    ' (last restart ' + _kfSinceLast + 'ms ago, cooldown ' +
-                    this.RESTART_COOLDOWN_MS + 'ms; total throttled=' +
-                    this._stats.keyframeThrottled + ')');
-        this._kfThrottleLogged = true;
-        var self_kf = this;
-        setTimeout(function () { self_kf._kfThrottleLogged = false; },
-                   this.RESTART_COOLDOWN_MS);
-      }
       // Skip the entire restart block. Frame falls through to the
       // standard encode path below — encoded as P-frame by the
       // currently-running FFmpeg. The receiver doesn't get a fresh
@@ -858,18 +902,6 @@ VideoEncoder.prototype.encode = function (frame, options) {
       // subsequent requests within RESTART_COOLDOWN_MS get throttled.
       this._lastKeyframeRestart = _kfNow;
       this._pendingResize = false;
-
-    // ════════════════════════ DIAGNOSTIC (PLI-loop test) ════════════════════════
-    // Logs every keyframe-induced subprocess restart. Run for ~60s, count
-    // entries:
-    //   • With audio enabled:  expecting ~12/min if PLI loop is active
-    //   • Without audio:       should be 0-1/min
-    // If the pattern matches, the hypothesis "audio induces PLI loop" is
-    // confirmed and we can move to the fix. Remove this log once diagnosed.
-    console.log('[encoder] KEYFRAME RESTART @ ' + new Date().toISOString().slice(11, 23) +
-                ' (encodeCount=' + this._encodeCount +
-                ', pendingOlds=' + this._oldProcesses.length + ')');
-    // ═══════════════════════════════════════════════════════════════════════════
 
     var oldFfmpeg = this._ffmpeg;
 
@@ -972,12 +1004,9 @@ VideoEncoder.prototype.encode = function (frame, options) {
     var MAX_PENDING_RESTARTS = 4;
     while (this._oldProcesses.length > MAX_PENDING_RESTARTS) {
       var victim = this._oldProcesses.shift();
-      // ════════════════════════ DIAGNOSTIC ════════════════════════
-      // Eviction = PLI storm faster than old FFmpegs can drain.
-      // Seeing this means we're losing P-frames to keep memory bounded.
-      console.log('[encoder] EVICT pending old process (PLI STORM) @ ' +
-                  new Date().toISOString().slice(11, 23));
-      // ════════════════════════════════════════════════════════════
+      // Eviction = keyframe requests faster than old FFmpegs can drain;
+      // their buffered P-frames are lost to keep memory bounded.
+      this._stats.evictedProcesses++;
       // Also remove from pending-old set (won't get its output_end now)
       this._transitionPendingOld.delete(victim);
       try { victim.stop(); } catch (e) {}
@@ -1282,10 +1311,12 @@ VideoEncoder.prototype._wireReader = function (codecDef) {
       // drain target → trigger _onOldDrained synchronously (race-free).
       producingFfmpeg._outputCount = (producingFfmpeg._outputCount || 0) + 1;
 
+      var isH265 = cfg.codec === 'h265';
+      var lengthPrefixed = cfg.bitstreamFormat === 'length-prefixed';
       var chunk = new EncodedVideoChunk({
         type: f.isKeyframe ? 'key' : 'delta',
         timestamp: realPts,
-        data: f.payload,
+        data: lengthPrefixed ? annexbToAvccSample(f.payload, isH265) : f.payload,
       });
 
       // SVC: assign temporalLayerId from pattern
@@ -1312,7 +1343,7 @@ VideoEncoder.prototype._wireReader = function (codecDef) {
       // displayWidth/displayHeight and which were simply missing.
       if (f.isKeyframe) {
         var outputConfig = {
-          codec: cfg.codec,
+          codec: _outputCodecString(cfg, f.payload),
           codedWidth: cfg.width,
           codedHeight: cfg.height,
         };
@@ -1324,15 +1355,18 @@ VideoEncoder.prototype._wireReader = function (codecDef) {
           if (self._activeOrientation.rotation) outputConfig.rotation = self._activeOrientation.rotation;
           if (self._activeOrientation.flip)     outputConfig.flip = true;
         }
-        // Extract SPS/PPS (H.264) or VPS/SPS/PPS (H.265) as description
-        if (cfg.codec === 'h264' || cfg.codec === 'h265') {
-          var desc = extractParameterSetsAnnexB(f.payload, cfg.codec === 'h265');
+        // 'avc'/'hevc' format: the parameter sets travel out of band as
+        // an avcC/hvcC record. 'annexb' keeps them in-band: no description.
+        if (lengthPrefixed) {
+          var desc = isH265 ? buildHvcCFromAnnexB(f.payload) : buildAvcCFromAnnexB(f.payload);
           if (desc) outputConfig.description = desc;
         }
-        if (!_sameDecoderConfig(outputConfig, self._activeOutputConfig)) {
-          metadata.decoderConfig = outputConfig;
-          self._activeOutputConfig = outputConfig;
-        }
+        // Compared against [[active output config]] when the chunk is
+        // actually output (_deliver), not here: during a keyframe restart
+        // the NEW process's keyframe can be read before the OLD process's
+        // last frames, but it is output after them. Deciding here put the
+        // config on the wrong keyframe — the first one went out without it.
+        metadata._outputConfig = outputConfig;
       }
 
       self._emitEncoded(chunk, metadata, producingFfmpeg);
@@ -1358,6 +1392,28 @@ VideoEncoder.prototype._wireReader = function (codecDef) {
     }
   });
 };
+
+/**
+ * decoderConfig.codec: the caller's full codec string when it is one;
+ * for a short name ('h264') derive the real string — for H.264 straight
+ * from the SPS (profile_idc, constraint flags, level_idc), otherwise from
+ * the configured profile/level.
+ */
+function _outputCodecString(cfg, keyframeAnnexB) {
+  if (cfg.codecString.indexOf('.') >= 0 || cfg.codec === 'vp8' || cfg.codec === 'opus') return cfg.codecString;
+  if (cfg.codec === 'h264') {
+    var nalus = splitNALUs(keyframeAnnexB, false);
+    for (var i = 0; i < nalus.length; i++) {
+      if (nalus[i].type === 7 && nalus[i].data.length >= 4) {
+        var d = nalus[i].data;
+        return 'avc1.' + _hex2(d[1]) + _hex2(d[2]) + _hex2(d[3]);
+      }
+    }
+  }
+  return buildCodecString({ name: cfg.codec, profile: cfg.profile, level: cfg.level }) || cfg.codecString;
+}
+
+function _hex2(n) { return (n < 16 ? '0' : '') + n.toString(16); }
 
 /**
  * Dictionary equality for decoderConfig, per the spec's "equal
@@ -1575,6 +1631,7 @@ var _ENCODER_CONFIG_KEYS = [
   'codec', 'width', 'height', 'displayWidth', 'displayHeight',
   'bitrate', 'framerate', 'hardwareAcceleration', 'alpha',
   'scalabilityMode', 'bitrateMode', 'latencyMode', 'contentHint',
+  'avc', 'hevc',
 ];
 function _cloneEncoderConfig(config) {
   var out = {};

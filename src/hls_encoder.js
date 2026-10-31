@@ -45,7 +45,8 @@
  *        │                        │
  *        ▼                        ▼
  *   VideoEncoder              AudioEncoder
- *   (Annex-B output)          (ADTS output)
+ *   (TS: Annex-B,             (TS: ADTS,
+ *    fMP4: AVCC + avcC/hvcC)   fMP4: raw AAC + ASC / Opus)
  *        │                        │
  *        └─────────┬──────────────┘
  *                  ▼
@@ -61,13 +62,13 @@
  *           on('segment'), on('manifest')
  *
  * Encoder configuration choices:
- *   - We configure VideoEncoder with `avc:{format:'annexb'}` (or hevc
- *     equivalent), so output chunks are already in Annex-B format with
- *     SPS/PPS in-band at every keyframe. No avcC parsing or parameter-
- *     set injection is needed in our pipeline.
- *   - We configure AudioEncoder with `aac:{format:'adts'}`, so output
- *     chunks are already ADTS-wrapped. No aac-utils.wrapAdts call is
- *     needed in our pipeline.
+ *   - TS: VideoEncoder with `avc:{format:'annexb'}` (or hevc equivalent),
+ *     so chunks are Annex-B with SPS/PPS in-band at every keyframe, and
+ *     AudioEncoder with `aac:{format:'adts'}`, so chunks are ADTS-wrapped.
+ *   - fMP4: the spec defaults — length-prefixed chunks + avcC/hvcC in
+ *     decoderConfig.description, raw AAC + AudioSpecificConfig.
+ *   - Either way chunks pass straight through: no avcC parsing,
+ *     parameter-set injection or wrapAdts in our pipeline.
  *   - These delegate the heavy lifting to the platform — both formats
  *     are widely supported (Chrome, Edge; Safari 16.4+ for video and
  *     newer Safari for AAC ADTS). Older browsers will fail at
@@ -90,7 +91,7 @@ import EventEmitter from './core/events.js';
 import { isValidVideoRange } from './utils/playlist_utils.js';
 import { createEncryptor, ivFromHex, ivToHex } from './encryption.js';
 import CEA608Encoder, { buildCea608SeiNalu } from './cea608_encoder.js';
-import { injectSeiIntoAU, detectFormat, annexbToAvcc, buildAvcCFromAnnexB } from './utils/nalu_utils.js';
+import { injectSeiIntoAU } from './utils/nalu_utils.js';
 
 
 // Fallback frame duration when the encoder doesn't report chunk.duration.
@@ -1796,7 +1797,7 @@ HLSEncoder.prototype._configureVideoEncoder = function () {
   //   here — they're rejected for TS at construction time.)
   //
   // fMP4 path:
-  //   - h264/h265: leave as default ('avc' for H.264, 'hev1' for H.265),
+  //   - h264/h265: leave as default ('avc' for H.264, 'hevc' for H.265),
   //     which produces AVCC-style length-prefixed NALUs and emits
   //     SPS/PPS out-of-band via metadata.decoderConfig.description on
   //     the first chunk. We capture that description and hand it to the
@@ -1968,20 +1969,6 @@ HLSEncoder.prototype._onVideoChunk = function (chunk, metadata) {
   var au = new Uint8Array(chunk.byteLength);
   chunk.copyTo(au);
 
-  // fMP4 mdat samples must be length-prefixed (AVCC form), never
-  // Annex-B (writer_fmp4 header comment, ISO 14496-15 §5.3.2). The
-  // browser encoder already emits AVCC in the fMP4 config (we don't
-  // set avc.format there); the Node FFmpeg-backed encoder emits
-  // Annex-B regardless — detect and convert. No-op when already AVCC.
-  if (this._format === 'fmp4') {
-    var _vc = this._opts.video && this._opts.video.codec;
-    if (_vc === 'h264' || _vc === 'h265' || !_vc) {
-      if (detectFormat(au) === 'annexb') {
-        au = annexbToAvcc(au, _vc === 'h265');
-      }
-    }
-  }
-
   // For fMP4: capture the codec config from the first chunk's metadata
   // (or, for AV1 only, by parsing the chunk's Sequence Header OBU).
   //
@@ -2004,28 +1991,9 @@ HLSEncoder.prototype._onVideoChunk = function (chunk, metadata) {
       var vp9CodecStr = v.codecString || _defaultVideoCodecString('vp9', v.width, v.height);
       configBytes = _buildVp9ConfigRecord(_parseVp9CodecString(vp9CodecStr));
     } else if (dcfg && dcfg.description) {
-      // h264 / h265 / av1 with encoder-provided description.
-      // Browser WebCodecs emits the proper DecoderConfigurationRecord
-      // (avcC/hvcC/av1C) — pass through. The Node FFmpeg-backed encoder
-      // emits SPS/PPS in Annex-B form (MP-39); detect and convert so
-      // the avcC box in the init segment is spec-valid either way.
+      // h264 / h265 / av1: the encoder's DecoderConfigurationRecord
+      // (avcC / hvcC / av1C) goes into the init segment as-is.
       configBytes = new Uint8Array(dcfg.description);
-      if ((vCodec === 'h264' || vCodec === 'h265' || !vCodec) &&
-          detectFormat(configBytes) === 'annexb') {
-        if (vCodec === 'h265') {
-          // hvcC (ISO 14496-15 §8.3.3.1) needs VPS/SPS bit-level parsing
-          // (general_profile_space, constraint flags, chroma format…) —
-          // not implemented yet. Better a loud failure than a broken
-          // init segment that players reject cryptically.
-          console.warn('[HLSEncoder] H.265 fMP4 with Annex-B description: ' +
-            'hvcC record building not implemented (Node encoder path). ' +
-            'Use format=ts for H.265, or h264 for fMP4.');
-          configBytes = null;
-        } else {
-          var rec = buildAvcCFromAnnexB(configBytes);
-          if (rec) configBytes = rec;
-        }
-      }
     } else if (vCodec === 'av1' && chunk.type === 'key') {
       // AV1 fallback: keyframes always carry a Sequence Header OBU.
       // Build av1C from the codec string + that OBU. Wrapped in try/catch

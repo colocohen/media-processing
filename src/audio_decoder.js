@@ -2,22 +2,21 @@
  * AudioDecoder — WebCodecs-compatible audio decoder.
  * Outputs raw s16le PCM in 10ms chunks.
  *
- * Two input modes:
+ * Input is what a browser AudioDecoder takes (W3C codec registrations):
  *
- *   1. Container-wrapped (default). Caller feeds bytes of a self-
- *      describing container stream (OGG, ADTS, MP3, FLAC). FFmpeg
- *      auto-detects the format and decodes. This matches how browser
- *      AudioDecoder is typically fed — chunks coming out of MSE or a
- *      file demuxer.
+ *   Opus  raw Opus packets, one per chunk. FFmpeg's stdin pipeline needs
+ *         a container, so each packet is wrapped in an OGG page here
+ *         (~30 bytes per packet) — the same bridge libwebrtc uses.
  *
- *   2. Raw frames mode (config.rawFrames === true, Opus only). Caller
- *      feeds raw Opus packets as they come out of an RTP depayloader
- *      or libopus. We wrap them in OGG pages transparently before
- *      handing to FFmpeg, because FFmpeg's decoder pipeline is
- *      stream-based and requires a container — there is no standard
- *      way to feed raw Opus frames to FFmpeg via stdin. Internal OGG
- *      wrapping is cheap (~30 bytes overhead per frame) and matches
- *      how Chrome/libwebrtc internally bridge raw opus to libopus.
+ *   AAC   with description (AudioSpecificConfig): raw AAC access units.
+ *         Each is given an ADTS header built from the ASC before FFmpeg.
+ *         without description: ADTS frames, passed through as-is.
+ *
+ *   Others (MP3, FLAC, …) are passed through; FFmpeg auto-detects.
+ *
+ * Before this, Opus needed a non-standard `rawFrames: true` (without it
+ * raw packets decoded to nothing), and AAC's ASC was written raw in front
+ * of the first chunk, so the browser's default raw-AAC form did not decode.
  */
 
 import { initCoder, configureCoder, applyCoderPrototype } from './base_coder.js';
@@ -26,6 +25,8 @@ import FrameQueue from './core/frame_queue.js';
 import AudioData from './audio_data.js';
 import OggWriter from './writer_ogg.js';
 import { getOpusPacketDurationUs } from './utils/opus_utils.js';
+import { parseAudioSpecificConfig, wrapAdtsWithConfig } from './utils/aac_utils.js';
+import { toUint8Array } from './core/buffer_source.js';
 import { getDefaultContainer, getContainer, getContainerFormat } from './containers.js';
 
 function AudioDecoder(init) {
@@ -63,19 +64,24 @@ AudioDecoder.prototype.configure = function (config) {
     numberOfChannels: config.numberOfChannels || 2,
     outputFormat:     config.outputFormat || 's16',
     description:      config.description || null,   // e.g. AAC AudioSpecificConfig
-    rawFrames:        !!config.rawFrames,           // raw-packet mode (Opus only)
   };
+
+  // AAC: a description means raw access units (see header comment).
+  this._aacConfig = null;
+  if (this._config.codec === 'aac' && this._config.description) {
+    this._aacConfig = parseAudioSpecificConfig(toUint8Array(this._config.description));
+    if (!this._aacConfig) {
+      throw new TypeError('AudioDecoder.configure: description is not a valid AudioSpecificConfig');
+    }
+  }
 
   this._descriptionSent = false;
   this._keyChunkRequired = true;   // reset per configure(), per spec
 
-  // Raw-frames mode currently only makes sense for Opus. For any other
-  // codec the caller almost certainly has a container already (ADTS for
-  // AAC, MP3 framing for MP3) so we silently ignore the flag rather
-  // than error out, matching the permissive WebCodecs spec style.
+  // Opus chunks are raw packets (as in a browser): wrap them in OGG.
   this._oggMuxer = null;
   this._oggHeadersFed = false;
-  if (this._config.rawFrames && this._config.codec === 'opus') {
+  if (this._config.codec === 'opus') {
     this._oggMuxer = new OggWriter({
       channels:   this._config.numberOfChannels,
       // Mid-stream wrapping — don't ask the decoder to discard samples.
@@ -179,9 +185,14 @@ AudioDecoder.prototype.decode = function (chunk) {
     return;
   }
 
-  // Prepend description (e.g. AAC AudioSpecificConfig) before first chunk
-  if (!this._descriptionSent && this._config.description && chunk.type === 'key') {
-    var desc = this._config.description;
+  if (this._config.codec === 'aac') {
+    // Raw AAC (description given) → ADTS; ADTS chunks pass through.
+    this._queueSize++;
+    this._ffmpeg.write(this._aacConfig ? wrapAdtsWithConfig(chunk.data, this._aacConfig) : chunk.data);
+  } else if (!this._descriptionSent && this._config.description && chunk.type === 'key') {
+    // Codecs whose description is a stream header FFmpeg reads in-band
+    // (FLAC's STREAMINFO): put it in front of the first chunk.
+    var desc = toUint8Array(this._config.description);
     var combined = new Uint8Array(desc.length + chunk.data.length);
     combined.set(desc, 0);
     combined.set(chunk.data, desc.length);
@@ -222,10 +233,11 @@ AudioDecoder.prototype._startFFmpeg = function () {
   var containerDef = getContainer(containerName);
 
   // Small probesize for audio — ADTS/OGG streams are typically only a few KB.
-  // -fflags nobuffer forces FFmpeg to start decoding immediately.
+  // No '-fflags nobuffer': it discards the packets read while probing,
+  // i.e. the start of the stream. Measured on 2 s of AAC: 1856 ms
+  // decoded with it, 2026 ms (all of it) without.
   var args = [
     '-hide_banner', '-loglevel', 'error',
-    '-fflags', 'nobuffer',
     '-probesize', '32768', '-analyzeduration', '100000',
   ];
 
@@ -315,18 +327,14 @@ AudioDecoder.prototype._startFFmpeg = function () {
 };
 
 AudioDecoder.isConfigSupported = function (config) {
-  // rawFrames mode adds support for 'opus' even when no default
-  // container is registered — the decoder supplies one internally.
-  var supported = (config && config.rawFrames && normalizeCodec(config.codec) === 'opus')
-    ? true
-    : !!getDefaultContainer(config.codec);
+  var supported = !!(config && getDefaultContainer(normalizeCodec(config.codec)));
   // W3C AudioDecoderSupport carries `config` alongside `supported`; see
   // the matching note on VideoDecoder.isConfigSupported.
   return Promise.resolve({ supported: supported, config: _cloneAudioDecoderConfig(config) });
 };
 
 var _AUDIO_DECODER_CONFIG_KEYS = [
-  'codec', 'sampleRate', 'numberOfChannels', 'description', 'rawFrames',
+  'codec', 'sampleRate', 'numberOfChannels', 'description',
 ];
 function _cloneAudioDecoderConfig(config) {
   var out = {};

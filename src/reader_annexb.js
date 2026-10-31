@@ -92,8 +92,19 @@ AnnexBReader.prototype.flush = function () {
   // If a start code remains and there's data after it, that data is
   // the trailing AU — emit it.
   var first = findAUD(this._buf, this._start, this._end, audType, isH265);
-  if (first >= 0 && first < this._end) {
-    var au = this._buf.slice(first, this._end);
+  var au = (first >= 0 && first < this._end) ? this._buf.slice(first, this._end) : null;
+
+  // Reset BEFORE emitting. 'video' listeners run synchronously, and the
+  // encoder's keyframe-restart drain logic calls flush() on this same
+  // reader from inside that listener (output count reached → drain hook
+  // → flush). With the reset after the emit, that re-entrant flush found
+  // the tail AU still buffered and emitted it a second time: every
+  // forced keyframe produced a duplicate of the last pre-restart frame
+  // (same bytes, fallback timestamp).
+  this._start = 0;
+  this._end = 0;
+
+  if (au) {
     var isKey = isH265 ? hasIDR_H265(au) : hasIDR_H264(au);
     if (isKey) this._groupId++;
     var ptsUs = Math.floor(this._index * 1000000 / this._fps);
@@ -106,11 +117,6 @@ AnnexBReader.prototype.flush = function () {
       groupId: this._groupId,
     });
   }
-
-  // Reset for potential reuse (rare — readers are typically created
-  // per FFmpeg instance, but we keep the contract symmetric).
-  this._start = 0;
-  this._end = 0;
 
   // Signal to listeners that no more 'video' events will come from
   // this reader. The encoder's transition logic uses this to know

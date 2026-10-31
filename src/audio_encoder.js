@@ -9,7 +9,20 @@ import { EncodedAudioChunk } from './encoded_chunk.js';
 import { getAudioCodec } from './codecs.js';
 import { getDefaultContainer, getContainer, getContainerFormat, getContainerExtra } from './containers.js';
 import { getOpusPacketDurationUs } from './utils/opus_utils.js';
-import { buildAudioSpecificConfig } from './utils/aac_utils.js';
+import { buildAudioSpecificConfig, stripAdts, audioSpecificConfigFromAdts, parseAdtsHeader } from './utils/aac_utils.js';
+
+// ── AAC bitstream format (W3C AAC codec registration) ──
+//
+//   aac.format = 'aac'  (default): chunks are raw AAC access units;
+//                       decoderConfig.description = AudioSpecificConfig.
+//   aac.format = 'adts': chunks keep their ADTS header; no description.
+//
+// FFmpeg is run with an ADTS container (the reader needs the framing),
+// so the raw form is derived here by stripping each header. Before this
+// the option was ignored: chunks were always ADTS AND came with an ASC
+// description — a mix no browser produces, which put ADTS headers inside
+// fMP4 samples (HLSEncoder fMP4 path) and broke spec-following decoders.
+var _AAC_FORMATS = { aac: 1, adts: 1 };
 
 // ── Format helpers ────────────────────────────────────────────────────────
 
@@ -207,8 +220,20 @@ AudioEncoder.prototype.configure = function (config) {
     opusOpts = _validateAndMapOpusConfig(config.opus);
   }
 
+  var aacFormat = null;
+  if (normalizedCodec === 'aac') {
+    aacFormat = (config.aac && config.aac.format !== undefined) ? config.aac.format : 'aac';
+    if (!_AAC_FORMATS[aacFormat]) {
+      throw new TypeError("AudioEncoder.configure: aac.format must be 'aac' or 'adts' (got '" + aacFormat + "')");
+    }
+  }
+
   this._config = {
     codec: normalizedCodec,
+    // decoderConfig.codec must be a full codec string ('mp4a.40.2'),
+    // never the short name — a browser AudioDecoder rejects 'aac'.
+    codecString: String(config.codec),
+    aacFormat: aacFormat,
     sampleRate: config.sampleRate || 48000,
     numberOfChannels: config.numberOfChannels || 2,
     bitrate: config.bitrate || 0,
@@ -352,20 +377,9 @@ AudioEncoder.prototype.encode = function (audioData) {
   if (!this._inputFormat) this._inputFormat = fmt;
 
   if (!this._ffmpeg.running) {
-    // ════════════════════════ DIAGNOSTIC ════════════════════════
-    // FFmpeg has died and is being respawned. Log the count and
-    // (critically) the listener count BEFORE _startFFmpeg attaches
-    // a new one. Listener doubling (count > 0 here) indicates the
-    // pre-fix bug; post-fix this should always log 0.
-    var preCount = this._ffmpeg._ee
-      ? this._ffmpeg._ee.listenerCount('data') : 0;
-    this._stats.ffmpegRestarts++;
-    console.log('[audio_encoder] FFMPEG RESTART @ ' +
-                new Date().toISOString().slice(11, 23) +
-                ' encodeCount=' + this._encodeCount +
-                ' restarts=' + this._stats.ffmpegRestarts +
-                ' listenersBefore=' + preCount);
-    // ═══════════════════════════════════════════════════════════
+    // The first start is not a restart; every later one is (FFmpeg
+    // exited after flush() or died).
+    if (this._encodeCount > 0) this._stats.ffmpegRestarts++;
     this._startFFmpeg();
   }
 
@@ -489,13 +503,15 @@ AudioEncoder.prototype._startFFmpeg = function () {
         // ogg stream) so the first chunk's decoderConfig carries it —
         // browser-faithful, with the correct libopus pre-skip.
         if (reader._opusHead && !self._opusHead) self._opusHead = reader._opusHead;
+        var payload = (cfg.aacFormat === 'aac') ? stripAdts(f.payload) : f.payload;
+        var meta = self._takeFirstChunkMetadata(f.payload);
         self._output(new EncodedAudioChunk({
           type: 'key',
           // Reader pts are 0-based per-stream — anchor them to the input
           // timeline the same way as the raw path.
           timestamp: (self._basePtsUs || 0) + self._gapAccumUs + f.ptsUs,
-          duration: f.durationUs, data: f.payload,
-        }), self._takeFirstChunkMetadata());
+          duration: f.durationUs, data: payload,
+        }), meta);
       },
     });
   } else {
@@ -547,26 +563,28 @@ AudioEncoder.prototype._startFFmpeg = function () {
  * carries the same parameters inline. Returns undefined after the first
  * call, so subsequent chunks carry no metadata (matching the browser).
  */
-AudioEncoder.prototype._takeFirstChunkMetadata = function () {
+AudioEncoder.prototype._takeFirstChunkMetadata = function (firstFrame) {
   if (this._decoderConfigSent) return undefined;
   this._decoderConfigSent = true;
 
   var cfg = this._config;
   var dc = {
-    codec: cfg.codec,
+    codec: _outputCodecString(cfg, firstFrame),
     sampleRate: cfg.sampleRate,
     numberOfChannels: cfg.numberOfChannels,
   };
   if (cfg.codec === 'aac') {
-    try {
-      dc.description = buildAudioSpecificConfig({
-        profile: 'lc',
-        sampleRate: cfg.sampleRate,
-        channels: cfg.numberOfChannels,
-      });
-    } catch (e) {
-      // Non-standard sample rate: omit description rather than crash.
-      // The fMP4 esds path will surface its own error if it truly needs it.
+    // Only the raw ('aac') form carries an AudioSpecificConfig. Built
+    // from the first ADTS header FFmpeg actually wrote, so it describes
+    // the real stream; the configured values are the fallback.
+    if (cfg.aacFormat === 'aac') {
+      var asc = firstFrame ? audioSpecificConfigFromAdts(firstFrame) : null;
+      if (!asc) {
+        try {
+          asc = buildAudioSpecificConfig({ profile: 'lc', sampleRate: cfg.sampleRate, channels: cfg.numberOfChannels });
+        } catch (e) { asc = null; }   // non-standard sample rate: no description
+      }
+      if (asc) dc.description = asc;
     }
   } else if (cfg.codec === 'opus' && this._opusHead) {
     // Real OpusHead (RFC 7845 §5.1) captured from the ogg stream by
@@ -576,6 +594,15 @@ AudioEncoder.prototype._takeFirstChunkMetadata = function () {
   }
   return { decoderConfig: dc };
 };
+
+// decoderConfig.codec: the configured string when it is a full one;
+// 'aac' → 'mp4a.40.<object type>' from the ADTS header actually written.
+function _outputCodecString(cfg, firstFrame) {
+  if (cfg.codec !== 'aac' || cfg.codecString.indexOf('.') >= 0) return cfg.codecString;
+  var h = firstFrame ? parseAdtsHeader(firstFrame) : null;
+  var objectType = { main: 1, lc: 2, ssr: 3 }[h && h.profile] || 2;
+  return 'mp4a.40.' + objectType;
+}
 
 AudioEncoder.isConfigSupported = function (config) {
   // W3C AudioEncoderSupport carries `config` alongside `supported`;
@@ -588,6 +615,7 @@ AudioEncoder.isConfigSupported = function (config) {
 
 var _AUDIO_ENCODER_CONFIG_KEYS = [
   'codec', 'sampleRate', 'numberOfChannels', 'bitrate', 'bitrateMode',
+  'aac', 'opus',
 ];
 function _cloneAudioEncoderConfig(config) {
   var out = {};
