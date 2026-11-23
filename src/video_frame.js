@@ -9,6 +9,7 @@ import { i420ToRgba, rgbaToI420, rgb24ToI420, i420ToRgb24, nv12ToI420, i420ToNv1
 import VideoColorSpace from './video_color_space.js';
 import { isBufferSource as _isBufferSource, toUint8Array as _bufferSourceToBuffer } from './core/buffer_source.js';
 import { domException as _domex } from './core/dom_exception.js';
+import { planeSpecs, frameByteSize, planeLayout } from './core/frame_size.js';
 
 // Bytes per pixel by format. For planar YUV formats this is the
 // AVERAGE — actual layout: Y plane (W*H) + chroma plane(s) at the
@@ -96,7 +97,7 @@ function VideoFrame(dataOrInit, initArg) {
         visibleRect: over.visibleRect || src.visibleRect,
         colorSpace: over.colorSpace || src.colorSpace,
         timestamp: (typeof over.timestamp === 'number') ? over.timestamp : src.timestamp,
-        duration: over.duration || src.duration,
+        duration: (over.duration !== undefined && over.duration !== null) ? over.duration : src.duration,   // 0 is a duration (|| dropped it)
         rotation: (typeof over.rotation === 'number') ? over.rotation : src.rotation,
         flip: (over.flip !== undefined) ? !!over.flip : src.flip,
       };
@@ -114,7 +115,7 @@ function VideoFrame(dataOrInit, initArg) {
       visibleRect: over.visibleRect || src.visibleRect,
       colorSpace: over.colorSpace || src.colorSpace,
       timestamp: (typeof over.timestamp === 'number') ? over.timestamp : src.timestamp,
-      duration: over.duration || src.duration,
+      duration: (over.duration !== undefined && over.duration !== null) ? over.duration : src.duration,   // 0 is a duration (|| dropped it)
     };
   }
   // Form: VideoFrame(data, init) — browser standard. Accept any
@@ -156,7 +157,7 @@ function _finishConstruction(self, dataOrInit) {
     throw new TypeError('VideoFrame: unsupported format "' + format + '". Supported: ' + Object.keys(FORMAT_BPP).join(', '));
   }
 
-  var expectedSize = Math.floor(init.codedWidth * init.codedHeight * bpp);
+  var expectedSize = frameByteSize(format, init.codedWidth, init.codedHeight);
   if (init.data.length !== expectedSize) {
     throw new RangeError(
       'VideoFrame: data length ' + init.data.length +
@@ -214,7 +215,8 @@ function _finishConstruction(self, dataOrInit) {
   };
   self.colorSpace = new VideoColorSpace(init.colorSpace);
   self.timestamp = (typeof init.timestamp === 'number') ? init.timestamp : 0;
-  self.duration = init.duration || 0;
+  // W3C: duration is null when not given; 0 is a valid duration.
+  self.duration = (typeof init.duration === 'number') ? init.duration : null;
   self.byteLength = res.data.length;
   self._closed = false;
 
@@ -256,13 +258,15 @@ VideoFrame.prototype._hasCrop = function () {
  * here.
  */
 VideoFrame.prototype.allocationSize = function (options) {
+  // W3C: a closed frame throws InvalidStateError (it returned a size).
+  if (this._closed) throw _domex('VideoFrame is closed', 'InvalidStateError');
   var fmt = (options && options.format) || this.format;
   var bpp = FORMAT_BPP[fmt];
   if (!bpp) return this.data ? this.data.length : 0;
   var v = this.visibleRect;
   var w = (v && v.width) || this.codedWidth;
   var h = (v && v.height) || this.codedHeight;
-  return Math.floor(w * h * bpp);
+  return frameByteSize(fmt, w, h);
 };
 
 /**
@@ -423,8 +427,7 @@ var _converters = {
 function _pixelConvert(name, data, w, h) {
   var fn = _converters[name];
   if (!fn) return null;
-  var bpp = FORMAT_BPP[_converterOutputFmt[name]] || 4;
-  var outSize = Math.floor(w * h * bpp);
+  var outSize = frameByteSize(_converterOutputFmt[name], w, h);
   var dst = { data: new Uint8Array(outSize), width: w, height: h };
   fn({ data: data, width: w, height: h }, dst);
   return dst.data;
@@ -452,8 +455,10 @@ function _cropInto(dst, src, fmt, codedW, codedH, rect) {
     var sp = planes[p];
     var x = Math.floor((rect.x || 0) / sp.subX);
     var y = Math.floor((rect.y || 0) / sp.subY);
-    var w = Math.floor(rect.width / sp.subX);
-    var h = Math.floor(rect.height / sp.subY);
+    // Rounded up, like the plane sizes (core/frame_size.js): an odd crop
+    // has ceil(w/2) chroma samples per row — floor cut the last one.
+    var w = Math.ceil(rect.width / sp.subX);
+    var h = Math.ceil(rect.height / sp.subY);
     for (var row = 0; row < h; row++) {
       var from = sp.offset + (y + row) * sp.stride + x * sp.pixBytes;
       dst.set(src.subarray(from, from + w * sp.pixBytes), dstOff);
@@ -462,133 +467,10 @@ function _cropInto(dst, src, fmt, codedW, codedH, rect) {
   }
 }
 
-/**
- * Plane geometry per format: byte offset, row stride, per-pixel bytes,
- * and the chroma subsampling factors that map a luma rect onto it.
- */
-function _planeSpecs(fmt, w, h) {
-  var y = { offset: 0, stride: w, pixBytes: 1, subX: 1, subY: 1 };
-  var ySize = w * h;
-  switch (fmt) {
-    case 'I420': case 'YUV420P': {
-      var c = (w >> 1) * (h >> 1);
-      return [y,
-        { offset: ySize,     stride: w >> 1, pixBytes: 1, subX: 2, subY: 2 },
-        { offset: ySize + c, stride: w >> 1, pixBytes: 1, subX: 2, subY: 2 }];
-    }
-    case 'I420A': {
-      var ca = (w >> 1) * (h >> 1);
-      return [y,
-        { offset: ySize,          stride: w >> 1, pixBytes: 1, subX: 2, subY: 2 },
-        { offset: ySize + ca,     stride: w >> 1, pixBytes: 1, subX: 2, subY: 2 },
-        { offset: ySize + ca * 2, stride: w,      pixBytes: 1, subX: 1, subY: 1 }];
-    }
-    case 'NV12':
-      // Interleaved UV: one plane, two bytes per chroma sample pair.
-      return [y, { offset: ySize, stride: w, pixBytes: 2, subX: 2, subY: 2 }];
-    case 'I422': {
-      var c422 = (w >> 1) * h;
-      return [y,
-        { offset: ySize,        stride: w >> 1, pixBytes: 1, subX: 2, subY: 1 },
-        { offset: ySize + c422, stride: w >> 1, pixBytes: 1, subX: 2, subY: 1 }];
-    }
-    case 'I422A': {
-      var c422a = (w >> 1) * h;
-      return [y,
-        { offset: ySize,             stride: w >> 1, pixBytes: 1, subX: 2, subY: 1 },
-        { offset: ySize + c422a,     stride: w >> 1, pixBytes: 1, subX: 2, subY: 1 },
-        { offset: ySize + c422a * 2, stride: w,      pixBytes: 1, subX: 1, subY: 1 }];
-    }
-    case 'I444':
-      return [y,
-        { offset: ySize,     stride: w, pixBytes: 1, subX: 1, subY: 1 },
-        { offset: ySize * 2, stride: w, pixBytes: 1, subX: 1, subY: 1 }];
-    case 'I444A':
-      return [y,
-        { offset: ySize,     stride: w, pixBytes: 1, subX: 1, subY: 1 },
-        { offset: ySize * 2, stride: w, pixBytes: 1, subX: 1, subY: 1 },
-        { offset: ySize * 3, stride: w, pixBytes: 1, subX: 1, subY: 1 }];
-    case 'RGBA': case 'RGBX': case 'BGRA': case 'BGRX':
-      return [{ offset: 0, stride: w * 4, pixBytes: 4, subX: 1, subY: 1 }];
-    case 'RGB24':
-      return [{ offset: 0, stride: w * 3, pixBytes: 3, subX: 1, subY: 1 }];
-    default:
-      return [y];
-  }
-}
-
-function _layoutForFormat(fmt, w, h) {
-  if (fmt === 'I420' || fmt === 'YUV420P') {
-    var ySize = w * h;
-    var uvSize = (w >> 1) * (h >> 1);
-    return [
-      { offset: 0, stride: w },
-      { offset: ySize, stride: w >> 1 },
-      { offset: ySize + uvSize, stride: w >> 1 },
-    ];
-  }
-  if (fmt === 'I420A') {
-    var yS = w * h;
-    var uvS = (w >> 1) * (h >> 1);
-    return [
-      { offset: 0, stride: w },
-      { offset: yS, stride: w >> 1 },
-      { offset: yS + uvS, stride: w >> 1 },
-      { offset: yS + uvS * 2, stride: w },  // alpha
-    ];
-  }
-  if (fmt === 'NV12') {
-    return [
-      { offset: 0, stride: w },
-      { offset: w * h, stride: w },
-    ];
-  }
-  // 4:2:2 chroma subsampling — chroma planes are half-width, full-height.
-  if (fmt === 'I422') {
-    var ySz422 = w * h;
-    var uvSz422 = (w >> 1) * h;
-    return [
-      { offset: 0, stride: w },
-      { offset: ySz422, stride: w >> 1 },
-      { offset: ySz422 + uvSz422, stride: w >> 1 },
-    ];
-  }
-  if (fmt === 'I422A') {
-    var yS422a = w * h;
-    var uvS422a = (w >> 1) * h;
-    return [
-      { offset: 0, stride: w },
-      { offset: yS422a, stride: w >> 1 },
-      { offset: yS422a + uvS422a, stride: w >> 1 },
-      { offset: yS422a + uvS422a * 2, stride: w },     // alpha
-    ];
-  }
-  // 4:4:4 chroma subsampling — chroma planes match Y plane.
-  if (fmt === 'I444') {
-    var ySz444 = w * h;
-    return [
-      { offset: 0, stride: w },
-      { offset: ySz444, stride: w },
-      { offset: ySz444 * 2, stride: w },
-    ];
-  }
-  if (fmt === 'I444A') {
-    var yS444a = w * h;
-    return [
-      { offset: 0, stride: w },
-      { offset: yS444a, stride: w },
-      { offset: yS444a * 2, stride: w },
-      { offset: yS444a * 3, stride: w },               // alpha
-    ];
-  }
-  if (fmt === 'RGBA' || fmt === 'BGRA') {
-    return [{ offset: 0, stride: w * 4 }];
-  }
-  if (fmt === 'RGB24') {
-    return [{ offset: 0, stride: w * 3 }];
-  }
-  return [{ offset: 0, stride: w }];
-}
+// Plane geometry lives in core/frame_size.js (chroma planes rounded UP
+// for odd dimensions — see the comment there).
+function _planeSpecs(fmt, w, h) { return planeSpecs(fmt, w, h) || [{ offset: 0, stride: w, pixBytes: 1, subX: 1, subY: 1, rows: h }]; }
+function _layoutForFormat(fmt, w, h) { return planeLayout(fmt, w, h); }
 
 /**
  * Create DOMException if available (Node 17+), otherwise fallback Error.

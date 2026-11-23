@@ -753,8 +753,9 @@ export function annexbToAvccSample(au, isH265) {
  *                         the record, parameter sets from the record.
  *   no description      → chunks are already Annex-B ('annexb' format).
  *   Annex-B bytes       → not a spec form, but what older code here
- *                         produced (Demuxer still does): used as the
- *                         parameter sets, chunks taken as Annex-B.
+ *                         produced (the Demuxer did, before it emitted
+ *                         avcC/hvcC): used as the parameter sets,
+ *                         chunks taken as Annex-B.
  *
  * @param {Uint8Array|null} description
  * @param {boolean} isH265
@@ -810,6 +811,31 @@ export function codecStringFromAnnexB(au, isH265) {
   while (last >= 5 && ptl[last] === 0) last--;
   for (var j = 5; j <= last; j++) s += '.' + ptl[j].toString(16).toUpperCase();
   return s;
+}
+
+/**
+ * The WebCodecs codec string from a decoder configuration record — as a
+ * file's sample entry (MP4 avcC / hvcC) or a Matroska CodecPrivate
+ * carries it. `prefix` is the sample entry's 4cc ('avc1' | 'avc3' |
+ * 'hvc1' | 'hev1'); default 'avc1' / 'hvc1'.
+ * @returns {string|null}  null when the record has no SPS
+ */
+export function codecStringFromAvcC(rec, prefix) {
+  var avc = parseAvcC(rec);
+  if (!avc || !avc.sps.length) return null;
+  var s = codecStringFromAnnexB(nalusToAnnexb([avc.sps[0]]), false);
+  return s ? (prefix || 'avc1') + s.slice(4) : null;
+}
+
+export function codecStringFromHvcC(rec, prefix) {
+  var hv = parseHvcC(rec);
+  if (!hv) return null;
+  var sps = null;
+  for (var i = 0; i < hv.nalus.length && !sps; i++) {
+    if (((hv.nalus[i][0] >> 1) & 0x3F) === H265_NAL_SPS) sps = hv.nalus[i];
+  }
+  var s = sps ? codecStringFromAnnexB(nalusToAnnexb([sps]), true) : null;
+  return s ? (prefix || 'hvc1') + s.slice(4) : null;
 }
 
 function _hex2(n) { return (n < 16 ? '0' : '') + n.toString(16); }

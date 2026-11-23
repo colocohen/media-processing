@@ -35,14 +35,16 @@
  *     how the encoder splits in the first place — so each segment IS
  *     independently decodable. Setting the tag tells players they can
  *     start playback at any segment without waiting for context.
- *   - EXT-X-VERSION defaults to 3, which lets EXTINF carry float
- *     durations (millisecond precision). When initSegmentUri is set
- *     (fMP4 streams) we auto-bump to 6 — EXT-X-MAP is a v6 tag, and
- *     CMAF interop generally expects v6+ regardless.
- *   - TARGETDURATION is derived from the longest segment seen so far.
- *     Per spec it MUST be >= ceil(longest EXTINF). Caller can lock it
- *     to an explicit value via opts.targetDuration when the segment
- *     duration is known up front (recommended).
+ *   - EXT-X-VERSION is computed at serialize time as the lowest
+ *     version the output needs (RFC 8216 §7 / rfc8216bis §8): 3 for
+ *     float EXTINF, 4 BYTERANGE / I-FRAMES-ONLY, 5 KEYFORMAT, 6 EXT-X-MAP
+ *     (5 in an I-frames-only playlist), 8 EXT-X-DEFINE (11 QUERYPARAM),
+ *     9 EXT-X-SKIP (10 when it also skips DATERANGEs). opts.version is
+ *     a floor.
+ *   - TARGETDURATION: opts.targetDuration when given (recommended, and
+ *     required in practice for live). Otherwise VOD uses ceil(longest
+ *     EXTINF) and live/event pin it at the first segment, because a live
+ *     playlist's target duration MUST NOT change (RFC 8216 §6.2.1).
  */
 
 
@@ -53,10 +55,10 @@
  * @param {number}  [opts.targetDuration]      Explicit TARGETDURATION (sec).
  *                                             Auto-computed from segments if
  *                                             unset.
- * @param {number}  [opts.version]             EXT-X-VERSION value. Defaults
- *                                             to 6 if initSegmentUri is set
- *                                             (fMP4 requires v6+ for
- *                                             EXT-X-MAP), else 3.
+ * @param {number}  [opts.version]             Minimum EXT-X-VERSION. The
+ *                                             written value is raised to
+ *                                             what the features in use
+ *                                             require.
  * @param {boolean} [opts.independentSegments=true]  Emit
  *                                             EXT-X-INDEPENDENT-SEGMENTS.
  * @param {number}  [opts.startMediaSequence=0]  Initial MEDIA-SEQUENCE.
@@ -72,20 +74,6 @@ import { escapeQuoted, isValidVariableName, isValidIvHex,
          isValidEncryptionMethod, parseAttributeList,
          parseByteRange } from './utils/playlist_utils.js';
 
-// Per-segment tag prefixes — lines that "belong to" a segment and
-// must come AFTER global playlist-level state (KEY, MAP, DATERANGE,
-// etc.) but BEFORE the segment's URI line. Used by serializeDelta
-// to find the correct insertion point for the EXT-X-SKIP directive.
-//
-// Frozen at module load to make the misuse-as-mutable case obvious;
-// V8 will also keep it in shape-stable read-only memory.
-var _PER_SEGMENT_TAG_PREFIXES = Object.freeze([
-  '#EXT-X-DISCONTINUITY',
-  '#EXT-X-PROGRAM-DATE-TIME',
-  '#EXT-X-PART:',
-  '#EXT-X-BITRATE:',
-]);
-
 function Playlist(opts) {
   if (!opts) opts = {};
 
@@ -96,11 +84,24 @@ function Playlist(opts) {
 
   this._mode = mode;
   this._windowSize = opts.windowSize || 6;
-  this._explicitTargetDuration = opts.targetDuration || 0;
+  // TARGETDURATION is a decimal-integer (RFC 8216 §4.3.3.1), so a
+  // fractional value from the caller is rounded up, never down.
+  this._explicitTargetDuration = opts.targetDuration ? Math.ceil(opts.targetDuration) : 0;
   this._computedTargetDuration = 0;
-  // EXT-X-MAP is a v6 feature. If caller didn't pin a version,
-  // auto-bump when an init segment is present.
-  this._version = opts.version || (opts.initSegmentUri ? 6 : 3);
+  // Largest EXTINF rounded to the nearest integer — the quantity
+  // RFC 8216 §4.3.3.1 compares against TARGETDURATION.
+  this._maxRoundedDuration = 0;
+  // Live/event without an explicit target: the value is pinned at the
+  // first segment. It used to be recomputed as the running max, so a
+  // live playlist went TARGETDURATION:2 -> 5 when one 4.2 s segment
+  // arrived; RFC 8216 §6.2.1 says the target duration MUST NOT change.
+  this._pinnedTargetDuration = 0;
+  // EXT-X-VERSION. opts.version is a floor; the version actually written
+  // is computed at serialize time from the features the output uses
+  // (_requiredVersion). Before, it was 3 (or 6 with an init segment)
+  // whatever the content, so a playlist with KEYFORMAT, BYTERANGE or
+  // EXT-X-DEFINE claimed VERSION:3, which strict clients reject.
+  this._version = opts.version || 3;
   this._independentSegments = opts.independentSegments !== false;
   this._initSegmentUri = opts.initSegmentUri || null;
   // Optional BYTERANGE on EXT-X-MAP. When the init segment is part
@@ -191,12 +192,23 @@ function Playlist(opts) {
   // start. null = no directive emitted.
   this._start = null;
 
-  // EXT-X-KEY state (RFC 8216 §4.4.4.4). At most one active key per
-  // playlist — the directive applies to all subsequent segments. Set
-  // via setKey(); cleared by passing { method: 'NONE' } if needed
-  // (e.g., switching from encrypted to clear in event-style playlists).
-  // null = no key directive emitted.
+  // EXT-X-KEY state (RFC 8216 §4.4.4.4). setKey() sets the key for the
+  // segments added AFTER the call; each segment records the key it was
+  // added under, and serialize() writes an EXT-X-KEY wherever the key
+  // changes. This used to be one global tag at the top of the playlist,
+  // so a key rotation re-labelled every earlier segment with the new
+  // key (a.ts, encrypted with key-A, was advertised as key-B and could
+  // no longer be decrypted). null = clear.
   this._key = null;
+
+  // Wall-clock anchor for a synthetic EXT-X-PROGRAM-DATE-TIME. RFC 8216
+  // §4.3.2.7: a playlist containing EXT-X-DATERANGE MUST contain at least
+  // one EXT-X-PROGRAM-DATE-TIME. When the caller supplies none, the first
+  // segment in the output gets one derived from this anchor (taken when
+  // the first segment was added) plus the duration of everything before
+  // it. _droppedDurationSec counts what slid out of a live window.
+  this._pdtAnchorMs = null;
+  this._droppedDurationSec = 0;
 
   // ── PRELOAD-HINT state ──
   // For LL-HLS, the playlist tells the player where the next part
@@ -245,6 +257,30 @@ Playlist.prototype.addSegment = function (seg) {
     throw new Error('Playlist.addSegment: requires { uri:string, duration:number }');
   }
 
+  // Live/event without an explicit targetDuration: the first segment
+  // pins TARGETDURATION. A later segment whose EXTINF rounds above it
+  // can't be listed without either changing the target (RFC 8216
+  // §6.2.1 MUST NOT) or breaking EXTINF <= TARGETDURATION (§4.3.3.1
+  // MUST), so it's refused here, before any state changes. Pass
+  // opts.targetDuration (the longest segment you will produce) for live.
+  var rounded = Math.round(seg.duration);
+  if (this._mode !== 'vod' && !this._explicitTargetDuration) {
+    if (this._pinnedTargetDuration === 0) {
+      this._pinnedTargetDuration = Math.max(1, Math.ceil(seg.duration));
+    } else if (rounded > this._pinnedTargetDuration) {
+      throw new RangeError('Playlist.addSegment: duration ' + seg.duration +
+        ' s rounds above the live TARGETDURATION ' + this._pinnedTargetDuration +
+        ', which was pinned by the first segment and must not change ' +
+        '(RFC 8216 §6.2.1). Pass opts.targetDuration (the longest segment ' +
+        'duration you will produce) for live/event playlists.');
+    }
+  }
+  if (rounded > this._maxRoundedDuration) this._maxRoundedDuration = rounded;
+  if (this._pdtAnchorMs === null) {
+    var explicitPdt = seg.programDateTime ? Date.parse(_formatProgramDateTime(seg.programDateTime)) : NaN;
+    this._pdtAnchorMs = isNaN(explicitPdt) ? Date.now() - seg.duration * 1000 : explicitPdt;
+  }
+
   this._segments.push({
     uri: seg.uri,
     duration: seg.duration,
@@ -272,14 +308,14 @@ Playlist.prototype.addSegment = function (seg) {
     // fresh. Stored as an array (possibly empty for non-LL-HLS) — the
     // serializer emits one EXT-X-PART line per entry.
     parts: this._inProgressParts,
+    // The EXT-X-KEY in effect when the segment was added (see _key).
+    key: this._key,
   });
   this._inProgressParts = [];
   this._inProgressUri = null;
 
-  // TARGETDURATION must be >= ceil(longest EXTINF). Track the max so
-  // it grows monotonically. Locking it via opts.targetDuration is the
-  // strongly preferred approach since some players cache the first
-  // value they see.
+  // VOD (no explicit target): TARGETDURATION = ceil(longest EXTINF),
+  // which satisfies the round-to-nearest rule with margin.
   var ceil = Math.ceil(seg.duration);
   if (ceil > this._computedTargetDuration) {
     this._computedTargetDuration = ceil;
@@ -288,9 +324,21 @@ Playlist.prototype.addSegment = function (seg) {
   // Sliding window for live. Use while (not if) so that reducing
   // windowSize between calls does the right thing — and to be defensive
   // in case the caller pre-loaded segments.
+  //
+  // RFC 8216 §6.2.2: the server MUST NOT remove a segment if that would
+  // leave the playlist shorter than three target durations. windowSize
+  // is therefore a minimum: { windowSize: 1, targetDuration: 6 } used to
+  // serve a single 6 s segment (players need >= 18 s to start safely);
+  // now it keeps three.
   if (this._mode === 'live') {
-    while (this._segments.length > this._windowSize) {
+    var minDurationSec = 3 * this._currentTargetDuration();
+    var totalSec = 0;
+    for (var ti = 0; ti < this._segments.length; ti++) totalSec += this._segments[ti].duration;
+    while (this._segments.length > this._windowSize &&
+           totalSec - this._segments[0].duration >= minDurationSec) {
       var dropped = this._segments.shift();
+      totalSec -= dropped.duration;
+      this._droppedDurationSec += dropped.duration;
       this._mediaSequence++;
       if (dropped.discontinuity) this._discontinuitySequence++;
     }
@@ -397,7 +445,7 @@ Playlist.prototype.addDateRange = function (opts) {
   if (opts.startDate === undefined || opts.startDate === null) {
     throw new TypeError('Playlist.addDateRange: opts.startDate required');
   }
-  this._dateRanges.push({
+  var entry = {
     id:              opts.id,
     classAttr:       opts.classAttr || null,
     startDate:       _formatProgramDateTime(opts.startDate),
@@ -415,7 +463,12 @@ Playlist.prototype.addDateRange = function (opts) {
     // attribute (added in RFC 8216bis), not a custom client one.
     cue:             _normalizeCue(opts.cue),
     custom:          opts.custom || null,
-  });
+  };
+  // Render once now so a value that can't be a quoted-string (a '"' or
+  // CR/LF — escapeQuoted throws) fails here, at the call that added it,
+  // instead of inside every later serialize() of a running stream.
+  _serializeDateRange(entry);
+  this._dateRanges.push(entry);
   return this;
 };
 
@@ -644,12 +697,11 @@ Playlist.prototype.define = function (def) {
     if (!isValidVariableName(def.queryparam)) {
       throw new TypeError('Playlist.define: invalid queryparam name "' + def.queryparam + '"');
     }
+    // QUERYPARAM needs EXT-X-VERSION 11 — computed in _requiredVersion.
     entry = { kind: 'queryparam', name: def.queryparam };
-    // QUERYPARAM was added in HLS v11. Bump version so the playlist
-    // declares minimum support.
-    if (this._version < 11) this._version = 11;
   }
 
+  _serializeDefine(entry);   // quoted-string check, see addDateRange
   this._defines.push(entry);
   return this;
 };
@@ -682,11 +734,11 @@ Playlist.prototype.setStart = function (opts) {
 };
 
 /**
- * Set or replace the EXT-X-KEY directive. The directive applies to
- * every Media Segment that follows it in the playlist (including
- * those added later via addSegment). Calling setKey again replaces
- * the previous directive — useful for key rotation or for switching
- * to METHOD=NONE to denote a clear-content section.
+ * Set the EXT-X-KEY for the Media Segments added from now on. Segments
+ * already added keep the key they were added under; serialize() writes
+ * an EXT-X-KEY line before the first segment of each run that shares a
+ * key. Calling setKey again rotates the key (or, with METHOD=NONE,
+ * starts a clear section) without touching earlier segments.
  *
  * @param {object}      opts
  * @param {string}      opts.method     'AES-128', 'SAMPLE-AES',
@@ -728,13 +780,15 @@ Playlist.prototype.setKey = function (opts) {
     throw new TypeError('Playlist.setKey: opts.iv must be 0x followed by 32 hex digits');
   }
 
-  this._key = {
+  var key = {
     method:            m,
     uri:               opts.uri,
     iv:                opts.iv,
     keyFormat:         opts.keyFormat,
     keyFormatVersions: opts.keyFormatVersions,
   };
+  _serializeKey(key);   // quoted-string check, see addDateRange
+  this._key = key;
   return this;
 };
 
@@ -787,6 +841,7 @@ Playlist.prototype.setRenditionReport = function (opts) {
   if (typeof opts.lastMsn !== 'number') {
     throw new TypeError('Playlist.setRenditionReport: opts.lastMsn (number) required');
   }
+  escapeQuoted(opts.uri);   // quoted-string check, see addDateRange
   this._renditionReports[opts.uri] = {
     uri:      opts.uri,
     lastMsn:  opts.lastMsn | 0,
@@ -826,10 +881,117 @@ Playlist.prototype.end = function () {
  * addSegment() in live mode.
  */
 Playlist.prototype.serialize = function () {
+  return this._render(0);
+};
+
+/**
+ * Serialize a Playlist Delta Update (RFC 8216bis §4.4.5.2 / §6.2.5.1).
+ * Replaces older Media Segments with a single EXT-X-SKIP directive,
+ * dramatically shrinking the playlist for long-running live streams
+ * where clients only need recent segments.
+ *
+ * The retained tail MUST cover at least CAN-SKIP-UNTIL seconds. Older
+ * Media Segments are replaced by EXT-X-SKIP:SKIPPED-SEGMENTS=<n>; the
+ * global tags (MAP, DEFINE, DATERANGE, ...) remain, and the EXT-X-KEY in
+ * effect for the first kept segment is repeated after the SKIP.
+ *
+ * Caller signals delta intent via canSkipUntil > 0 in the constructor.
+ * If canSkipUntil is 0, this method falls back to a full serialize.
+ *
+ * @returns {string}  m3u8 text (delta-update form when applicable)
+ */
+Playlist.prototype.serializeDelta = function () {
+  if (this._canSkipUntil <= 0 || this._segments.length === 0) {
+    // Delta updates not enabled, or nothing to skip — full playlist.
+    return this.serialize();
+  }
+
+  // Decide how many segments to retain at the tail. The kept tail
+  // must cover at least CAN-SKIP-UNTIL seconds of duration. Walk
+  // backward summing durations until we cross the threshold.
+  var keepFromIdx = this._segments.length;
+  var accum = 0;
+  while (keepFromIdx > 0 && accum < this._canSkipUntil) {
+    keepFromIdx--;
+    accum += this._segments[keepFromIdx].duration;
+  }
+  if (keepFromIdx === 0) {
+    // Nothing skipped — all segments are inside the CAN-SKIP-UNTIL
+    // window, no delta possible. Return full playlist.
+    return this.serialize();
+  }
+  return this._render(keepFromIdx);
+};
+
+/**
+ * Lowest EXT-X-VERSION the rendered output is valid under — RFC 8216 §7
+ * and rfc8216bis §8 — never below the opts.version floor.
+ *
+ * @param {number} skipCount  segments replaced by EXT-X-SKIP (0 = none)
+ */
+Playlist.prototype._requiredVersion = function (skipCount) {
+  var v = Math.max(this._version, 3);              // 3: floating-point EXTINF
+  // Only what is actually written counts: the listed segments (not
+  // the skipped ones) and the current key if in-progress parts use it.
+  var segs = this._segments;
+  var keys = this._inProgressParts.length > 0 ? [this._key] : [];
+  var hasByterange = !!this._initSegmentByterange;
+  for (var i = skipCount; i < segs.length; i++) {
+    if (segs[i].byterange) hasByterange = true;
+    keys.push(segs[i].key);
+  }
+  // 4: EXT-X-BYTERANGE, EXT-X-I-FRAMES-ONLY.
+  if (hasByterange || this._iFramesOnly) v = Math.max(v, 4);
+  // 5: KEYFORMAT / KEYFORMATVERSIONS on EXT-X-KEY.
+  for (var k = 0; k < keys.length; k++) {
+    var key = keys[k];
+    if (key && key.method !== 'NONE' &&
+        (key.keyFormat !== undefined || key.keyFormatVersions !== undefined)) {
+      v = Math.max(v, 5);
+    }
+  }
+  // 5: EXT-X-MAP in an I-frames-only playlist; 6: in any other.
+  if (this._initSegmentUri) v = Math.max(v, this._iFramesOnly ? 5 : 6);
+  // 8: variable substitution (EXT-X-DEFINE); 11: its QUERYPARAM form.
+  for (var d = 0; d < this._defines.length; d++) {
+    v = Math.max(v, this._defines[d].kind === 'queryparam' ? 11 : 8);
+  }
+  // 9: EXT-X-SKIP; 10: an EXT-X-SKIP that also replaces DATERANGEs
+  // (we always write RECENTLY-REMOVED-DATERANGES when that is on).
+  if (skipCount > 0) v = Math.max(v, this._canSkipDateRanges ? 10 : 9);
+  return v;
+};
+
+/**
+ * TARGETDURATION as written. Explicit value if given (in VOD raised to
+ * cover a longer segment — a VOD playlist is fetched whole, so nothing
+ * "changes" for a client, and EXTINF rounded must be <= it); otherwise
+ * ceil(longest) for VOD and the pinned first value for live/event.
+ */
+Playlist.prototype._currentTargetDuration = function () {
+  var td;
+  if (this._explicitTargetDuration) {
+    td = this._explicitTargetDuration;
+    if (this._mode === 'vod' && this._maxRoundedDuration > td) td = this._maxRoundedDuration;
+  } else if (this._mode === 'vod') {
+    td = this._computedTargetDuration;
+  } else {
+    td = this._pinnedTargetDuration;
+  }
+  return td || 1;
+};
+
+/**
+ * The renderer behind serialize() and serializeDelta().
+ *
+ * @param {number} skipCount  number of leading segments to replace with
+ *                            EXT-X-SKIP (0 = full playlist)
+ */
+Playlist.prototype._render = function (skipCount) {
   var lines = [];
 
   lines.push('#EXTM3U');
-  lines.push('#EXT-X-VERSION:' + this._version);
+  lines.push('#EXT-X-VERSION:' + this._requiredVersion(skipCount));
 
   // EXT-X-DEFINE (RFC 8216bis §4.4.2). Variable definitions appear
   // early so they can be referenced by every later directive. Three
@@ -855,14 +1017,13 @@ Playlist.prototype.serialize = function () {
     lines.push('#EXT-X-START:' + startAttrs);
   }
 
-  // TARGETDURATION: explicit takes precedence, then computed, then a
-  // safe minimum of 1 (used only for empty playlists during warmup —
-  // any real player request will see real segments).
-  var td = this._explicitTargetDuration ||
-           this._computedTargetDuration ||
-           1;
-  lines.push('#EXT-X-TARGETDURATION:' + td);
+  lines.push('#EXT-X-TARGETDURATION:' + this._currentTargetDuration());
 
+  // A Delta Update keeps the MEDIA-SEQUENCE of the full playlist: it
+  // is the number of the first (skipped) segment, and clients compute
+  // the first listed segment as MEDIA-SEQUENCE + SKIPPED-SEGMENTS
+  // (rfc8216bis §4.4.5.2). It used to be bumped by the skipped count,
+  // so the client added it twice: seg4.ts was numbered 4+4 = 8.
   lines.push('#EXT-X-MEDIA-SEQUENCE:' + this._mediaSequence);
 
   if (this._discontinuitySequence > 0) {
@@ -877,9 +1038,7 @@ Playlist.prototype.serialize = function () {
   // mode === 'live' → omit PLAYLIST-TYPE entirely (the convention)
 
   // EXT-X-I-FRAMES-ONLY (RFC 8216 §4.4.3.6). Goes early in the
-  // playlist so every segment line is parsed in I-frame mode. The
-  // CMAF spec requires this directive when EXT-X-MAP is also used —
-  // they sit on adjacent lines.
+  // playlist so every segment line is parsed in I-frame mode.
   if (this._iFramesOnly) {
     lines.push('#EXT-X-I-FRAMES-ONLY');
   }
@@ -908,15 +1067,6 @@ Playlist.prototype.serialize = function () {
     }
   }
 
-  // EXT-X-KEY (RFC 8216 §4.4.4.4). Applies to every Media Segment
-  // that follows it. Goes before EXT-X-MAP so the encryption directive
-  // is visible to the player before it tries to decode anything that
-  // could be encrypted. (EXT-X-MAP / init segments are NOT encrypted
-  // under METHOD=AES-128 — only Media Segments are.)
-  if (this._key) {
-    lines.push(_serializeKey(this._key));
-  }
-
   // EXT-X-MAP for fMP4 streams. Goes BEFORE the first EXTINF entry
   // (RFC 8216 §4.3.2.5). Players load this once and apply it to all
   // subsequent media segments. We emit it on every serialize() call
@@ -936,8 +1086,42 @@ Playlist.prototype.serialize = function () {
   // before the segment list so they're prominent — players that
   // stream-parse manifests see them early. Order is insertion order;
   // duplicate IDs are emitted as written (player resolves by latest).
-  for (var di = 0; di < this._dateRanges.length; di++) {
-    lines.push(_serializeDateRange(this._dateRanges[di]));
+  for (var dri = 0; dri < this._dateRanges.length; dri++) {
+    lines.push(_serializeDateRange(this._dateRanges[dri]));
+  }
+
+  // EXT-X-SKIP replaces the first skipCount segments. It MUST follow the
+  // last EXT-X-MAP and precede every Media Segment line (rfc8216bis
+  // §4.4.5.2) — that is exactly here.
+  if (skipCount > 0) {
+    var skipLine = '#EXT-X-SKIP:SKIPPED-SEGMENTS=' + skipCount;
+    // RECENTLY-REMOVED-DATERANGES is REQUIRED when CAN-SKIP-DATERANGES
+    // is advertised, even when nothing was removed (empty string).
+    if (this._canSkipDateRanges) {
+      skipLine += ',RECENTLY-REMOVED-DATERANGES=""';
+    }
+    lines.push(skipLine);
+  }
+
+  // DATERANGE needs at least one PROGRAM-DATE-TIME in the playlist
+  // (RFC 8216 §4.3.2.7 MUST). If no listed segment carries one, the
+  // first listed segment gets one derived from the wall-clock anchor.
+  // Without it, players have no way to place START-DATE on the media
+  // timeline and ignore the ranges (ad markers silently never fire).
+  var syntheticPdtIdx = -1;
+  var syntheticPdt = null;
+  if (this._dateRanges.length > 0 && skipCount < this._segments.length &&
+      this._pdtAnchorMs !== null) {
+    var anyPdt = false;
+    for (var pi0 = skipCount; pi0 < this._segments.length; pi0++) {
+      if (this._segments[pi0].programDateTime) { anyPdt = true; break; }
+    }
+    if (!anyPdt) {
+      var offsetSec = this._droppedDurationSec;
+      for (var pi1 = 0; pi1 < skipCount; pi1++) offsetSec += this._segments[pi1].duration;
+      syntheticPdtIdx = skipCount;
+      syntheticPdt = new Date(this._pdtAnchorMs + Math.round(offsetSec * 1000)).toISOString();
+    }
   }
 
   // EXT-X-BITRATE (RFC 8216bis §4.4.4.8) is "sticky" — it applies
@@ -947,9 +1131,19 @@ Playlist.prototype.serialize = function () {
   // a discontinuity), keeping the playlist size minimal for VBR runs
   // that happen to flatten across consecutive segments.
   var lastBitrate = null;
+  // EXT-X-KEY in effect at this point of the output (null = clear).
+  var lastKey = null;
 
-  for (var i = 0; i < this._segments.length; i++) {
+  for (var i = skipCount; i < this._segments.length; i++) {
     var s = this._segments[i];
+    var segKey = _effectiveKey(s.key);
+    if (segKey !== lastKey) {
+      // A key line wherever the key changes; METHOD=NONE when going
+      // back to clear after an encrypted run (not needed at the start —
+      // clear is the default).
+      lines.push(_serializeKey(segKey || { method: 'NONE' }));
+      lastKey = segKey;
+    }
     if (s.discontinuity) {
       lines.push('#EXT-X-DISCONTINUITY');
       // Per spec, EXT-X-BITRATE's effect ends at a discontinuity. Reset
@@ -958,6 +1152,8 @@ Playlist.prototype.serialize = function () {
     }
     if (s.programDateTime) {
       lines.push('#EXT-X-PROGRAM-DATE-TIME:' + s.programDateTime);
+    } else if (i === syntheticPdtIdx) {
+      lines.push('#EXT-X-PROGRAM-DATE-TIME:' + syntheticPdt);
     }
     // EXT-X-PART entries for closed segments — a closed segment in
     // LL-HLS still carries its part list so byte-range fetchers can
@@ -995,8 +1191,14 @@ Playlist.prototype.serialize = function () {
 
   // In-progress parts (segment hasn't closed yet). These appear at the
   // tail of the playlist with no EXTINF line — players treat them as
-  // "live edge" until the segment closes.
+  // "live edge" until the segment closes. They belong to the segment
+  // that will be added under the current key.
   if (this._inProgressParts.length > 0) {
+    var curKey = _effectiveKey(this._key);
+    if (curKey !== lastKey) {
+      lines.push(_serializeKey(curKey || { method: 'NONE' }));
+      lastKey = curKey;
+    }
     for (var pj = 0; pj < this._inProgressParts.length; pj++) {
       lines.push(_serializePart(this._inProgressParts[pj]));
     }
@@ -1053,120 +1255,6 @@ Playlist.prototype.serialize = function () {
   return lines.join('\n') + '\n';
 };
 
-/**
- * Serialize a Playlist Delta Update (RFC 8216bis §4.4.5.2 / §6.2.5.1).
- * Replaces older Media Segments with a single EXT-X-SKIP directive,
- * dramatically shrinking the playlist for long-running live streams
- * where clients only need recent segments.
- *
- * Per spec, the Skipped portion covers the segments older than
- * (lastMediaSequence - canSkipUntil_in_segments). The retained tail
- * MUST cover at least CAN-SKIP-UNTIL seconds. Older Media Segments
- * are replaced by EXT-X-SKIP:SKIPPED-SEGMENTS=<n>, but ALL global
- * tags (KEY, MAP, DEFINE, etc.) and DATERANGE entries remain — only
- * Media Segment lines and their per-segment tags are skipped.
- *
- * Caller signals delta intent via canSkipUntil > 0 in the constructor.
- * If canSkipUntil is 0, this method falls back to a full serialize.
- *
- * @returns {string}  m3u8 text (delta-update form when applicable)
- */
-Playlist.prototype.serializeDelta = function () {
-  if (this._canSkipUntil <= 0 || this._segments.length === 0) {
-    // Delta updates not enabled, or nothing to skip — full playlist.
-    return this.serialize();
-  }
-
-  // Decide how many segments to retain at the tail. The kept tail
-  // must cover at least CAN-SKIP-UNTIL seconds of duration. Walk
-  // backward summing durations until we cross the threshold.
-  var keepFromIdx = this._segments.length;
-  var accum = 0;
-  while (keepFromIdx > 0 && accum < this._canSkipUntil) {
-    keepFromIdx--;
-    accum += this._segments[keepFromIdx].duration;
-  }
-  var skippedCount = keepFromIdx;
-  if (skippedCount === 0) {
-    // Nothing skipped — all segments are inside the CAN-SKIP-UNTIL
-    // window, no delta possible. Return full playlist.
-    return this.serialize();
-  }
-
-  // Build a temporary view: drop the skipped segments and emit an
-  // EXT-X-SKIP directive in their place. Save and restore _segments
-  // and _mediaSequence to avoid touching the object's permanent state
-  // — tests and other consumers must see no change.
-  //
-  // The try/finally guarantees state is restored even if serialize()
-  // throws (it shouldn't, but encryption/key-init paths can throw
-  // and silently corrupting the playlist would be a nasty bug to
-  // diagnose).
-  var allSegments = this._segments;
-  var origSeq     = this._mediaSequence;
-  var fullText;
-  try {
-    this._segments = allSegments.slice(skippedCount);
-    // Bump media sequence so the kept first segment is at the right
-    // sequence number — clients computing media-sequence-of-skipped-
-    // end need this to be consistent.
-    this._mediaSequence = origSeq + skippedCount;
-    fullText = this.serialize();
-  } finally {
-    this._segments = allSegments;
-    this._mediaSequence = origSeq;
-  }
-
-  // Build the EXT-X-SKIP line. Per spec §4.4.5.2 RECENTLY-REMOVED-
-  // DATERANGES is REQUIRED when the server advertises CAN-SKIP-
-  // DATERANGES — even if no dateranges have been removed (then the
-  // value is an empty quoted-string).
-  var skipLine = '#EXT-X-SKIP:SKIPPED-SEGMENTS=' + skippedCount;
-  if (this._canSkipDateRanges) {
-    skipLine += ',RECENTLY-REMOVED-DATERANGES=""';
-  }
-
-  // Per RFC 8216bis §4.4.5.2: "The EXT-X-SKIP tag MUST appear after
-  // the last EXT-X-MAP tag, but before any Media Segment line." We
-  // find the position immediately before the first segment-related
-  // line. Segment-related lines start with one of: EXTINF, EXT-X-
-  // DISCONTINUITY, EXT-X-PROGRAM-DATE-TIME, EXT-X-PART, EXT-X-
-  // BITRATE, or a bare URI. The earliest such line marks the start
-  // of the segment region — we anchor on the FIRST EXTINF since
-  // every segment has one and it's a reliable anchor.
-  var anchor = fullText.indexOf('\n#EXTINF:');
-  if (anchor < 0) {
-    // No segments in output (shouldn't happen given the early-return
-    // above, but be defensive). Append at end before final newline.
-    return fullText.slice(0, fullText.length - 1) + skipLine + '\n';
-  }
-  // Walk backward from EXTINF over any per-segment tags that precede
-  // it (PROGRAM-DATE-TIME, DISCONTINUITY, PART, BITRATE) so we land
-  // BEFORE the segment block, not in the middle of it. Each tag is
-  // on its own line; we step over preceding lines that start with one
-  // of the per-segment prefixes.
-  var insertPos = anchor + 1;  // position of the # of #EXTINF
-  while (true) {
-    // Find the start of the previous line.
-    var prevNewline = fullText.lastIndexOf('\n', insertPos - 2);
-    if (prevNewline < 0) break;
-    var prevLine = fullText.substring(prevNewline + 1, insertPos - 1);
-    var matched = false;
-    for (var ppi = 0; ppi < _PER_SEGMENT_TAG_PREFIXES.length; ppi++) {
-      if (prevLine.indexOf(_PER_SEGMENT_TAG_PREFIXES[ppi]) === 0) {
-        matched = true;
-        break;
-      }
-    }
-    if (!matched) break;
-    insertPos = prevNewline + 1;
-  }
-
-  return fullText.slice(0, insertPos) +
-         skipLine + '\n' +
-         fullText.slice(insertPos);
-};
-
 // ── Getters (for HLSEncoder bookkeeping) ──────────────────
 
 Playlist.prototype.segmentCount = function () {
@@ -1178,7 +1266,8 @@ Playlist.prototype.mediaSequence = function () {
 };
 
 Playlist.prototype.targetDuration = function () {
-  return this._explicitTargetDuration || this._computedTargetDuration;
+  return this._segments.length > 0 || this._explicitTargetDuration ?
+    this._currentTargetDuration() : 0;
 };
 
 Playlist.prototype.isEnded = function () {
@@ -1187,6 +1276,11 @@ Playlist.prototype.isEnded = function () {
 
 
 // ── Internal helpers ──────────────────────────────────────
+
+// A key object as written: null for clear (no key, or METHOD=NONE).
+function _effectiveKey(k) {
+  return (k && k.method !== 'NONE') ? k : null;
+}
 
 function _formatProgramDateTime(value) {
   if (value === null || value === undefined) return null;

@@ -20,7 +20,7 @@
  * than waiting for OGG page-level buffering to fill.
  */
 
-import { getOpusPacketDurationUs } from './utils/opus_utils.js';
+import { getOpusPacketDurationUs, buildOpusHead, parseOpusHead } from './utils/opus_utils.js';
 import { writeU16LE, writeU32LE, concat, fromAscii } from './core/bytes.js';
 
 // ── Ogg CRC32 table ──
@@ -77,15 +77,24 @@ var FLAG_EOS          = 0x04;   // end of stream
  *                                           0 when wrapping mid-stream RTP
  * @param {number} [opts.inputSampleRate=48000]  informational only
  * @param {string} [opts.vendor]             OpusTags vendor string
+ * @param {Uint8Array} [opts.opusHead]       the encoder's OpusHead (WebCodecs
+ *                                           decoderConfig.description). Written
+ *                                           verbatim — it carries the channel
+ *                                           mapping the packets were coded with,
+ *                                           which a rebuilt header can only guess.
+ *                                           channels / preSkip / inputSampleRate
+ *                                           are then read from it.
  */
 function OggWriter(opts) {
   if (!opts) opts = {};
-  this._channels   = opts.channels || 2;
+  var head = opts.opusHead ? parseOpusHead(opts.opusHead) : null;
+  this._opusHead   = head ? new Uint8Array(opts.opusHead) : null;
+  this._channels   = head ? head.channels : (opts.channels || 2);
   this._serial     = (opts.serial != null)
                       ? (opts.serial >>> 0)
                       : ((Math.random() * 0xFFFFFFFF) >>> 0);
-  this._preSkip    = (opts.preSkip != null) ? opts.preSkip : 0;
-  this._inputRate  = opts.inputSampleRate || OPUS_SAMPLE_RATE;
+  this._preSkip    = head ? head.preSkip : ((opts.preSkip != null) ? opts.preSkip : 0);
+  this._inputRate  = head ? (head.inputSampleRate || OPUS_SAMPLE_RATE) : (opts.inputSampleRate || OPUS_SAMPLE_RATE);
   this._vendor     = opts.vendor || 'media-processing';
 
   this._sequence   = 0;     // page sequence number, increments per page
@@ -117,9 +126,12 @@ OggWriter.prototype.writeHeaders = function () {
  *                                   correctly. Falls back to 960 (20 ms
  *                                   at 48 kHz, WebRTC default) only if
  *                                   the packet is truncated/empty.
- * @returns {Buffer}  a complete OGG page
+ * @param {boolean} [isLast]  mark this packet's page end-of-stream (the
+ *                            preferred way to end a stream: no extra page)
+ * @returns {Uint8Array}  one complete OGG page — or several, for a packet
+ *                        larger than one page can hold (65025 bytes)
  */
-OggWriter.prototype.writePacket = function (opusFrame, samplesInFrame) {
+OggWriter.prototype.writePacket = function (opusFrame, samplesInFrame, isLast) {
   // Resolve sample count. Caller-supplied wins; otherwise parse the
   // TOC byte. The previous default-to-960 silently wrote wrong granule
   // for any non-20 ms packet — same root cause as MP-10/MP-24.
@@ -131,16 +143,23 @@ OggWriter.prototype.writePacket = function (opusFrame, samplesInFrame) {
     n = Math.round(durUs * OPUS_SAMPLE_RATE / 1000000);
   }
   this._granule += n;
-  return this._buildPage(opusFrame, 0x00, this._granule);
+  return this._buildPage(opusFrame, isLast ? FLAG_EOS : 0x00, this._granule);
 };
 
 /**
  * Build an EOS (end-of-stream) page. Send this after the final packet
  * to cleanly terminate the bitstream. Optional — most demuxers handle
- * truncated streams gracefully.
+ * truncated streams gracefully. (Or pass isLast to the final
+ * writePacket() and skip this page.)
+ *
+ * The page has NO segments (RFC 3533 allows page_segments = 0). It used
+ * to carry one zero-length segment, i.e. a 0-byte packet — not a valid
+ * Opus packet (RFC 6716 §3.1 requires at least the TOC byte), and
+ * FFmpeg failed the file at that page: "Packet processing failed:
+ * Invalid data found when processing input".
  */
 OggWriter.prototype.writeEos = function () {
-  return this._buildPage(new Uint8Array(0), FLAG_EOS, this._granule);
+  return this._buildPage(null, FLAG_EOS, this._granule);
 };
 
 /**
@@ -157,19 +176,20 @@ OggWriter.prototype.reset = function () {
 
 /**
  * OpusHead page — RFC 7845 §5.1. This is the "identification header"
- * and is mandatory. Channel mapping family 0 (mono/stereo Vorbis-style
- * order) is the common case for WebRTC; the channel mapping table
- * MUST be omitted for family 0. Total body size: 19 bytes.
+ * and is mandatory. Channel mapping family 0 (mono/stereo, 19 bytes,
+ * no mapping table) is the common case for WebRTC.
+ *
+ * Family 0 is only defined for 1-2 channels: for more it used to be
+ * written anyway, and FFmpeg refused the stream ("Channel mapping 0 is
+ * only specified for up to 2 channels"). The encoder's own OpusHead is
+ * used when given; otherwise buildOpusHead picks family 1 / 255.
  */
 OggWriter.prototype._buildIdPage = function () {
-  var body = new Uint8Array(19);
-  body.set(fromAscii('OpusHead'), 0);    // 0..7
-  body[8] = 1;                 // version
-  body[9] = this._channels;    // channel count
-  writeU16LE(body, 10, this._preSkip); // pre-skip (samples @ 48 kHz)
-  writeU32LE(body, 12, this._inputRate);  // original input sample rate
-  writeU16LE(body, 16, 0);              // output gain (Q8 dB, 0 = flat)
-  body[18] = 0;                // channel mapping family = 0
+  var body = this._opusHead || buildOpusHead({
+    channels: this._channels,
+    preSkip: this._preSkip,
+    inputSampleRate: this._inputRate,
+  });
   return this._buildPage(body, FLAG_BOS, 0);
 };
 
@@ -192,7 +212,7 @@ OggWriter.prototype._buildTagsPage = function () {
 // ── Internal: page framing ────────────────────────────────────────
 
 /**
- * Build a complete OGG page from a packet body.
+ * Build the OGG page(s) carrying one packet.
  *
  * Segment-table rules (RFC 3533 §6):
  *   - Divide the packet into 255-byte segments, one entry each.
@@ -200,33 +220,44 @@ OggWriter.prototype._buildTagsPage = function () {
  *     (0..254). If the packet length is an exact multiple of 255,
  *     a trailing zero-length segment MUST be appended to signal
  *     "end of packet, no continuation into the next page".
- *   - For an empty packet (e.g. EOS marker page), still emit a
- *     single zero-length segment.
- *   - Maximum 255 segments per page → max ~65 KB per page.
+ *   - A page holds at most 255 segments. A longer packet continues
+ *     on the next page (header flag 0x01 = continued packet); a page
+ *     on which no packet ends carries granule position -1. It used to
+ *     throw instead, so any packet over 65024 bytes could not be
+ *     written at all.
+ *   - body === null: a page with no segments (the EOS page).
  *
  * CRC rule: compute CRC-32 over the entire page with the CRC field
  * itself set to zero, then patch the computed value in.
  */
 OggWriter.prototype._buildPage = function (body, flags, granule) {
-  // Build segment lacing table
-  var segments;
-  if (body.length === 0) {
-    segments = [0];
-  } else {
-    segments = [];
-    var remaining = body.length;
-    while (remaining >= 255) {
-      segments.push(255);
-      remaining -= 255;
-    }
-    segments.push(remaining);   // 0..254 — "ends the packet"
-  }
+  if (!body) return this._buildOnePage([], new Uint8Array(0), flags, granule);
 
-  if (segments.length > 255) {
-    throw new Error('OggWriter: packet size ' + body.length +
-                    ' requires more than 255 segments; split across pages');
+  var segments = [];
+  var remaining = body.length;
+  while (remaining >= 255) {
+    segments.push(255);
+    remaining -= 255;
   }
+  segments.push(remaining);   // 0..254 — "ends the packet"
 
+  if (segments.length <= 255) return this._buildOnePage(segments, body, flags, granule);
+
+  var pages = [];
+  var off = 0;
+  for (var s = 0; s < segments.length; s += 255) {
+    var segs = segments.slice(s, s + 255);
+    var bytes = 0;
+    for (var k = 0; k < segs.length; k++) bytes += segs[k];
+    var last = s + 255 >= segments.length;
+    var f = (s > 0 ? FLAG_CONTINUATION : 0) | (last ? flags : (flags & FLAG_BOS));
+    pages.push(this._buildOnePage(segs, body.subarray(off, off + bytes), f, last ? granule : -1));
+    off += bytes;
+  }
+  return concat(pages);
+};
+
+OggWriter.prototype._buildOnePage = function (segments, body, flags, granule) {
   var headerLen = 27 + segments.length;
   var page = new Uint8Array(headerLen + body.length);
 
@@ -237,8 +268,9 @@ OggWriter.prototype._buildPage = function (body, flags, granule) {
   // 6..13 granule position (64-bit LE). Split high/low to avoid
   // BigInt — Opus streams at 48 kHz will only exceed 32 bits after
   // ~24 hours of continuous audio, so this matters for long sessions.
-  var granLo = (granule >>> 0);
-  var granHi = Math.floor(granule / 0x100000000) >>> 0;
+  // -1 (all ones) = no packet finishes on this page.
+  var granLo = granule < 0 ? 0xFFFFFFFF : (granule >>> 0);
+  var granHi = granule < 0 ? 0xFFFFFFFF : (Math.floor(granule / 0x100000000) >>> 0);
   writeU32LE(page, 6, granLo);
   writeU32LE(page, 10, granHi);
   writeU32LE(page, 14, this._serial);             // 14..17 bitstream serial

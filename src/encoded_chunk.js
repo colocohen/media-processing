@@ -11,12 +11,15 @@
  * @param {number} init.timestamp  — PTS in microseconds (REQUIRED per spec)
  * @param {number} [init.duration] — Duration in microseconds
  * @param {BufferSource} init.data — Encoded payload (Buffer / TypedArray /
- *                                   ArrayBuffer / DataView)
+ *                                   ArrayBuffer / DataView); REQUIRED, copied
+ * @param {ArrayBuffer[]} [init.transfer] — ArrayBuffers to detach; if data's
+ *                                   buffer is one of them it is taken, not copied
  * @param {object} [init.metadata] — Codec-specific metadata (Anthropic-
  *                                   specific extension; not in W3C spec)
  */
 
 import { isBufferSource, toUint8Array as toBuffer, requireBufferSource } from './core/buffer_source.js';
+import { takeBufferSource } from './core/take_buffer.js';
 
 function _initChunk(name, self, init) {
   if (!init) throw new TypeError(name + ': init required');
@@ -43,15 +46,17 @@ function _initChunk(name, self, init) {
     ? init.duration
     : null;
 
-  // Normalize data to a Buffer view. data may be null/undefined for
-  // chunks with no payload (rare); otherwise it must be BufferSource.
-  var data;
-  if (init.data == null) {
-    data = null;
-  } else {
-    data = requireBufferSource(init.data, name + ': data');
+  // W3C §5.2 / §4.2: `data` is a required BufferSource, and the chunk
+  // owns a COPY of it unless its ArrayBuffer is listed in init.transfer.
+  // Before, a missing data gave a 0-byte chunk instead of a TypeError,
+  // data was aliased (mutating the source Uint8Array after construction
+  // changed the chunk: copyTo read 99 instead of 1), and `transfer` was
+  // ignored (the source ArrayBuffer stayed attached, byteLength 3).
+  if (init.data === undefined || init.data === null) {
+    throw new TypeError(name + ': data is required');
   }
-  var byteLength = data ? data.length : 0;
+  var data = takeBufferSource(name + ': data', init.data, init.transfer);
+  var byteLength = data.length;
 
   // ── Read-only attributes (MP-35) ──
   //

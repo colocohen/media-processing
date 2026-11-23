@@ -122,4 +122,79 @@ function parseOpusToc(packet) {
 }
 
 
-export { getOpusPacketDurationUs, parseOpusToc };
+// ── OpusHead (RFC 7845 §5.1) ──────────────────────────────────────
+//
+// Channel mapping family 1 (RFC 7845 §5.1.1.2): Vorbis channel order,
+// 1..8 channels, coded as `streams` Opus streams of which the first
+// `coupled` are stereo. These are libopus' surround layouts — what
+// FFmpeg's libopus encoder (mapping_family -1, the default) and every
+// browser produce — so a stream encoded without an OpusHead at hand
+// still decodes. Indexed by channel count.
+var FAMILY1_LAYOUTS = [
+  null,
+  { streams: 1, coupled: 0, mapping: [0] },
+  { streams: 1, coupled: 1, mapping: [0, 1] },
+  { streams: 2, coupled: 1, mapping: [0, 2, 1] },
+  { streams: 2, coupled: 2, mapping: [0, 1, 2, 3] },
+  { streams: 3, coupled: 2, mapping: [0, 4, 1, 2, 3] },
+  { streams: 4, coupled: 2, mapping: [0, 4, 1, 2, 3, 5] },
+  { streams: 4, coupled: 3, mapping: [0, 4, 1, 2, 3, 5, 6] },
+  { streams: 5, coupled: 3, mapping: [0, 6, 1, 2, 3, 4, 5, 7] },
+];
+
+/**
+ * Build an OpusHead identification header (RFC 7845 §5.1).
+ *
+ * Family 0 (no mapping table) is only defined for 1 or 2 channels. It
+ * used to be written for every channel count, so a 6-channel stream got
+ * an OpusHead FFmpeg rejects outright ("Channel mapping 0 is only
+ * specified for up to 2 channels"). 3..8 channels now get family 1 with
+ * the libopus surround layout, more get family 255 (one mono stream per
+ * channel, identity mapping).
+ *
+ * @param {object} opts  { channels=2, preSkip=0, inputSampleRate=48000, outputGain=0 }
+ * @returns {Uint8Array}
+ */
+function buildOpusHead(opts) {
+  if (!opts) opts = {};
+  var ch = opts.channels || 2;
+  var family = ch <= 2 ? 0 : (ch <= 8 ? 1 : 255);
+  var layout = family === 1 ? FAMILY1_LAYOUTS[ch] : null;
+  var len = 19 + (family === 0 ? 0 : 2 + ch);
+  var b = new Uint8Array(len);
+  var magic = 'OpusHead';
+  for (var i = 0; i < 8; i++) b[i] = magic.charCodeAt(i);
+  b[8] = 1;                                         // version
+  b[9] = ch;
+  var preSkip = opts.preSkip || 0;
+  b[10] = preSkip & 0xFF; b[11] = (preSkip >> 8) & 0xFF;
+  var rate = opts.inputSampleRate || 48000;
+  b[12] = rate & 0xFF; b[13] = (rate >>> 8) & 0xFF; b[14] = (rate >>> 16) & 0xFF; b[15] = (rate >>> 24) & 0xFF;
+  var gain = (opts.outputGain || 0) & 0xFFFF;
+  b[16] = gain & 0xFF; b[17] = (gain >> 8) & 0xFF;
+  b[18] = family;
+  if (family !== 0) {
+    b[19] = layout ? layout.streams : ch;          // stream count
+    b[20] = layout ? layout.coupled : 0;           // coupled count
+    for (var c = 0; c < ch; c++) b[21 + c] = layout ? layout.mapping[c] : c;
+  }
+  return b;
+}
+
+/**
+ * Parse an OpusHead. Returns null when the bytes are not one.
+ * @returns {{channels:number, preSkip:number, inputSampleRate:number, mappingFamily:number}|null}
+ */
+function parseOpusHead(b) {
+  if (!b || b.length < 19) return null;
+  var magic = 'OpusHead';
+  for (var i = 0; i < 8; i++) if (b[i] !== magic.charCodeAt(i)) return null;
+  return {
+    channels: b[9],
+    preSkip: b[10] | (b[11] << 8),
+    inputSampleRate: (b[12] | (b[13] << 8) | (b[14] << 16) | (b[15] << 24)) >>> 0,
+    mappingFamily: b[18],
+  };
+}
+
+export { getOpusPacketDurationUs, parseOpusToc, buildOpusHead, parseOpusHead };

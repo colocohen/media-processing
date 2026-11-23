@@ -94,9 +94,9 @@
  *                  media segment is independently decodable. Required
  *                  by some players for byte-range / seek operations.
  *
- * @param {number}  [opts.version]               EXT-X-VERSION value.
- *                  Default: 6 (sufficient for all features we emit;
- *                  required for #EXT-X-MAP referenced by fMP4 variants).
+ * @param {number}  [opts.version]               Minimum EXT-X-VERSION.
+ *                  Default 6; raised to 7 for INSTREAM-ID="SERVICEn",
+ *                  8 for EXT-X-DEFINE, 11 for DEFINE QUERYPARAM.
  *
  * @returns {string}  m3u8 text content. Caller is responsible for
  *                    serving it with content-type
@@ -181,9 +181,20 @@ export function buildMasterPlaylist(opts) {
 
   var lines = [];
   lines.push('#EXTM3U');
-  // EXT-X-VERSION may be auto-bumped by features below (e.g.
-  // QUERYPARAM in DEFINE bumps to v11). Track minimum here.
+  // EXT-X-VERSION is raised to what the features below need (RFC 8216
+  // §7 / rfc8216bis §8): 7 for INSTREAM-ID="SERVICEn", 8 for any
+  // EXT-X-DEFINE, 11 for its QUERYPARAM form. It stayed 6 with a DEFINE
+  // or a CEA-708 SERVICE rendition, which strict clients reject.
   var minVersion = opts.version || 6;
+  if (Array.isArray(opts.closedCaptionsRenditions)) {
+    for (var cvi = 0; cvi < opts.closedCaptionsRenditions.length; cvi++) {
+      var ccr = opts.closedCaptionsRenditions[cvi];
+      if (ccr && typeof ccr.instreamId === 'string' &&
+          ccr.instreamId.indexOf('SERVICE') === 0 && minVersion < 7) {
+        minVersion = 7;
+      }
+    }
+  }
 
   // EXT-X-DEFINE entries appear early so they're available for
   // substitution in any URI that follows. Validated upfront — bad
@@ -194,6 +205,7 @@ export function buildMasterPlaylist(opts) {
       var def = opts.defines[dii];
       var defLine = _serializeDefineEntry(def, dii);
       serializedDefines.push(defLine);
+      if (minVersion < 8) minVersion = 8;
       if (def.queryparam !== undefined && minVersion < 11) minVersion = 11;
     }
   }
@@ -425,10 +437,13 @@ function _serializeMediaRendition(type, r) {
 function _serializeStreamInf(v) {
   var attrs = [];
   // BANDWIDTH must appear first per spec recommendation. Required.
-  attrs.push('BANDWIDTH=' + (v.bandwidth | 0));
+  // Math.round, not `| 0`: `| 0` is a 32-bit signed cast, so 3 Gbit/s
+  // (a valid decimal-integer, 8K / high-frame-rate ladders) came out as
+  // BANDWIDTH=-1294967296.
+  attrs.push('BANDWIDTH=' + Math.round(v.bandwidth));
 
   if (typeof v.averageBandwidth === 'number') {
-    attrs.push('AVERAGE-BANDWIDTH=' + (v.averageBandwidth | 0));
+    attrs.push('AVERAGE-BANDWIDTH=' + Math.round(v.averageBandwidth));
   }
   // SCORE (RFC 8216bis §4.4.6.2). Used by ABR clients to break ties
   // among variants with similar BANDWIDTH. Higher score = preferred.
@@ -503,9 +518,9 @@ function _serializeStreamInf(v) {
  */
 function _serializeIFrameStreamInf(v) {
   var attrs = [];
-  attrs.push('BANDWIDTH=' + (v.bandwidth | 0));
+  attrs.push('BANDWIDTH=' + Math.round(v.bandwidth));   // not | 0, see _serializeStreamInf
   if (typeof v.averageBandwidth === 'number') {
-    attrs.push('AVERAGE-BANDWIDTH=' + (v.averageBandwidth | 0));
+    attrs.push('AVERAGE-BANDWIDTH=' + Math.round(v.averageBandwidth));
   }
   if (v.codecs)             attrs.push('CODECS="' + escapeQuoted(v.codecs) + '"');
   if (v.supplementalCodecs) {
@@ -783,6 +798,15 @@ export function parseMasterPlaylist(text) {
 
     if (line.indexOf('#EXT-X-STREAM-INF:') === 0) {
       pendingVariant = _streamInfToVariant(parseAttributeList(line.slice(18)));
+      // CLOSED-CAPTIONS=NONE (unquoted enumerated-string) means "no
+      // captions" and maps to null — what buildMasterPlaylist writes back
+      // as NONE. parseAttributeList drops the quotes, so it came back as
+      // the group name "NONE" and a rebuild threw ("no closed-captions
+      // rendition with that GROUP-ID") or wrote CLOSED-CAPTIONS="NONE".
+      // A quoted "NONE" stays a GROUP-ID.
+      if (/(^|,)CLOSED-CAPTIONS=NONE(,|$)/.test(line.slice(18))) {
+        pendingVariant.closedCaptions = null;
+      }
     } else if (line.indexOf('#EXT-X-I-FRAME-STREAM-INF:') === 0) {
       out.iFrameVariants.push(_streamInfToVariant(parseAttributeList(line.slice(26))));
     } else if (line.indexOf('#EXT-X-MEDIA:') === 0) {

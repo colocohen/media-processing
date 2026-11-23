@@ -50,59 +50,84 @@ function MediaStreamTrackProcessor(init) {
   }
 
   var track = init.track;
-  var maxBuffer = init.maxBufferSize || 15;
+  // mediacapture-transform: maxBufferSize starts at 1 and takes the
+  // application's value only when it is an integer > 1.
+  var maxBuffer = (Number.isInteger(init.maxBufferSize) && init.maxBufferSize > 1) ? init.maxBufferSize : 1;
   var eventName = track.kind === 'video' ? 'frame' : 'data';
-  var handler = null;
+  var handler = null, onEnded = null;
+  var queue = [];            // [[queue]]: owned clones, oldest first
+  var pendingPull = null;    // controller waiting in pull() for a frame
+  var ctl = null;
+  var self = this;
+  this.discardedFrames = 0;  // [[numDiscardedFrames]]
 
-  /**
-   * ReadableStream that yields VideoFrame (video) or AudioData (audio)
-   * from the source track. Backpressure is handled by the stream's
-   * internal queue — when the queue is full, frames are dropped.
-   */
+  // The queue is the spec's own, not the ReadableStream's. When it was the
+  // stream's (CountQueuingStrategy, default 15), a full queue DROPPED THE
+  // NEW FRAME — the consumer was fed the oldest ones, up to 15 frames
+  // (half a second at 30 fps) behind live. handleNewFrame (§2.1.5) does the
+  // opposite: dequeue and close the OLDEST, enqueue the new one, so a
+  // queued frame is always among the most recent.
+  function deliver() {
+    if (pendingPull && queue.length) {
+      var c = pendingPull; pendingPull = null;
+      c.enqueue(queue.shift());
+    }
+  }
+  function detach() {
+    if (handler) { track.off(eventName, handler); handler = null; }
+    if (onEnded) { track.off('_stopped', onEnded); onEnded = null; }
+  }
+
   this.readable = new ReadableStream({
     start: function (controller) {
+      ctl = controller;
       handler = function (data) {
-        if (controller.desiredSize !== null && controller.desiredSize <= 0) {
-          // Backpressure: consumer is slow, drop frame
-          return;
-        }
-        // Clone before enqueue. EventEmitter delivers the same VideoFrame /
+        // Clone before queueing. EventEmitter delivers the same VideoFrame /
         // AudioData object to every listener, all sharing one ref-counted
-        // buffer. If a sibling listener calls close() before our async reader
-        // pulls from the queue, copyTo on the queued object throws
-        // "VideoFrame is detached". Per W3C WebCodecs, .clone() is cheap —
-        // it just bumps the underlying resource's refcount; pixel/sample
-        // data is not duplicated. This makes the processor independent of
-        // other consumers' lifetimes.
+        // buffer; a sibling listener may close() it before our reader pulls.
+        // clone() only bumps the refcount (W3C), so this is cheap.
         var owned = (typeof data.clone === 'function') ? data.clone() : data;
-        controller.enqueue(owned);
+        if (queue.length >= maxBuffer) {
+          var dropped = queue.shift();
+          try { if (dropped && typeof dropped.close === 'function') dropped.close(); } catch (e) {}
+          self.discardedFrames++;
+        }
+        queue.push(owned);
+        deliver();
       };
       // prependListener (not on()) so this handler ALWAYS fires first when
-      // multiple listeners are attached. Cloning has to happen before any
+      // multiple listeners are attached: cloning has to happen before any
       // sibling listener calls close() — clone() on a detached frame throws.
-      // EventEmitter calls listeners in registration order; if a diag/log
-      // listener was attached BEFORE the processor and closes the frame,
-      // a plain on() handler would receive an already-detached frame and
-      // clone() would fail. prependListener guarantees we run first
-      // regardless of when the processor was constructed.
       if (typeof track.prependListener === 'function') {
         track.prependListener(eventName, handler);
       } else {
         track.on(eventName, handler);
       }
-
-      // End the stream when the track stops
-      track.on('ended', function () {
+      // End the stream when the track ends. Kept as a reference so cancel()
+      // can remove it — it leaked one 'ended' listener per processor.
+      onEnded = function () {
+        detach();
         try { controller.close(); } catch (e) {}
-      });
+      };
+      // '_stopped' covers the track's own stop(), which fires no 'ended'
+      // (mediacapture-main) but ends the processor's stream all the same.
+      track.on('_stopped', onEnded);
+    },
+    pull: function (controller) {
+      pendingPull = controller;
+      deliver();
     },
     cancel: function () {
-      if (handler) {
-        track.off(eventName, handler);
-        handler = null;
+      detach();
+      pendingPull = null;
+      // Frames still queued are ours (clones): release them. They were
+      // left holding their buffers' refcounts.
+      while (queue.length) {
+        var f = queue.shift();
+        try { if (f && typeof f.close === 'function') f.close(); } catch (e) {}
       }
     },
-  }, new CountQueuingStrategy({ highWaterMark: maxBuffer }));
+  }, { highWaterMark: 0 });
 }
 
 // ═══════════════════════════════════════
@@ -142,11 +167,14 @@ function MediaStreamTrackGenerator(init) {
       }
       self._push(data);
     },
+    // Closing (or aborting) the writable ends the generator's source:
+    // the track and its clones end and fire 'ended' (mediacapture-
+    // transform), which a stop() would not.
     close: function () {
-      self.stop();
+      self._endSource();
     },
     abort: function () {
-      self.stop();
+      self._endSource();
     },
   });
 }

@@ -60,18 +60,8 @@ OggReader.prototype.feed = function (chunk) {
     var granHi = readU32LE(page, 10);
     var granule = granHi * 0x100000000 + granLo;
 
+    var headerType = page[5];
     var body = page.subarray(headerLen);
-
-    // First two pages are Opus headers — skip for packet extraction.
-    // Page 0's body IS the OpusHead identification header (RFC 7845
-    // §5.1, contains the real libopus pre-skip); capture it so the
-    // encoder can surface it as decoderConfig.description, matching the
-    // browser WebCodecs AudioEncoder. Page 1 is the comment header.
-    if (this._headersParsed < 2) {
-      if (this._headersParsed === 0) this._opusHead = body.slice();
-      this._headersParsed++;
-      continue;
-    }
 
     // Extract packets from segments.
     //
@@ -119,6 +109,22 @@ OggReader.prototype.feed = function (chunk) {
     // Whatever is left belongs to a packet continuing into the next page.
     this._pendingSegments = packetBuf;
 
+    // The first two PACKETS are the Opus headers (RFC 7845 §3): OpusHead
+    // (§5.1, with the real libopus pre-skip — kept so the encoder can
+    // surface it as decoderConfig.description, like the browser's
+    // AudioEncoder) and OpusTags (§5.2). They were taken to be the first
+    // two PAGES, but OpusTags may span pages (§3: "the comment header
+    // packet ... MAY span multiple pages") — any tag over ~64 KB, e.g. a
+    // cover image, does. Its continuation page then came out as an
+    // audio packet (a 35052-byte 'Opus frame') and every timestamp after
+    // it was off by one packet.
+    while (packets.length && this._headersParsed < 2 && _isOpusHeader(packets[0])) {
+      if (this._headersParsed === 0) this._opusHead = packets[0];
+      this._headersParsed++;
+      packets.shift();
+    }
+    if (packets.length) this._headersParsed = 2;   // audio from here (headers or not)
+
     // Emit audio events for each packet.
     //
     // Per-packet duration comes from the Opus TOC byte (RFC 6716 §3.1)
@@ -136,6 +142,14 @@ OggReader.prototype.feed = function (chunk) {
     // raw-stream debugging) without depending on container framing.
     for (var p = 0; p < packets.length; p++) {
       var durUs = getOpusPacketDurationUs(packets[p]);
+      // End trimming (RFC 7845 §4.5): the end-of-stream page's granule
+      // position (48 kHz, from the stream's start) says where the audio
+      // ends, which may be inside its last packet. The last packet went out
+      // whole (20000 µs where FFmpeg says 6500).
+      if ((headerType & 0x04) && p === packets.length - 1 && granule > 0) {
+        var endUs = Math.round(granule * 1000000 / 48000) - this._ptsUs;
+        if (endUs > 0 && endUs < durUs) durUs = endUs;
+      }
       this._ee.emit('audio', {
         payload: packets[p],
         ptsUs: this._ptsUs,
@@ -145,6 +159,13 @@ OggReader.prototype.feed = function (chunk) {
     }
   }
 };
+
+// 'OpusHead' / 'OpusTags': an Opus header packet, not audio.
+function _isOpusHeader(pkt) {
+  if (pkt.length < 8) return false;
+  var m = String.fromCharCode(pkt[0], pkt[1], pkt[2], pkt[3], pkt[4], pkt[5], pkt[6], pkt[7]);
+  return m === 'OpusHead' || m === 'OpusTags';
+}
 
 OggReader.prototype.flush = function () {
   this._q.reset();

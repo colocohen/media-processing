@@ -7,6 +7,7 @@ import AnnexBReader from './reader_annexb.js';
 import ADTSReader from './reader_adts.js';
 import FMP4Reader from './reader_fmp4.js';
 import TSReader from './reader_ts.js';
+import FLVReader from './reader_flv.js';
 import OGGReader from './reader_ogg.js';
 
 /**
@@ -50,16 +51,30 @@ var CONTAINERS = {
       return new AnnexBReader({ codec: opts.codec || 'h264', fps: opts.fps || 30 });
     },
     extra: function (codec) {
-      // NOTE: AUD insertion for the *demuxer* read path lives inline in
-      // demuxer.start() — NOT here. This `extra` is shared with the
-      // ENCODE path (video/audio/media encoders via getContainerExtra),
-      // where libx264/libx265 already emit AUDs (x264-params aud=1).
-      // Adding h264_metadata=aud=insert here caused DOUBLE AUDs on encode
-      // → the reader split each frame twice → 2N-1 output chunks.
+      // Used where FFmpeg writes a raw Annex-B stream (MediaEncoder with
+      // container 'annexb'). VideoEncoder reads H.264/H.265 as FLV, and
+      // the Demuxer no longer reads Annex-B at all. libx264/libx265 emit
+      // AUDs themselves (x264-params aud=1): adding
+      // h264_metadata=aud=insert here caused DOUBLE AUDs on encode →
+      // the reader split each frame twice → 2N-1 output chunks.
       if (codec === 'h264') return ['-bsf:v', 'h264_mp4toannexb'];
       if (codec === 'h265') return ['-bsf:v', 'hevc_mp4toannexb'];
       return [];
     },
+  },
+  // H.264 / H.265 ENCODER output (VideoEncoder only — see
+  // getEncoderContainer). Length-framed, so each frame is read the
+  // moment FFmpeg writes it; reader_flv explains why Annex-B can't be.
+  // No mp4toannexb bitstream filter: FLV stores length-prefixed NAL
+  // units, and the muxer converts the encoder's Annex-B itself.
+  flv: {
+    format: 'flv',
+    createReader: function (opts) {
+      return new FLVReader({ codec: opts.codec || 'h264' });
+    },
+    // no_metadata / no_duration_filesize: nothing to rewrite on a pipe.
+    // no_sequence_end: no end-of-sequence tag on close.
+    extra: ['-flvflags', 'no_sequence_end+no_metadata+no_duration_filesize'],
   },
   adts: {
     format: 'adts',
@@ -136,6 +151,19 @@ function getDefaultContainer(codec) {
 }
 
 /**
+ * The container a VideoEncoder reads its FFmpeg's output in. H.264 and
+ * H.265 come out as FLV rather than their default Annex-B: an Annex-B
+ * stream gives no frame boundary until the next frame starts, which
+ * held every encoded frame back by one frame (reader_flv.js). Decoders
+ * and the demuxer keep feeding / reading Annex-B.
+ */
+function getEncoderContainer(codec) {
+  var c = String(codec).toLowerCase();
+  if (c === 'h264' || c === 'h265') return 'flv';
+  return getDefaultContainer(c);
+}
+
+/**
  * Get a container definition by name.
  */
 function getContainer(name) {
@@ -158,4 +186,4 @@ function getContainerExtra(containerDef, codec) {
   return containerDef.extra || [];
 }
 
-export { getDefaultContainer, getContainer, getContainerFormat, getContainerExtra };
+export { getDefaultContainer, getEncoderContainer, getContainer, getContainerFormat, getContainerExtra };

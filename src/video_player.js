@@ -10,6 +10,7 @@
 
 import { spawn } from 'node:child_process';
 import EventEmitter from './core/events.js';
+import { frameByteSize } from './core/frame_size.js';
 
 function VideoPlayer(opts) {
   if (!opts) opts = {};
@@ -17,6 +18,8 @@ function VideoPlayer(opts) {
   this._proc = null;
   this._started = false;
   this._warnedSize = false;
+  this._track = null;          // track attached by play()
+  this._onFrame = null;        // … and its 'frame' listener
 
   this.width = opts.width || 1280;
   this.height = opts.height || 720;
@@ -25,7 +28,9 @@ function VideoPlayer(opts) {
   this.windowWidth = opts.windowWidth || 800;
   this.windowHeight = opts.windowHeight || 450;
 
-  this._bytesPerFrame = ((this.width * this.height * 3) >> 1);
+  // I420 with ceil chroma (core/frame_size.js); (w*h*3)>>1 floored it,
+  // so every correct odd-sized frame was rejected as the wrong size.
+  this._bytesPerFrame = frameByteSize('I420', this.width, this.height);
 }
 
 VideoPlayer.prototype.on = function (ev, fn) { this._ee.on(ev, fn); };
@@ -68,9 +73,20 @@ VideoPlayer.prototype.play = function (stream) {
   }
 
   var self = this;
-  tracks[0].on('frame', function (frame) {
+  this._detach();   // play() again: don't feed ffplay from two tracks
+  this._track = tracks[0];
+  this._onFrame = function (frame) {
     self.writeFrame(frame);
-  });
+  };
+  this._track.on('frame', this._onFrame);
+};
+
+VideoPlayer.prototype._detach = function () {
+  if (this._track && this._onFrame && typeof this._track.off === 'function') {
+    this._track.off('frame', this._onFrame);
+  }
+  this._track = null;
+  this._onFrame = null;
 };
 
 /**
@@ -86,6 +102,11 @@ VideoPlayer.prototype.onDrain = function (cb) {
  * Stop the player.
  */
 VideoPlayer.prototype.stop = function () {
+  // Remove the play() listener first. It used to stay attached, so the
+  // next frame after stop() went through writeFrame → _ensureStarted
+  // and spawned a new ffplay (4 spawns for 5 frames in the repro), and
+  // the track kept counting the player as a consumer.
+  this._detach();
   try { if (this._proc && this._proc.stdin) this._proc.stdin.end(); } catch (e) {}
   try { if (this._proc) this._proc.kill('SIGKILL'); } catch (e) {}
   this._proc = null;
@@ -114,6 +135,9 @@ VideoPlayer.prototype._ensureStarted = function () {
 
   var self = this;
   proc.on('error', function (e) { self._ee.emit('error', e); });
+  // EPIPE when the ffplay window is closed mid-write; without a
+  // listener it is thrown as an uncaught 'error' event.
+  if (proc.stdin) proc.stdin.on('error', function (e) { if (e && e.code !== 'EPIPE') self._ee.emit('error', e); });
   proc.on('close', function (c) {
     self._started = false;
     self._ee.emit('close', c);

@@ -3,11 +3,29 @@
  *
  * Parses moof→traf→tfdt (base decode time) + trun (per-sample info)
  * to emit individual frames with accurate PTS and keyframe detection.
+ *
+ * Events:
+ *   'init'    { initSegment (ftyp + moov), timescale, tracks }
+ *             tracks: [{ id, type: 'video'|'audio'|'other', timescale }];
+ *             timescale: the first video track's (else the first track's)
+ *   'video' / 'audio'
+ *             { trackId, payload, isKeyframe, ptsUs, dtsUs, durationUs,
+ *               duration (track ticks) } — by the track's handler
+ *   'segment' { payload } — a moof with nothing this reader can read
+ *
+ * The stream is read box by box at the top level (ISO/IEC 14496-12 §4.2):
+ * the boxes it doesn't need — styp, sidx, emsg, prft, free, skip, uuid,
+ * an mdat without a moof — are skipped by their size, and boxes between a
+ * moof and its mdat are allowed.
  */
 
 import EventEmitter from './core/events.js';
-import { readU32BE, toAscii, readS32BE } from './core/bytes.js';
+import { readU32BE, readU64BE, toAscii, concat } from './core/bytes.js';
+import { findBox, findBoxes, findPath, parseTfhd, parseTfdt, parseTrun, isSyncSampleFlags } from './utils/iso_bmff.js';
 import ByteQueue from './core/byte_queue.js';
+
+// Boxes read whole; any other top-level box is skipped as it streams by.
+var KEEP = { ftyp: true, moov: true, moof: true, mdat: true };
 
 function FMP4Reader(opts) {
   if (!opts) opts = {};
@@ -17,37 +35,91 @@ function FMP4Reader(opts) {
   this._timescale = opts.timescale || 90000;
   this._defaultSampleDuration = opts.defaultSampleDuration || 0;
   this._defaultSampleSize = opts.defaultSampleSize || 0;
+  this._pos = 0;          // the stream offset of the queue's first byte
+  this._skip = 0;         // bytes of a skipped box still to come
+  this._ftyp = null;
+  this._tracks = {};      // track_ID → { id, type, timescale, trex defaults, nextDts }
+  this._moof = null;      // { buf, start }: waiting for its mdat
 }
 
 FMP4Reader.prototype.on = function (ev, fn) { this._ee.on(ev, fn); };
 FMP4Reader.prototype.off = function (ev, fn) { this._ee.off(ev, fn); };
 
+/**
+ * One top-level box at a time.
+ *
+ * This used to accept only `ftyp moov` and then strictly `moof mdat`
+ * pairs: the first other box stalled the reader for good — every byte
+ * after it stayed queued. An HLS fMP4 stream (init + segments, each
+ * starting with styp) and a file with a global sidx gave 0 of 90 frames.
+ */
 FMP4Reader.prototype.feed = function (chunk) {
   this._q.push(chunk);
   while (true) {
-    if (!this._gotInit) {
-      var init = this._tryReadInit();
-      if (!init) break;
-      this._parseInitSegment(init);
-      this._ee.emit('init', { initSegment: init, timescale: this._timescale });
-      this._gotInit = true;
-    } else {
-      var seg = this._tryReadSegment();
-      if (!seg) break;
-      this._parseMediaSegment(seg);
+    if (this._skip) {
+      var n = Math.min(this._skip, this._q.length);
+      if (!n) break;
+      this._q.discard(n);
+      this._pos += n;
+      this._skip -= n;
+      continue;
     }
+    var h = this._q.peek(8);
+    if (!h) break;
+    var size = readU32BE(h, 0), type = toAscii(h, 4, 8), hdr = 8;
+    if (size === 1) {
+      var h16 = this._q.peek(16);
+      if (!h16) break;
+      size = readU64BE(h16, 8);
+      hdr = 16;
+    }
+    // size 0 (to the end of the file) can't be framed in a stream; a
+    // size below the header is garbage — either way nothing more can be
+    // read, as before.
+    if (size < hdr) break;
+    if (!KEEP[type]) { this._skip = size; continue; }
+    if (this._q.length < size) break;
+    var start = this._pos;
+    var box = this._q.read(size);
+    this._pos += size;
+    this._box(type, box, start);
   }
 };
 
-FMP4Reader.prototype.flush = function () { this._q.reset(); };
+FMP4Reader.prototype.flush = function () {
+  this._q.reset();
+  this._skip = 0;
+  this._moof = null;
+};
 
-// ── Init segment parsing (extract timescale from moov→mvhd or moov→trak→mdhd) ──
+FMP4Reader.prototype._box = function (type, buf, start) {
+  if (type === 'ftyp') { this._ftyp = buf; return; }
+  if (type === 'moov') {
+    this._parseInitSegment(buf);
+    var init = this._ftyp ? concat([this._ftyp, buf]) : buf;
+    var tracks = [], self = this;
+    Object.keys(this._tracks).forEach(function (id) {
+      var t = self._tracks[id];
+      tracks.push({ id: t.id, type: t.type, timescale: t.timescale });
+    });
+    this._gotInit = true;
+    this._ee.emit('init', { initSegment: init, timescale: this._timescale, tracks: tracks });
+    return;
+  }
+  if (type === 'moof') { this._moof = { buf: buf, start: start }; return; }
+  // mdat
+  if (!this._moof) return;                    // media data without a moof: nothing to index it
+  var moof = this._moof;
+  this._moof = null;
+  this._parseMediaSegment(moof.buf, moof.start, buf, start);
+};
+
+// ── Init segment: every trak's id, handler and timescale; mvex/trex defaults ──
 
 FMP4Reader.prototype._parseInitSegment = function (buf) {
-  var moov = _findBox(buf, 0, buf.length, 'moov');
-  if (!moov) return;
-  // Try mvhd for timescale
-  var mvhd = _findBox(buf, moov.dataStart, moov.end, 'mvhd');
+  var moov = { dataStart: 8, end: buf.length };
+  if (readU32BE(buf, 0) === 1) moov.dataStart = 16;
+  var mvhd = findBox(buf, moov.dataStart, moov.end, 'mvhd');
   if (mvhd) {
     var ver = buf[mvhd.dataStart];
     if (ver === 0 && mvhd.dataStart + 20 <= buf.length) {
@@ -56,265 +128,126 @@ FMP4Reader.prototype._parseInitSegment = function (buf) {
       this._timescale = readU32BE(buf, mvhd.dataStart + 20);
     }
   }
-  // Try mdhd for more specific timescale
-  var trak = _findBox(buf, moov.dataStart, moov.end, 'trak');
-  if (trak) {
-    var mdia = _findBox(buf, trak.dataStart, trak.end, 'mdia');
-    if (mdia) {
-      var mdhd = _findBox(buf, mdia.dataStart, mdia.end, 'mdhd');
-      if (mdhd) {
-        var mdVer = buf[mdhd.dataStart];
-        if (mdVer === 0 && mdhd.dataStart + 20 <= buf.length) {
-          this._timescale = readU32BE(buf, mdhd.dataStart + 12);
-        } else if (mdVer === 1 && mdhd.dataStart + 28 <= buf.length) {
-          this._timescale = readU32BE(buf, mdhd.dataStart + 20);
-        }
-      }
-    }
-  }
-};
-
-// ── Media segment parsing (moof + mdat → individual frames) ──
-
-FMP4Reader.prototype._parseMediaSegment = function (buf) {
-  var moof = _findBox(buf, 0, buf.length, 'moof');
-  var mdat = _findBox(buf, 0, buf.length, 'mdat');
-  if (!moof || !mdat) {
-    // Fallback: emit as raw segment
-    this._ee.emit('segment', { payload: buf });
-    return;
-  }
-
-  var traf = _findBox(buf, moof.dataStart, moof.end, 'traf');
-  if (!traf) { this._ee.emit('segment', { payload: buf }); return; }
-
-  // Parse tfhd for defaults
-  var tfhd = _findBox(buf, traf.dataStart, traf.end, 'tfhd');
-  var defaultDur = this._defaultSampleDuration;
-  var defaultSize = this._defaultSampleSize;
-  var defaultFlags = 0;
-  if (tfhd) {
-    var tfhdOff = tfhd.dataStart;
-    var tfhdFlags = (buf[tfhdOff + 1] << 16) | (buf[tfhdOff + 2] << 8) | buf[tfhdOff + 3];
-    var p = tfhdOff + 8;  // skip version(1) + flags(3) + trackID(4)
-    if (tfhdFlags & 0x000002) p += 8;  // base_data_offset
-    if (tfhdFlags & 0x000008) { defaultDur = readU32BE(buf, p); p += 4; }
-    if (tfhdFlags & 0x000010) { defaultSize = readU32BE(buf, p); p += 4; }
-    if (tfhdFlags & 0x000020) { defaultFlags = readU32BE(buf, p); }
-  }
-
-  // Parse tfdt for base decode time
-  var baseDecodeTime = 0;
-  var tfdt = _findBox(buf, traf.dataStart, traf.end, 'tfdt');
-  if (tfdt) {
-    var tfdtVer = buf[tfdt.dataStart];
-    if (tfdtVer === 0) {
-      baseDecodeTime = readU32BE(buf, tfdt.dataStart + 4);
-    } else {
-      var hi = readU32BE(buf, tfdt.dataStart + 4);
-      var lo = readU32BE(buf, tfdt.dataStart + 8);
-      baseDecodeTime = hi * 0x100000000 + lo;
-    }
-  }
-
-  // Parse trun for per-sample info
-  var trun = _findBox(buf, traf.dataStart, traf.end, 'trun');
-  if (!trun) { this._ee.emit('segment', { payload: buf }); return; }
-
-  var trunOff = trun.dataStart;
-  var trunFlags = (buf[trunOff + 1] << 16) | (buf[trunOff + 2] << 8) | buf[trunOff + 3];
-  var sampleCount = readU32BE(buf, trunOff + 4);
-  var tp = trunOff + 8;
-
-  // data_offset (relative to moof start)
-  var dataOffset = 0;
-  if (trunFlags & 0x000001) { dataOffset = readS32BE(buf, tp); tp += 4; }
-  if (trunFlags & 0x000004) tp += 4;  // first_sample_flags
-
-  var hasDuration = !!(trunFlags & 0x000100);
-  var hasSize = !!(trunFlags & 0x000200);
-  var hasFlags = !!(trunFlags & 0x000400);
-  var hasCTO = !!(trunFlags & 0x000800);
-
-  // Read samples
-  var samples = [];
-  for (var i = 0; i < sampleCount; i++) {
-    var dur = defaultDur, sz = defaultSize, fl = defaultFlags, cto = 0;
-    if (hasDuration) { dur = readU32BE(buf, tp); tp += 4; }
-    if (hasSize) { sz = readU32BE(buf, tp); tp += 4; }
-    if (hasFlags) { fl = readU32BE(buf, tp); tp += 4; }
-    if (hasCTO) { cto = readS32BE(buf, tp); tp += 4; }
-    samples.push({ duration: dur, size: sz, flags: fl, compositionOffset: cto });
-  }
-
-  // Emit individual frames from mdat
-  var mdatDataStart = mdat.dataStart;
-  var sampleOffset = moof.start + dataOffset;
-  // If dataOffset points into mdat, use it; otherwise start at mdat data
-  if (sampleOffset < mdatDataStart || sampleOffset >= mdat.end) {
-    sampleOffset = mdatDataStart;
-  }
-
-  var currentTime = baseDecodeTime;
-  for (var s = 0; s < samples.length; s++) {
-    var sample = samples[s];
-    var end = sampleOffset + sample.size;
-    if (end > buf.length) break;
-
-    var payload = buf.slice(sampleOffset, end);
-    var ptsUs = Math.round((currentTime + sample.compositionOffset) * 1e6 / this._timescale);
-
-    // Keyframe detection from sample_flags (ISO/IEC 14496-12 §8.6.4.3).
-    //
-    // sample_flags is a 32-bit field. Two relevant fields:
-    //
-    //   bit 25-24: sample_depends_on (2 bits)
-    //     0 = unknown
-    //     1 = THIS sample depends on others (P/B-frame)
-    //     2 = THIS sample does NOT depend on others (I-frame)
-    //     3 = reserved
-    //
-    //   bit 16: sample_is_non_sync_sample (1 bit)
-    //     0 = this IS a sync (random-access) sample — keyframe
-    //     1 = not a sync sample
-    //
-    // History: the original code (pre-MP-30) used `depends_on != 2`,
-    // which over-classified depends_on=0 ("unknown") as keyframe.
-    // FFmpeg's default fMP4 muxer sets depends_on=0 for every sample
-    // unless explicitly configured, so EVERY P-frame got flagged as
-    // keyframe → unnecessary PLI / RTCP feedback, broken NACK / FEC
-    // heuristics.
-    //
-    // The MP-30 fix added the fallback to is_non_sync_sample but
-    // inverted the depends_on direction by mistake — it read
-    // "1 = others depend on this" (i.e. I-frame), but the spec
-    // actually says "1 = this depends on others" (i.e. P/B-frame).
-    // The bug stayed masked because depends_on=0 is the common case
-    // (handled by the fallback path) and depends_on != 0 was rare in
-    // tested inputs. Caught while writing writer-fmp4.js.
-    //
-    // Current logic (correct per spec):
-    //   - depends_on=2 → I-frame → keyframe
-    //   - depends_on=1 → P/B-frame → not keyframe
-    //   - depends_on=0 or 3 (unknown / reserved) → defer to is_non_sync
-    var dependsOn = (sample.flags >> 24) & 0x03;
-    var isNonSync = (sample.flags >> 16) & 0x01;
-    var isKey;
-    if (dependsOn === 2) {
-      isKey = true;
-    } else if (dependsOn === 1) {
-      isKey = false;
-    } else {
-      // dependsOn === 0 (unknown) or === 3 (reserved) — fall back to
-      // is_non_sync_sample bit. is_non_sync == 0 means it IS a sync
-      // sample (keyframe).
-      isKey = (isNonSync === 0);
-    }
-    // First sample in fragment with first_sample_flags might override
-    if (s === 0 && (trunFlags & 0x000004)) {
-      // first_sample_flags was present — already handled above
-    }
-
-    this._ee.emit('video', {
-      payload: payload,
-      isKeyframe: isKey,
-      ptsUs: ptsUs,
-      dtsUs: Math.round(currentTime * 1e6 / this._timescale),
-      duration: sample.duration,
+  // Every trak, by track_ID. Only the first trak's mdhd was read, and
+  // every sample was timed with it and emitted as 'video': with the audio
+  // track first (track 1, 48 kHz) the 142 AAC frames came out as 'video'
+  // keyframes and the video track (90 kHz) was never told apart.
+  var self = this, firstVideo = null, first = null;
+  findBoxes(buf, moov.dataStart, moov.end, 'trak').forEach(function (trak) {
+    var tkhd = findBox(buf, trak.dataStart, trak.end, 'tkhd');
+    var mdhd = findPath(buf, trak, 'mdia/mdhd');
+    var hdlr = findPath(buf, trak, 'mdia/hdlr');
+    if (!tkhd || !mdhd) return;
+    var id = readU32BE(buf, tkhd.dataStart + (buf[tkhd.dataStart] === 1 ? 20 : 12));
+    var ts = readU32BE(buf, mdhd.dataStart + (buf[mdhd.dataStart] === 1 ? 20 : 12));
+    var handler = hdlr ? toAscii(buf, hdlr.dataStart + 8, hdlr.dataStart + 12) : '';
+    var t = {
+      id: id, timescale: ts || self._timescale,
+      type: handler === 'vide' ? 'video' : handler === 'soun' ? 'audio' : 'other',
+      defaultDuration: null, defaultSize: null, defaultFlags: null, nextDts: 0,
+    };
+    self._tracks[id] = t;
+    if (!first) first = t;
+    if (!firstVideo && t.type === 'video') firstVideo = t;
+  });
+  var mvex = findBox(buf, moov.dataStart, moov.end, 'mvex');
+  if (mvex) {
+    findBoxes(buf, mvex.dataStart, mvex.end, 'trex').forEach(function (trex) {
+      var p = trex.dataStart + 4, t = self._tracks[readU32BE(buf, p)];
+      if (!t) return;
+      t.defaultDuration = readU32BE(buf, p + 8);
+      t.defaultSize = readU32BE(buf, p + 12);
+      t.defaultFlags = readU32BE(buf, p + 16);
     });
-
-    sampleOffset = end;
-    currentTime += sample.duration;
   }
+  if (firstVideo || first) this._timescale = (firstVideo || first).timescale;
 };
 
-// ── Box reading helpers ──
-
-FMP4Reader.prototype._tryReadInit = function () {
-  // Peek just 8 bytes to get ftyp size, then check moov
-  var hdr1 = this._q.peek(8);
-  if (!hdr1) return null;
-  if (toAscii(hdr1, 4, 8) !== 'ftyp') return null;
-  var ftypSize = readU32BE(hdr1, 0);
-  if (ftypSize === 1) {
-    var hdr1ext = this._q.peek(16);
-    if (!hdr1ext) return null;
-    ftypSize = readU32BE(hdr1ext, 8) * 0x100000000 + readU32BE(hdr1ext, 12);
-  }
-  if (ftypSize < 8 || this._q.length < ftypSize + 8) return null;
-
-  // Peek moov header at offset ftypSize
-  var buf2 = this._q.peek(ftypSize + 8);
-  if (!buf2) return null;
-  if (toAscii(buf2, ftypSize + 4, ftypSize + 8) !== 'moov') return null;
-  var moovSize = readU32BE(buf2, ftypSize);
-  if (moovSize === 1) {
-    var buf2ext = this._q.peek(ftypSize + 16);
-    if (!buf2ext) return null;
-    moovSize = readU32BE(buf2ext, ftypSize + 8) * 0x100000000 + readU32BE(buf2ext, ftypSize + 12);
-  }
-  if (moovSize < 8 || this._q.length < ftypSize + moovSize) return null;
-
-  return this._q.read(ftypSize + moovSize);
-};
-
-FMP4Reader.prototype._tryReadSegment = function () {
-  // Peek just 8 bytes to get moof size, then check mdat
-  var hdr1 = this._q.peek(8);
-  if (!hdr1) return null;
-  if (toAscii(hdr1, 4, 8) !== 'moof') return null;
-  var moofSize = readU32BE(hdr1, 0);
-  if (moofSize === 1) {
-    var hdr1ext = this._q.peek(16);
-    if (!hdr1ext) return null;
-    moofSize = readU32BE(hdr1ext, 8) * 0x100000000 + readU32BE(hdr1ext, 12);
-  }
-  if (moofSize < 8 || this._q.length < moofSize + 8) return null;
-
-  var buf2 = this._q.peek(moofSize + 8);
-  if (!buf2) return null;
-  if (toAscii(buf2, moofSize + 4, moofSize + 8) !== 'mdat') return null;
-  var mdatSize = readU32BE(buf2, moofSize);
-  if (mdatSize === 1) {
-    var buf2ext = this._q.peek(moofSize + 16);
-    if (!buf2ext) return null;
-    mdatSize = readU32BE(buf2ext, moofSize + 8) * 0x100000000 + readU32BE(buf2ext, moofSize + 12);
-  }
-  if (mdatSize < 8 || this._q.length < moofSize + mdatSize) return null;
-
-  return this._q.read(moofSize + mdatSize);
-};
-
-function _readBoxHeader(buf, off) {
-  if (off + 8 > buf.length) return null;
-  var size = readU32BE(buf, off);
-  var type = toAscii(buf, off + 4, off + 8);
-  if (size === 1) {
-    if (off + 16 > buf.length) return null;
-    size = readU32BE(buf, off + 8) * 0x100000000 + readU32BE(buf, off + 12);
-  }
-  if (size === 0 || off + size > buf.length) return null;
-  return { size: size, type: type };
-}
+// ── Media segment (moof + its mdat → individual frames) ──
 
 /**
- * Find a box by type within a range. Returns { start, end, dataStart } or null.
+ * Every traf of the moof, every trun of each traf (§8.8.4: one traf per
+ * track, any number of truns). Only the first traf and its first trun
+ * were read, so the other tracks of a muxed fragment were lost.
+ *
+ * Sample positions (§8.8.7, §8.8.8): base_data_offset when tfhd has it,
+ * else the moof's start (default-base-is-moof, or the first traf), else
+ * where the previous traf's data ended; a trun's data_offset is from that
+ * base, and a trun without one continues after the previous run.
  */
-function _findBox(buf, from, to, type) {
-  var off = from;
-  while (off + 8 <= to) {
-    var size = readU32BE(buf, off);
-    var t = toAscii(buf, off + 4, off + 8);
-    var headerSize = 8;
-    if (size === 1 && off + 16 <= to) {
-      size = readU32BE(buf, off + 8) * 0x100000000 + readU32BE(buf, off + 12);
-      headerSize = 16;
+FMP4Reader.prototype._parseMediaSegment = function (moofBuf, moofStart, mdat, mdatStart) {
+  var trafs = findBoxes(moofBuf, 8, moofBuf.length, 'traf');
+  if (!trafs.length) { this._ee.emit('segment', { payload: concat([moofBuf, mdat]) }); return; }
+  var prevEnd = moofStart, any = false;
+  for (var ti = 0; ti < trafs.length; ti++) {
+    var traf = trafs[ti];
+    var tfhdBox = findBox(moofBuf, traf.dataStart, traf.end, 'tfhd');
+    if (!tfhdBox) continue;
+    var tfhd = parseTfhd(moofBuf, tfhdBox);
+    var track = this._tracks[tfhd.trackId];
+    if (!track) {
+      // No moov seen (fed from a segment on): one video track, as before.
+      track = this._tracks[tfhd.trackId] = {
+        id: tfhd.trackId, type: 'video', timescale: this._timescale,
+        defaultDuration: null, defaultSize: null, defaultFlags: null, nextDts: 0,
+      };
     }
-    if (size < 8 || off + size > to) break;
-    if (t === type) return { start: off, end: off + size, dataStart: off + headerSize };
-    off += size;
+    var defaultDur   = _first(tfhd.defaultSampleDuration, track.defaultDuration, this._defaultSampleDuration);
+    var defaultSize  = _first(tfhd.defaultSampleSize, track.defaultSize, this._defaultSampleSize);
+    var defaultFlags = _first(tfhd.defaultSampleFlags, track.defaultFlags, 0);
+
+    var base = tfhd.baseDataOffset != null ? tfhd.baseDataOffset
+             : (tfhd.defaultBaseIsMoof || ti === 0) ? moofStart : prevEnd;
+
+    var tfdt = findBox(moofBuf, traf.dataStart, traf.end, 'tfdt');
+    var time = tfdt ? parseTfdt(moofBuf, tfdt) : track.nextDts;
+    var dataPos = base;
+
+    var truns = findBoxes(moofBuf, traf.dataStart, traf.end, 'trun');
+    for (var ri = 0; ri < truns.length; ri++) {
+      var trun = parseTrun(moofBuf, truns[ri]);
+      if (trun.dataOffset != null) dataPos = base + trun.dataOffset;
+      for (var i = 0; i < trun.samples.length; i++) {
+        var t = trun.samples[i];
+        // first_sample_flags stands in for the first sample's flags when the
+        // trun gives no per-sample ones (§8.8.8.1).
+        var flags = t.flags != null ? t.flags
+                  : (i === 0 && trun.firstSampleFlags != null ? trun.firstSampleFlags : defaultFlags);
+        var dur = t.duration != null ? t.duration : defaultDur;
+        var size = t.size != null ? t.size : defaultSize;
+        var at = dataPos - mdatStart;
+        dataPos += size;
+        var ptsUs = Math.round((time + t.compositionOffset) * 1e6 / track.timescale);
+        var dtsUs = Math.round(time * 1e6 / track.timescale);
+        var endUs = Math.round((time + dur) * 1e6 / track.timescale);
+        time += dur;
+        if (at < 0 || at + size > mdat.length) continue;   // not in this mdat
+        any = true;
+        if (track.type === 'other') continue;
+
+        // Keyframe from sample_flags — utils/iso_bmff isSyncSampleFlags
+        // (ISO/IEC 14496-12 §8.6.4.3): sample_depends_on 2 → I-frame, 1 →
+        // P/B-frame, 0 / 3 (unknown / reserved) → sample_is_non_sync_sample
+        // decides. (FFmpeg writes depends_on=0 for every sample, so the
+        // fallback is the common path — see the MP-30 history in git.)
+        // Audio samples are all sync samples whatever the flags say.
+        this._ee.emit(track.type, {
+          trackId: track.id,
+          payload: mdat.slice(at, at + size),
+          isKeyframe: track.type === 'audio' ? true : isSyncSampleFlags(flags),
+          ptsUs: ptsUs,
+          dtsUs: dtsUs,
+          durationUs: endUs - dtsUs,
+          duration: dur,
+        });
+      }
+    }
+    track.nextDts = time;
+    prevEnd = dataPos;
   }
-  return null;
-}
+  if (!any) this._ee.emit('segment', { payload: concat([moofBuf, mdat]) });
+};
+
+function _first(a, b, c) { return a != null ? a : b != null ? b : c; }
 
 export default FMP4Reader;

@@ -3,7 +3,9 @@
  * Validates input chunks, uses FrameQueue, single-write IVF headers.
  */
 
-import { initCoder, configureCoder, applyCoderPrototype } from './base_coder.js';
+import { frameByteSize } from './core/frame_size.js';
+import { initCoder, configureCoder, applyCoderPrototype, watchExit, detachCoderListeners,
+  addPendingFlush, removePendingFlush } from './base_coder.js';
 import { normalizeCodec } from './utils/codec_strings.js';
 import FrameQueue from './core/frame_queue.js';
 import { writeU16LE, writeU32LE, fromAscii } from './core/bytes.js';
@@ -37,6 +39,9 @@ function VideoDecoder(init) {
 }
 
 applyCoderPrototype(VideoDecoder, { role: 'decoder' });
+var _baseFlush = VideoDecoder.prototype.flush;
+var _baseReset = VideoDecoder.prototype.reset;
+var _baseClose = VideoDecoder.prototype.close;
 
 VideoDecoder.prototype.configure = function (config) {
   if (!config || !config.codec) throw new TypeError('VideoDecoder.configure: codec required');
@@ -70,6 +75,19 @@ VideoDecoder.prototype.configure = function (config) {
     ? bitstreamFromDescription(config.description ? toUint8Array(config.description) : null, vcodec === 'h265')
     : { lengthSize: 0, paramSets: null };
   if (bitstream.error) throw new TypeError('VideoDecoder.configure: ' + bitstream.error);
+  if (this._state === 'closed') configureCoder(this);   // throws InvalidStateError
+
+  // Reconfiguring while chunks are in flight, or while a previous
+  // reconfigure is still draining: queue it (see _drainThenConfigure).
+  if (this._draining) {
+    this._keyChunkRequired = true;
+    this._draining.items.push({ config: config });
+    return;
+  }
+  if (this._state === 'configured' && this._ffmpeg.running && this._inputQueue.length > 0) {
+    this._drainThenConfigure(config);
+    return;
+  }
 
   configureCoder(this);
   this._lengthSize = bitstream.lengthSize;      // >0: chunks are length-prefixed
@@ -88,7 +106,13 @@ VideoDecoder.prototype.configure = function (config) {
     // the old conservative one. Test test_real_ffmpeg_args.js caught
     // a bug where probesize stuck at 1MB because configure() defaulted
     // it before _startFFmpeg's `|| 32768` had a chance to apply.
-    probesize:        (config.probesize        != null) ? config.probesize        : 32768,
+    // 32 bytes, not 32 KB: FFmpeg reads probesize bytes of the stream
+    // before it decodes anything, and in realtime 32 KB is several
+    // frames (measured: the first H.264 frame at 640x480 came out after
+    // ~110 ms with 32 KB, ~45 ms with 32 — the cost of starting FFmpeg).
+    // The demuxer is always named with -f, so nothing is identified by
+    // probing; codec parameters come from the first packet.
+    probesize:        (config.probesize        != null) ? config.probesize        : 32,
     analyzeduration:  (config.analyzeduration  != null) ? config.analyzeduration  : 100000,
     threads:          (config.threads          != null) ? config.threads          : 0,
     // MP-9: track whether dimensions were caller-supplied. If yes, we
@@ -105,7 +129,7 @@ VideoDecoder.prototype.configure = function (config) {
   this._frameIndex = 0;
   this._decodeIndex = 0;
   this._inputQueue = [];                    // MP-23: clear per-session
-  this._bytesPerFrame = ((w * h * 3) >> 1);
+  this._bytesPerFrame = frameByteSize('I420', w, h);
   this._fq = null;
 
   this.context.state = 'configured';
@@ -113,6 +137,73 @@ VideoDecoder.prototype.configure = function (config) {
   this.context.width = w;
   this.context.height = h;
   this.context.frameCount = 0;
+};
+
+// configure() with chunks still in flight. W3C queues configure() behind
+// the decode() calls before it, so those chunks are decoded — and output
+// — with the configuration they were submitted under; Chrome's decoder
+// drains before it reconfigures. configureCoder() killed FFmpeg instead,
+// and every chunk in flight was lost: 10 chunks decoded back to back,
+// then a new render size, and only the 10 after it came out.
+//
+// The running FFmpeg gets end of input and finishes on its own, with its
+// run's state (frame queue, timestamps, output size) untouched. Until it
+// has exited, decode() and configure() calls are queued in order; then
+// the new configuration is applied and the queue replayed. 'close' comes
+// after every byte of its output has been delivered, so all of its
+// frames are out by then. A failed exit closes the coder (watchExit),
+// and the queue goes with it.
+VideoDecoder.prototype._drainThenConfigure = function (config) {
+  var self = this;
+  var old = this._ffmpeg;
+  var drain = this._draining = { old: old, items: [{ config: config }], flushes: [] };
+  this._keyChunkRequired = true;
+  old.on('close', function (code, signal) {
+    if (self._draining !== drain) return;          // reset()/close() discarded it
+    self._draining = null;
+    if (self._state !== 'configured') return;      // failCoder closed the coder
+    var items = drain.items;
+    for (var i = 0; i < items.length; i++) {
+      if (self._draining) { self._draining.items.push(items[i]); continue; }
+      try {
+        if (items[i].config) self.configure(items[i].config);
+        else self.decode(items[i].chunk);
+      } catch (e) {
+        self._error(e);
+        return;
+      }
+    }
+    var flushes = drain.flushes;
+    for (var j = 0; j < flushes.length; j++) flushes[j]();
+  });
+  old.endInput();
+};
+
+VideoDecoder.prototype.flush = function (cb) {
+  var self = this;
+  if (!this._draining) return _baseFlush.call(this, cb);
+  // Resolves after the queued chunks are out too: flush again once the
+  // drain has replayed them.
+  var p = new Promise(function (resolve, reject) {
+    var onFail = function (err) { reject(err); };
+    addPendingFlush(self, onFail);
+    self._draining.flushes.push(function () {
+      removePendingFlush(self, onFail);
+      self.flush().then(resolve, reject);
+    });
+  });
+  if (typeof cb === 'function') { p.then(function () { cb(); }, cb); return; }
+  return p;
+};
+
+VideoDecoder.prototype.reset = function () {
+  this._draining = null;
+  _baseReset.call(this);
+};
+
+VideoDecoder.prototype.close = function () {
+  this._draining = null;
+  _baseClose.call(this);
 };
 
 VideoDecoder.prototype.decode = function (chunk) {
@@ -149,6 +240,13 @@ VideoDecoder.prototype.decode = function (chunk) {
     throw inputErr;
   }
 
+  if (this._draining) {
+    // A reconfigure is draining: decoded after it, in order.
+    this._queueSize++;
+    this._draining.items.push({ chunk: chunk });
+    return;
+  }
+
   if (!this._ffmpeg.running) this._startFFmpeg();
 
   var containerName = getDefaultContainer(this._config.codec);
@@ -175,18 +273,28 @@ VideoDecoder.prototype.decode = function (chunk) {
     // H.264 / H.265 reach FFmpeg as Annex-B: convert length-prefixed
     // chunks, and put the parameter sets in front of the first key chunk.
     var data = this._lengthSize ? avccToAnnexb(chunk.data, this._lengthSize) : chunk.data;
-    if (!this._descriptionSent && this._paramSets && chunk.type === 'key') {
-      var ps = this._paramSets;
-      var combined = new Uint8Array(ps.length + data.length);
-      combined.set(ps, 0);
-      combined.set(data, ps.length);
-      this._queueSize++;
-      this._ffmpeg.write(combined);
-      this._descriptionSent = true;
-    } else {
-      this._queueSize++;
-      this._ffmpeg.write(data);
-    }
+    // Each chunk is written followed by an access unit delimiter, and a
+    // leading AUD of its own is dropped (the previous write already put
+    // one there). FFmpeg's Annex-B demuxer only knows an access unit is
+    // complete when it sees the start of the NEXT one, so every frame
+    // used to sit inside FFmpeg until the following chunk arrived — one
+    // frame of latency always, a whole frame interval of it (and on a
+    // still scene, where the encoder sends rarely, much more). The
+    // trailing AUD is that start, written right away; it is a legal
+    // first NAL unit of the next access unit (H.264 7.4.1.2.3, H.265
+    // 7.4.2.4.4), so the bitstream FFmpeg sees stays conforming.
+    var isHevc = this._config.codec === 'h265';
+    var body = _stripLeadingAud(data, isHevc);
+    var aud = isHevc ? HEVC_AUD : H264_AUD;
+    var ps = (!this._descriptionSent && this._paramSets && chunk.type === 'key') ? this._paramSets : null;
+    var psLen = ps ? ps.length : 0;
+    var combined = new Uint8Array(psLen + body.length + aud.length);
+    if (ps) combined.set(ps, 0);
+    combined.set(body, psLen);
+    combined.set(aud, psLen + body.length);
+    if (ps) this._descriptionSent = true;
+    this._queueSize++;
+    this._ffmpeg.write(combined);
   }
 
   // MP-23: track input timestamp so the output VideoFrame's timestamp
@@ -205,7 +313,10 @@ VideoDecoder.prototype.decode = function (chunk) {
   // discards the stalest entries — which are the ones already known to
   // be unmatched — and keeps the head of the queue aligned with the
   // frames actually arriving.
-  this._inputQueue.push(chunk.timestamp);
+  // {timestamp, duration}: the frame carries its chunk's duration (W3C);
+  // it was dropped.
+  this._inputQueue.push({ timestamp: chunk.timestamp,
+    duration: (typeof chunk.duration === 'number') ? chunk.duration : null });
   if (this._inputQueue.length > MAX_PENDING_TIMESTAMPS) {
     var overflow = this._inputQueue.length - MAX_PENDING_TIMESTAMPS;
     this._inputQueue.splice(0, overflow);
@@ -218,7 +329,40 @@ VideoDecoder.prototype.decode = function (chunk) {
 // discards entries that will never be matched to an output.
 var MAX_PENDING_TIMESTAMPS = 120;
 
+// Access unit delimiters (start code + NAL header + primary_pic_type
+// "any" + RBSP stop bit) — see decode().
+var H264_AUD = new Uint8Array([0, 0, 0, 1, 0x09, 0xF0]);
+var HEVC_AUD = new Uint8Array([0, 0, 0, 1, 0x46, 0x01, 0x50]);
+
+/** `data` without a leading AUD NAL unit (Annex-B), or `data` itself. */
+function _stripLeadingAud(data, isHevc) {
+  var sc = (data.length > 4 && data[0] === 0 && data[1] === 0)
+    ? (data[2] === 1 ? 3 : (data[2] === 0 && data[3] === 1 ? 4 : 0)) : 0;
+  if (!sc || sc >= data.length) return data;
+  var type = isHevc ? (data[sc] >> 1) & 0x3f : data[sc] & 0x1f;
+  if (type !== (isHevc ? 35 : 9)) return data;
+  for (var i = sc + 1; i + 2 < data.length; i++) {
+    if (data[i] === 0 && data[i + 1] === 0 && data[i + 2] === 1) {
+      // Keep a 4-byte start code's leading zero with the next NAL.
+      return data.subarray(i > 0 && data[i - 1] === 0 ? i - 1 : i);
+    }
+  }
+  return data.subarray(data.length); // the chunk was only an AUD
+}
+
 VideoDecoder.prototype._startFFmpeg = function () {
+  // One run's listeners at a time (see base_coder detachCoderListeners):
+  // after a flush() this starts a new run on the same process object.
+  detachCoderListeners(this._ffmpeg);
+  // A new run is a new FFmpeg input stream: it needs the IVF file header
+  // (VP8/VP9/AV1) and, for 'avc'/'hevc' input, the out-of-band parameter
+  // sets in front of its first key chunk — again. Both were reset only
+  // in configure(), so the first decode after a flush() fed the new
+  // FFmpeg IVF frames with no file header (or slices with no SPS/PPS):
+  // it failed to open its input and the decoder closed.
+  this._headerSent = false;
+  this._descriptionSent = false;
+  this._decodeIndex = 0;
   var self = this;
   var cfg = this._config;
   var containerName = getDefaultContainer(cfg.codec);
@@ -232,10 +376,10 @@ VideoDecoder.prototype._startFFmpeg = function () {
   //                    based on codec capabilities yields ~1.5-2x
   //                    throughput on multi-core hosts).
   //
-  //   -probesize 32K   Tiny probe (was: 1 MB). For WebRTC where the
-  //                    caller supplies the codec name explicitly via
-  //                    configure(), FFmpeg doesn't need to identify
-  //                    the codec by reading 1 MB first.
+  //   -probesize 32    Tiny probe (was: 1 MB, then 32 KB — see the
+  //                    default in configure). The caller names the
+  //                    codec in configure(), so FFmpeg doesn't need to
+  //                    identify it by reading ahead.
   //
   //   -analyzeduration 100K
   //                    Cap stream analysis to 100ms (was: 500ms). Going
@@ -275,7 +419,7 @@ VideoDecoder.prototype._startFFmpeg = function () {
     '-probesize', String(cfg.probesize),
     '-analyzeduration', String(cfg.analyzeduration),
     // No '-fflags nobuffer': it DISCARDS the packets read while probing
-    // the stream (up to -probesize, 32 KB here). That is the start of
+    // the stream (up to -probesize). That is the start of
     // the stream — including its first keyframe — so a small or
     // low-bitrate stream decoded to nothing, and a realtime one showed
     // nothing until the next keyframe (which 'realtime' mode only emits
@@ -318,10 +462,18 @@ VideoDecoder.prototype._startFFmpeg = function () {
     args.push('-vf', 'scale=' + cfg.width + ':' + cfg.height + ',format=yuv420p');
   }
 
-  // Use -vsync 0 as fallback for older FFmpeg (< 5.1 doesn't have -fps_mode)
-  args.push('-an', '-f', 'rawvideo', 'pipe:3');
+  // '-threads 1' here is the OUTPUT side: the rawvideo "encoder" that
+  // writes the decoded frames to pipe:3 supports frame threading, and
+  // with FFmpeg's default thread count it kept one frame in flight, so
+  // every decoded frame reached us only when the next one was decoded
+  // (measured on FFmpeg 8: 1 frame held for VP8/VP9/AV1 and raw input
+  // alike, 0 with this). Copying a raw frame needs no threads.
+  args.push('-an', '-threads', '1', '-f', 'rawvideo', 'pipe:3');
 
   self._ffmpeg.start(args, ['pipe', 'inherit', 'pipe', 'pipe']);
+  // FFmpeg failing (non-zero exit) closes this coder with an EncodingError
+  // — see base_coder's failCoder. It used to fail silently.
+  watchExit(self);
 
   // Output geometry actually in effect. In locked mode it is the
   // configured size; in auto mode it starts as a provisional guess and
@@ -339,9 +491,11 @@ VideoDecoder.prototype._startFFmpeg = function () {
     // mapping is 1:1 in order. If the queue is empty (FFmpeg emitted
     // a frame before any decode() — rare startup transient — fall
     // back to counter-based math).
-    var ts;
+    var ts, dur = null;
     if (self._inputQueue.length > 0) {
-      ts = self._inputQueue.shift();
+      var _in = self._inputQueue.shift();
+      ts = _in.timestamp;
+      dur = _in.duration;
     } else {
       ts = Math.round((self._frameIndex * 1e6) / (cfg.framerate || 30));
     }
@@ -351,6 +505,7 @@ VideoDecoder.prototype._startFFmpeg = function () {
       codedWidth: self._outWidth,
       codedHeight: self._outHeight,
       timestamp: ts,
+      duration: dur,
     });
     self._frameIndex++;
     self.context.frameCount = self._frameIndex;
@@ -426,7 +581,7 @@ VideoDecoder.prototype._applyStreamDimensions = function (w, h, source) {
   this._outWidth = w;
   this._outHeight = h;
   this._dimensionSource = source;
-  this._bytesPerFrame = ((w * h * 3) >> 1);
+  this._bytesPerFrame = frameByteSize('I420', w, h);
 
   this.context.width = w;
   this.context.height = h;
@@ -477,8 +632,16 @@ VideoDecoder.isConfigSupported = function (config) {
   // returned config against theirs to discover which members were
   // ignored (§7.3.2 note). Returning only `supported` removed the only
   // mechanism for detecting an unrecognised option.
+  // The codec STRING is normalised first ('avc1.42001f' → 'h264'), as
+  // configure() does. The container table knows only short names, so
+  // every WebCodecs codec string — avc1.*, vp09.*, av01.*, hvc1.* —
+  // was reported unsupported while configure() accepted it.
+  var supported = false;
+  try {
+    supported = !!(config && config.codec && getDefaultContainer(normalizeCodec(config.codec)));
+  } catch (e) { supported = false; }
   return Promise.resolve({
-    supported: !!getDefaultContainer(config.codec),
+    supported: supported,
     config: _cloneDecoderConfig(config),
   });
 };

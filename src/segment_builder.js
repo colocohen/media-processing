@@ -66,6 +66,11 @@ var _MAX_PRE_IDR_BUFFER = 200;
  * @param {Function} opts.onSegment        Called with segment info on each seal.
  * @param {number}  [opts.segmentDuration=6] Target duration in seconds.
  * @param {boolean} [opts.hasVideo=true]   Set false for audio-only streams.
+ * @param {number}  [opts.firstMediaSequence=0]  MSN of sequence 0 (for the
+ *                                         sequence-derived AES-128 IV).
+ *
+ * A segment whose encryption fails reaches onSegment with gap:true and
+ * bytes:null — list it as EXT-X-GAP, don't publish bytes for it.
  */
 function SegmentBuilder(opts) {
   if (!opts) opts = {};
@@ -86,6 +91,17 @@ function SegmentBuilder(opts) {
   // reach the caller through this instead of vanishing into the log.
   this._onError = opts.onError || null;
   this._segmentDurationUs = (opts.segmentDuration || 6) * 1000000;
+  // gridAligned: segments end at the first keyframe on or after each
+  // multiple of segmentDuration on the (shared, 0-based) timeline,
+  // instead of at the first keyframe segmentDuration after the segment
+  // started. HLSEncoder sets it when it forces the keyframes itself,
+  // on that same grid. With the elapsed-time rule, a rendition that
+  // joined a stream at 3 s cut its segments at 5 s, 7 s, … while the
+  // others cut at 4 s, 6 s, … — a player switching renditions lands
+  // mid-segment. On the grid every rendition cuts at the same points
+  // (the joiner's first segment is just shorter), and segment lengths
+  // no longer creep up by a frame per segment either.
+  this._gridAligned = !!opts.gridAligned;
   // Part duration in microseconds. 0 = LL-HLS disabled. The expected
   // value is in the 200ms–1s range; outside that range, players may
   // refuse the playlist (PART-TARGET upper bound is half the segment
@@ -123,6 +139,11 @@ function SegmentBuilder(opts) {
   // is in flight. Drain callbacks (registered by HLSEncoder.end) are
   // queued separately and fire when the encryption queue empties.
   this._encryption = opts.encryption || null;
+  // Media Sequence Number of sequence 0. The sequence-derived IV MUST be
+  // the segment's MSN in the playlist (RFC 8216 §5.2). Every sealed
+  // segment gets exactly one playlist entry — a segment whose encryption
+  // failed is listed as EXT-X-GAP, not dropped — so MSN = base + sequence.
+  this._firstMediaSequence = opts.firstMediaSequence || 0;
   this._pendingEncryptions = [];
   this._encryptionInProgress = false;
   this._drainCallbacks = [];
@@ -190,8 +211,8 @@ function SegmentBuilder(opts) {
   //
   // _partStartPtsUs:           PTS where the current part begins.
   //                            Resets to segment start at each new segment.
-  // _pendingPartEndPtsUs:      Set when chunks span >= partDuration; cleared
-  //                            when the part is sealed (audio caught up).
+  //                            Where the part ends is decided from the
+  //                            buffered chunks in _nextPartEnd.
   // _segmentPartByteOffsets[]: byte offsets for each part within the
   //                            current segment (for BYTERANGE attribute).
   // _segmentPartByteLengths[]: byte lengths matching the offsets array.
@@ -205,10 +226,11 @@ function SegmentBuilder(opts) {
   //                            IDR; gets set when a segment opens, cleared
   //                            after the first part emits.
   this._partStartPtsUs = null;
-  this._pendingPartEndPtsUs = null;
   this._segmentPartBytes = [];
   this._segmentParts = [];
   this._firstPartOfSegmentIndependent = false;
+  // True after disableAudio(): audio pushes are ignored.
+  this._audioDisabled = false;
   // Internal byte-offset cursor — mirrors sum of _segmentPartByteLengths
   // but kept as scalar to avoid an O(N) sum on every push.
   this._segmentByteCursor = 0;
@@ -284,8 +306,7 @@ SegmentBuilder.prototype.pushVideo = function (au, opts) {
   // _maybeSealPending() confirms audio has caught up.
   if (opts.isKey && this._videoBuf.length > 0 &&
       this._pendingBoundaryPtsUs === null) {
-    var elapsed = opts.ptsUs - this._segmentStartPtsUs;
-    if (elapsed >= this._segmentDurationUs) {
+    if (this._isBoundary(opts.ptsUs)) {
       this._pendingBoundaryPtsUs = opts.ptsUs;
     }
   }
@@ -300,17 +321,8 @@ SegmentBuilder.prototype.pushVideo = function (au, opts) {
     isKey: !!opts.isKey,
   });
 
-  // LL-HLS: detect a part boundary independently of segment boundaries.
-  // A part closes whenever the latest video PTS has advanced beyond
-  // the current part's start by at least partDuration. The actual
+  // LL-HLS: emit any part that is complete (see _nextPartEnd). The
   // split waits for audio to catch up — same flow as segment seal.
-  if (this._partDurationUs > 0 &&
-      this._pendingPartEndPtsUs === null &&
-      this._partStartPtsUs !== null &&
-      opts.ptsUs - this._partStartPtsUs >= this._partDurationUs) {
-    this._pendingPartEndPtsUs = opts.ptsUs;
-  }
-
   this._maybeEmitPart();
   this._maybeSealPending();
 };
@@ -328,6 +340,7 @@ SegmentBuilder.prototype.pushVideo = function (au, opts) {
  *                                       in audio-only mode.
  */
 SegmentBuilder.prototype.pushAudio = function (adts, opts) {
+  if (this._audioDisabled) return;
   // For mixed A+V streams, defer accepting audio into the main
   // buffer until video is anchored. Instead of dropping, we stash
   // pre-IDR audio so it can be replayed into segment 0 once the
@@ -369,12 +382,14 @@ SegmentBuilder.prototype.pushAudio = function (adts, opts) {
 
   // Audio-only flush trigger: time-based.
   if (!this._hasVideo) {
-    var elapsed = opts.ptsUs - this._segmentStartPtsUs;
     // canWriteInit defends the same way the mixed-A+V path does in
     // _maybeSealPending — defer if the writer hasn't received its
     // audio config yet (AAC needs description; Opus is always ready).
-    if (elapsed >= this._segmentDurationUs && this._audioBuf.length > 0 &&
+    if (this._isBoundary(opts.ptsUs) && this._audioBuf.length > 0 &&
         (!this._writer.canWriteInit || this._writer.canWriteInit())) {
+      // Parts that end before this boundary go out first, so the final
+      // part of the segment is never longer than PART-TARGET.
+      this._maybeEmitPart(opts.ptsUs, true);
       this._sealSegment(opts.ptsUs);
       this._segmentStartPtsUs = opts.ptsUs;
     }
@@ -386,16 +401,8 @@ SegmentBuilder.prototype.pushAudio = function (adts, opts) {
     durationUs: opts.durationUs || 0,
   });
 
-  // LL-HLS: same part-boundary detection as in pushVideo. For audio-
-  // only streams this is the only path that triggers parts; for mixed
-  // A+V it complements the video-driven detection.
-  if (this._partDurationUs > 0 &&
-      this._pendingPartEndPtsUs === null &&
-      this._partStartPtsUs !== null &&
-      opts.ptsUs - this._partStartPtsUs >= this._partDurationUs) {
-    this._pendingPartEndPtsUs = opts.ptsUs;
-  }
-
+  // LL-HLS: for audio-only streams audio frames define the parts; for
+  // mixed A+V this push may be the audio that a pending part waits for.
   this._maybeEmitPart();
   this._maybeSealPending();
 };
@@ -476,6 +483,7 @@ SegmentBuilder.prototype.flush = function () {
   // just discard whatever audio did arrive into the next segment.
   if (this._pendingBoundaryPtsUs !== null) {
     var boundary = this._pendingBoundaryPtsUs;
+    this._maybeEmitPart(boundary, true);
     var videoForSeg    = _spliceUpTo(this._videoBuf,    boundary);
     var audioForSeg    = _spliceUpTo(this._audioBuf,    boundary);
     var metadataForSeg = _spliceUpTo(this._metadataBuf, boundary);
@@ -520,7 +528,41 @@ SegmentBuilder.prototype.flush = function () {
     endPts = Math.max(endPts, this._videoBuf[0].ptsUs + 33333);
   }
 
+  // LL-HLS: cut the tail into parts first, so the final part is not
+  // everything since the last part (no more data is coming, so don't
+  // wait for audio).
+  this._maybeEmitPart(endPts, true);
   this._sealAtBoundary(endPts);
+};
+
+/**
+ * True while a segment boundary is waiting — for audio to catch up, or
+ * for the writer's codec configs (canWriteInit). HLSEncoder uses it to
+ * notice an audio track that never produced anything.
+ */
+SegmentBuilder.prototype.hasPendingBoundary = function () {
+  return this._pendingBoundaryPtsUs !== null;
+};
+
+/**
+ * Stop expecting audio: drop buffered audio, ignore later pushAudio()
+ * calls, and swap in `writer` (one built without an audio track). Only
+ * valid before the init segment has gone out — after that the track
+ * list is fixed. Then retries whatever was waiting on the audio.
+ *
+ * @param {object} writer  replacement writer with no audio track
+ */
+SegmentBuilder.prototype.disableAudio = function (writer) {
+  if (this._initEmitted) {
+    throw new Error('SegmentBuilder.disableAudio: init segment already written');
+  }
+  if (writer) this._writer = writer;
+  this._audioDisabled = true;
+  this._audioStarted = false;
+  this._audioBuf = [];
+  this._preIdrAudio = [];
+  this._maybeEmitPart();
+  this._maybeSealPending();
 };
 
 /**
@@ -540,7 +582,6 @@ SegmentBuilder.prototype.reset = function () {
   this._preIdrAudio = [];
   this._preIdrMetadata = [];
   this._partStartPtsUs = null;
-  this._pendingPartEndPtsUs = null;
   this._segmentPartBytes = [];
   this._segmentParts = [];
   this._firstPartOfSegmentIndependent = false;
@@ -594,6 +635,10 @@ SegmentBuilder.prototype._maybeSealPending = function () {
     if (n === 0 || this._audioBuf[n - 1].ptsUs < boundary) return;
   }
 
+  // Parts of this segment still owed go out before the seal; otherwise
+  // the final part would swallow them and exceed PART-TARGET.
+  this._maybeEmitPart();
+
   var videoForSeg = _spliceUpTo(this._videoBuf, boundary);
   var audioForSeg = _spliceUpTo(this._audioBuf, boundary);
   var metadataForSeg = _spliceUpTo(this._metadataBuf, boundary);
@@ -612,37 +657,91 @@ SegmentBuilder.prototype._maybeSealPending = function () {
 };
 
 /**
- * LL-HLS: emit a partial segment if one is ready. Mirrors the
+ * LL-HLS: emit every partial segment that is ready. Mirrors the
  * deferral logic of _maybeSealPending — wait for audio to catch up
  * before splicing — but operates inside an active segment without
  * needing an IDR. Each part is its own moof+mdat from the writer's
  * perspective, written into the same segment file (concatenated by
  * _emit at segment seal). The byte ranges are tracked here so the
  * playlist's EXT-X-PART entries can carry BYTERANGE attributes.
+ *
+ * @param {number}  [segEndPtsUs] end of the current segment, when known
+ *                                and not yet in _pendingBoundaryPtsUs
+ *                                (audio-only seal, flush tail)
+ * @param {boolean} [force]       don't wait for audio (end of stream /
+ *                                audio already past the boundary)
  */
-SegmentBuilder.prototype._maybeEmitPart = function () {
-  if (this._pendingPartEndPtsUs === null) return;
+SegmentBuilder.prototype._maybeEmitPart = function (segEndPtsUs, force) {
+  if (this._partDurationUs <= 0) return;
   if (this._writer.canWriteInit && !this._writer.canWriteInit()) return;
-
-  // Same audio-caught-up gate as the segment seal — without it the
-  // part would miss its share of audio frames, leaving an audible
-  // gap that compounds over many parts.
-  var partEnd = this._pendingPartEndPtsUs;
-  if (this._audioStarted) {
-    var n = this._audioBuf.length;
-    if (n === 0 || this._audioBuf[n - 1].ptsUs < partEnd) return;
+  var segEnd = (segEndPtsUs !== undefined && segEndPtsUs !== null) ?
+    segEndPtsUs : this._pendingBoundaryPtsUs;
+  for (;;) {
+    var partEnd = this._nextPartEnd(segEnd);
+    if (partEnd === null) return;
+    // Same audio-caught-up gate as the segment seal — without it the
+    // part would miss its share of audio frames, leaving an audible
+    // gap that compounds over many parts.
+    if (!force && this._audioStarted) {
+      var n = this._audioBuf.length;
+      if (n === 0 || this._audioBuf[n - 1].ptsUs < partEnd) return;
+    }
+    if (!this._emitPart(partEnd)) return;
   }
+};
 
+/**
+ * Where the current part ends, or null if it isn't complete yet.
+ *
+ * rfc8216bis §4.4.4.9: a part's duration MUST be <= PART-TARGET. The
+ * part used to end AT the first frame whose PTS reached the target, so
+ * it included that frame's predecessor interval and always overshot:
+ * PART-TARGET 0.250 at 30 fps gave every part 0.26667 s. Now a part ends
+ * at the latest frame start that keeps it within the target (0.23333 s
+ * at 30 fps), decided once a frame at or past the target shows the part
+ * can't grow any more.
+ *
+ * Video frames define part edges in A+V streams (a part never splits a
+ * frame); audio frames in audio-only streams. A part never crosses the
+ * segment end; the rest of a segment that fits in PART-TARGET becomes
+ * the final part at seal time.
+ */
+SegmentBuilder.prototype._nextPartEnd = function (segEnd) {
+  var start = this._partStartPtsUs;
+  if (start === null) return null;
+  var limit = start + this._partDurationUs;
+  if (segEnd !== null && segEnd !== undefined && segEnd <= limit) return null;
+  var buf = this._hasVideo ? this._videoBuf : this._audioBuf;
+  var best = null;        // latest chunk start in (start, limit]
+  var firstAfter = null;  // first chunk start > limit
+  for (var i = 0; i < buf.length; i++) {
+    var p = buf[i].ptsUs;
+    if (segEnd !== null && segEnd !== undefined && p >= segEnd) break;
+    if (p <= start) continue;
+    if (p > limit) { firstAfter = p; break; }
+    best = p;
+  }
+  // Complete once something at/after the target exists: a chunk at
+  // exactly the limit, a chunk past it, or the known segment end.
+  var reached = (best === limit) || firstAfter !== null ||
+                (segEnd !== null && segEnd !== undefined);
+  if (!reached) return null;
+  if (best !== null) return best;
+  // A single frame longer than PART-TARGET: the part can't be shorter
+  // than it. Only reachable with frame intervals > PART-TARGET.
+  return firstAfter;
+};
+
+/** Write one part ending at partEnd. Returns false if nothing to write. */
+SegmentBuilder.prototype._emitPart = function (partEnd) {
   var videoForPart    = _spliceUpTo(this._videoBuf,    partEnd);
   var audioForPart    = _spliceUpTo(this._audioBuf,    partEnd);
   var metadataForPart = _spliceUpTo(this._metadataBuf, partEnd);
 
-  // No chunks at all → nothing to write. Can happen if pushVideo
-  // detected a part boundary but the in-buffer chunks were already
-  // consumed by an earlier seal in the same call chain.
+  // No chunks at all → nothing to write (defensive: _nextPartEnd only
+  // returns a PTS that a buffered chunk starts at).
   if (videoForPart.length === 0 && audioForPart.length === 0) {
-    this._pendingPartEndPtsUs = null;
-    return;
+    return false;
   }
 
   // The first init-segment must go out before any part. Only emits
@@ -678,9 +777,9 @@ SegmentBuilder.prototype._maybeEmitPart = function () {
   this._segmentParts.push(partInfo);
   this._firstPartOfSegmentIndependent = false;
   this._partStartPtsUs = partEnd;
-  this._pendingPartEndPtsUs = null;
 
   this._onPart(partInfo);
+  return true;
 };
 
 /**
@@ -689,10 +788,17 @@ SegmentBuilder.prototype._maybeEmitPart = function () {
  * boundary. Used after a seal to handle cases where multiple
  * boundaries queued up in the buffer at once.
  */
+/** Does a segment that started at _segmentStartPtsUs end at ptsUs? */
+SegmentBuilder.prototype._isBoundary = function (ptsUs) {
+  var d = this._segmentDurationUs;
+  if (this._gridAligned) return Math.floor(ptsUs / d) > Math.floor(this._segmentStartPtsUs / d);
+  return ptsUs - this._segmentStartPtsUs >= d;
+};
+
 SegmentBuilder.prototype._maybeDetectNewBoundary = function () {
   for (var i = 1; i < this._videoBuf.length; i++) {
     var c = this._videoBuf[i];
-    if (c.isKey && (c.ptsUs - this._segmentStartPtsUs) >= this._segmentDurationUs) {
+    if (c.isKey && this._isBoundary(c.ptsUs)) {
       this._pendingBoundaryPtsUs = c.ptsUs;
       this._maybeSealPending();
       return;
@@ -840,7 +946,11 @@ SegmentBuilder.prototype._emit = function (videoChunks, audioChunks, metadataChu
     // The I-frame byterange covers exactly the first fragment.
     var keyframeOnly = [videoChunks[0]];
     var restVideo    = videoChunks.slice(1);
-    var bytes1 = w.writeSegment(keyframeOnly, [], endPtsUs, []);
+    // The keyframe-only fragment ends where the next frame starts. It
+    // was given the SEGMENT end, so the writer stretched the IDR's
+    // sample duration to the whole segment (2.0 s) and the first
+    // fragment overlapped the second one's timeline.
+    var bytes1 = w.writeSegment(keyframeOnly, [], restVideo[0].ptsUs, []);
     var bytes2 = w.writeSegment(restVideo, audioChunks, endPtsUs, metadataChunks);
     bytes = concat([bytes1, bytes2]);
     iFrameRange = {
@@ -895,7 +1005,12 @@ SegmentBuilder.prototype._processEncryptionQueue = function () {
   // terminally failed, in which case fall through so drain subscribers
   // fire and anyone blocked on end() is released.
   if (!this._encryption.encryptor && !this._encryption.failed) return;
-  if (this._encryption.failed) this._pendingEncryptions = [];
+  if (this._encryption.failed) {
+    // Key import failed: anything sealed since becomes a gap too.
+    var late = this._pendingEncryptions;
+    this._pendingEncryptions = [];
+    for (var li = 0; li < late.length; li++) this._emitGap(late[li]);
+  }
   if (this._pendingEncryptions.length === 0) {
     // Queue is empty — fire all drain subscribers and clear the list.
     if (this._drainCallbacks.length > 0) {
@@ -918,21 +1033,26 @@ SegmentBuilder.prototype._processEncryptionQueue = function () {
   // IV: explicit (constant for all segments) or derived from sequence
   // number (different IV per segment, matches the no-IV-attribute case
   // in EXT-X-KEY).
-  var iv = enc.iv || ivFromSequence(info.sequence);
+  // The sequence-derived IV is the segment's Media Sequence Number.
+  var iv = enc.iv || ivFromSequence(this._firstMediaSequence + info.sequence);
   var self = this;
   enc.encryptor.encrypt(info.bytes, iv, function (err, ciphertext) {
     self._encryptionInProgress = false;
     if (err) {
-      // Skip the segment — one bad segment shouldn't halt the stream,
-      // so 'segment' simply doesn't fire for this sequence.
-      //
-      // But report it. This used to console.error and nothing else, so
-      // a stream could silently drop segments while the caller saw a
-      // healthy-looking playlist with a hole in it.
+      // One bad segment shouldn't halt the stream — but it must keep
+      // its place in the timeline. It used to be dropped outright: the
+      // playlist then renumbered every later segment (seg2.ts listed at
+      // MSN 1) while each had been encrypted with IV = its own sequence
+      // (2), so a player — which derives the IV from the MSN — decrypted
+      // every following segment with the wrong IV, and the media
+      // timeline jumped with no EXT-X-DISCONTINUITY. Now the segment is
+      // delivered as a gap (no bytes), which the playlist lists as
+      // EXT-X-GAP: MSNs and IVs stay aligned and players skip over it.
       self._reportError(new Error(
         'SegmentBuilder: segment encryption failed for sequence=' +
         info.sequence + ': ' + ((err && err.message) || err)
       ));
+      self._emitGap(info);
     } else {
       info.bytes = ciphertext;
       self._onSegment(info);
@@ -940,6 +1060,19 @@ SegmentBuilder.prototype._processEncryptionQueue = function () {
     // Process next regardless of error so the queue keeps moving.
     self._processEncryptionQueue();
   });
+};
+
+/**
+ * Deliver a segment that has no usable bytes (encryption failed) as a
+ * gap: info.gap = true, info.bytes = null. The listener lists it with
+ * EXT-X-GAP so the segment keeps its Media Sequence Number and duration.
+ */
+SegmentBuilder.prototype._emitGap = function (info) {
+  info.bytes = null;
+  info.gap = true;
+  if (info.parts) info.parts = null;
+  if (info.iFrame) info.iFrame = null;
+  this._onSegment(info);
 };
 
 /** Report a non-fatal problem to the caller, falling back to the console. */
@@ -975,6 +1108,7 @@ SegmentBuilder.prototype.failEncryption = function (err) {
       'SegmentBuilder: dropping segment sequence=' + dropped[i].sequence +
       ' — encryption unavailable: ' + this._encryption.failed.message
     ));
+    this._emitGap(dropped[i]);   // keep the timeline, see _processEncryptionQueue
   }
   this._encryptionInProgress = false;
   this._processEncryptionQueue();

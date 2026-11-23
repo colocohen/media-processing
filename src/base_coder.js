@@ -30,7 +30,10 @@ function initCoder(self, init) {
   // Decrement here, in the per-frame output path; the FFmpeg-data handler in
   // wireReader no longer touches _queueSize.
   self._output = function (chunk, metadata) {
-    if (self._queueSize > 0) self._queueSize--;
+    // A coder whose outputs do not map one-to-one to its inputs (the
+    // AudioDecoder: 10 ms outputs from 20 ms packets) sets _queueByInput
+    // and decrements per input consumed instead.
+    if (!self._queueByInput && self._queueSize > 0) self._queueSize--;
     self._stats.outputCount++;
     userOutput(chunk, metadata);
     // W3C WebCodecs fires a plain Event named "dequeue" on the codec.
@@ -70,6 +73,22 @@ function initCoder(self, init) {
   self._flushTimeout = (init && init.flushTimeout) || FLUSH_TIMEOUT;
 }
 
+/**
+ * Detach every listener a coder puts on its FFmpegProcess. The process
+ * object outlives the FFmpeg runs it hosts — each flush() ends a run, and
+ * the next decode()/encode() starts another on the same object — and each
+ * _startFFmpeg() attaches its listeners afresh. Only 'data', 'error' and
+ * 'close' were ever removed (and only on configure/close/reset, never
+ * between runs), so after N flushes a decoder had N 'data' (video) or
+ * 'stdout' (audio) listeners all feeding the same frame queue: every
+ * frame came out N times (3, 6, 9, 12 for a 3-frame clip), and the
+ * stale 'ffmpeg:log' size watchers and exit watchers piled up alongside.
+ */
+var CODER_EVENTS = ['data', 'stdout', 'error', 'close', 'ffmpeg:log', 'ffmpeg:warning'];
+function detachCoderListeners(ffmpeg) {
+  for (var i = 0; i < CODER_EVENTS.length; i++) ffmpeg.removeAllListeners(CODER_EVENTS[i]);
+}
+
 function configureCoder(self) {
   // W3C WebCodecs: if [[state]] is "closed", configure() throws
   // InvalidStateError DOMException. The previous behavior silently
@@ -80,9 +99,7 @@ function configureCoder(self) {
   }
   if (self._state === 'configured') {
     self._ffmpeg.stop();
-    self._ffmpeg.removeAllListeners('data');
-    self._ffmpeg.removeAllListeners('error');
-    self._ffmpeg.removeAllListeners('close');
+    detachCoderListeners(self._ffmpeg);
     self._reader = null;
   }
   self._state = 'configured';
@@ -91,9 +108,77 @@ function configureCoder(self) {
 
 var FLUSH_TIMEOUT = 10000;
 
+// ── FFmpeg failing is a codec error ──
+//
+// FFmpeg exiting on its own with a non-zero code (or killed by a signal)
+// means the codec is gone: the encoder failed to open (libx265 refusing
+// more than 16 frame threads, an unsupported profile, ...), or it died
+// mid-stream. Nothing listened for that. The coder stayed 'configured';
+// the next encode()/decode() saw `!running` and spawned a fresh FFmpeg,
+// which failed the same way — one doomed process per frame — the queue
+// size grew forever, flush() RESOLVED as if every frame had come out,
+// and the error callback was never called. A caller had no way to learn
+// that not one chunk would ever be produced.
+//
+// W3C WebCodecs: an encoding/decoding failure runs "close VideoEncoder
+// (VideoDecoder, ...) with an EncodingError" — pending flush() promises
+// are rejected with it, [[state]] becomes "closed" (so further encode()
+// throws InvalidStateError instead of respawning), and the error
+// callback is invoked with it. failCoder() is that algorithm.
+
+/** The EncodingError for an FFmpeg exit, or null for a clean one (code 0). */
+function exitError(code, signal, ffmpeg) {
+  if (code === 0 && !signal) return null;
+  var why = (ffmpeg && ffmpeg.lastError) || '';
+  return _domex('FFmpeg exited ' + (signal ? 'on signal ' + signal : 'with code ' + code) +
+                (why ? ': ' + why : ''), 'EncodingError');
+}
+
+// Pending flush() completions. Each is fn(err): err rejects that flush.
+function addPendingFlush(self, fn) {
+  (self._pendingFlushes = self._pendingFlushes || []).push(fn);
+}
+function removePendingFlush(self, fn) {
+  var a = self._pendingFlushes;
+  if (!a) return;
+  var i = a.indexOf(fn);
+  if (i >= 0) a.splice(i, 1);
+}
+function rejectPendingFlushes(self, err) {
+  var a = self._pendingFlushes;
+  self._pendingFlushes = [];
+  for (var i = 0; a && i < a.length; i++) {
+    try { a[i](err); } catch (e) {}
+  }
+}
+
+/** InvalidStateError for a call that needs [[state]] "configured", else null. */
+function notConfiguredError(self, what) {
+  if (self._state === 'configured') return null;
+  return _domex(what + '() needs state "configured", not "' + self._state + '"', 'InvalidStateError');
+}
+
+/** "Close the codec with `err`" — see the block above. Idempotent. */
+function failCoder(self, err) {
+  if (self._state === 'closed') return;
+  self._fatalError = err;
+  rejectPendingFlushes(self, err);
+  self.close();   // the coder's own close(): stops every FFmpeg it owns
+  self._error(err);
+}
+
+/** Watch the current FFmpeg for exiting on its own with a failure. */
+function watchExit(self) {
+  var ffmpeg = self._ffmpeg;
+  ffmpeg.on('close', function (code, signal) {
+    var err = exitError(code, signal, ffmpeg);
+    if (err) failCoder(self, err);
+  });
+}
+
 /**
- * Flush: end FFmpeg stdin, wait for ALL output data, then complete.
- * Uses 'output_end' event (pipe:3 EOF) = deterministic "all data received".
+ * Flush: end FFmpeg stdin, wait for FFmpeg to exit, then complete —
+ * resolved on a clean exit, rejected (failCoder) on a failed one.
  * Timeout kills hung processes.
  */
 function flushCoder(self, cb) {
@@ -119,10 +204,12 @@ function flushCoder(self, cb) {
       self._ffmpeg.off('close', onClose);
     }
 
-    function finish(stopProcess) {
+    function finish(stopProcess, err) {
       if (done) return;
       done = true;
       cleanup();
+      removePendingFlush(self, onFail);
+      if (err) { if (cb) cb(err); return; }   // rejected: state is failCoder's/close()'s
       if (stopProcess) self._ffmpeg.stop();
       self._state = 'configured';
       self._queueSize = 0;
@@ -135,9 +222,18 @@ function flushCoder(self, cb) {
 
     // output_end = pipe:3 EOF, stdout_end = pipe:1 EOF (audio decoder),
     // close = fallback when neither pipe exists (raw passthrough).
-    function onEnd()    { finish(false); }
-    function onStdEnd() { finish(false); }
-    function onClose()  { finish(false); }
+    // The flush completes on 'close', which carries the exit code — not on
+    // output_end/stdout_end (the output pipe's EOF), which come FIRST:
+    // FFmpeg failing at the end of input closed the pipe, the flush
+    // resolved, and only then did the exit code say nothing had been
+    // encoded. Node emits 'close' after every stdio stream has closed, so
+    // all output has been delivered by then. A failed exit is failCoder's
+    // (watchExit): it rejects this flush via onFail.
+    function onEnd()    { /* wait for 'close' and its exit code */ }
+    function onStdEnd() { /* wait for 'close' and its exit code */ }
+    function onClose(code, signal) { if (!exitError(code, signal)) finish(false); }
+    function onFail(err) { finish(false, err); }
+    addPendingFlush(self, onFail);
 
     timer = setTimeout(function () { finish(true); }, self._flushTimeout || FLUSH_TIMEOUT);
 
@@ -151,21 +247,25 @@ function flushCoder(self, cb) {
   if (cb) cb();
 }
 
+// W3C: close() and reset() reject a pending flush() with an AbortError.
+// They used to drop its listeners and leave it hanging until the flush
+// timeout — which then resolved it and set [[state]] back to
+// 'configured' on a closed coder.
+function _abortError() { return _domex('Aborted due to close() or reset()', 'AbortError'); }
+
 function closeCoder(self) {
+  rejectPendingFlushes(self, _abortError());
   self._ffmpeg.stop();
-  self._ffmpeg.removeAllListeners('data');
-  self._ffmpeg.removeAllListeners('error');
-  self._ffmpeg.removeAllListeners('close');
+  detachCoderListeners(self._ffmpeg);
   self._reader = null;
   self._state = 'closed';
   self._queueSize = 0;
 }
 
 function resetCoder(self) {
+  rejectPendingFlushes(self, _abortError());
   self._ffmpeg.stop();
-  self._ffmpeg.removeAllListeners('data');
-  self._ffmpeg.removeAllListeners('error');
-  self._ffmpeg.removeAllListeners('close');
+  detachCoderListeners(self._ffmpeg);
   self._reader = null;
   self._state = 'unconfigured';
   self._config = null;
@@ -224,11 +324,21 @@ function applyCoderPrototype(Ctor, options) {
   // flush: returns Promise if no callback, or uses callback
   Ctor.prototype.flush = function (cb) {
     var self = this;
+    // W3C: flush() on a coder that is not "configured" rejects with an
+    // InvalidStateError. It resolved — on a closed coder too, so after
+    // failCoder had closed it a later flush() reported success.
+    var stateErr = notConfiguredError(self, 'flush');
+    if (stateErr) {
+      if (typeof cb === 'function') { cb(stateErr); return; }
+      return Promise.reject(stateErr);
+    }
     if (typeof cb === 'function') {
-      flushCoder(self, cb);
+      flushCoder(self, cb);   // cb(err): err set when the flush was rejected
       return;
     }
-    return new Promise(function (resolve) { flushCoder(self, resolve); });
+    return new Promise(function (resolve, reject) {
+      flushCoder(self, function (err) { if (err) reject(err); else resolve(); });
+    });
   };
 
   Ctor.prototype.close = function () { closeCoder(this); this.context.state = 'closed'; };
@@ -302,4 +412,7 @@ function applyCoderPrototype(Ctor, options) {
   });
 }
 
-export { initCoder, configureCoder, flushCoder, closeCoder, resetCoder, wireReader, applyCoderPrototype };
+export {
+  initCoder, configureCoder, flushCoder, closeCoder, resetCoder, wireReader, applyCoderPrototype,
+  exitError, failCoder, watchExit, detachCoderListeners, notConfiguredError, addPendingFlush, removePendingFlush, rejectPendingFlushes,
+};

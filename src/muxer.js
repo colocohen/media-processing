@@ -3,164 +3,266 @@
  *
  * Usage:
  *   var muxer = new Muxer({
- *     file: 'output.mp4',
+ *     file: 'output.mp4',             // or `output:` (alias); omit for a stream
  *     video: { codec: 'h264', width: 1920, height: 1080, framerate: 30 },
  *     audio: { codec: 'aac', sampleRate: 48000, channels: 2 },
  *   });
- *   muxer.addVideoChunk(encodedVideoChunk);
- *   muxer.addAudioChunk(encodedAudioChunk);
+ *   muxer.addVideoChunk(encodedVideoChunk, metadata);
+ *   muxer.addAudioChunk(encodedAudioChunk, metadata);
  *   muxer.finalize(function () {
  *     // Container trailer written; the output file is complete.
  *   });
  *
  * finalize() also returns a Promise when no callback is given.
  *
- * Video is fed through stdin (pipe:0), audio through pipe:3.
- * FFmpeg muxes them into the output container.
+ * Without `file` the container is streamed: 'data' events carry the
+ * bytes, 'end' follows the last of them (an MP4 is then written
+ * fragmented, the only MP4 a pipe can carry; opts.fragmentDuration in
+ * µs sets the fragment length; opts.outputArgs adds FFmpeg muxer options).
+ * 'error' reports an FFmpeg failure.
  *
- * Chunks are taken exactly as WebCodecs encoders emit them (browser or
- * this library's Node encoders) and framed for FFmpeg's raw demuxers:
+ * Every track reaches FFmpeg as its own Matroska stream (MKVWriter),
+ * which carries each chunk's timestamp, and FFmpeg copies the packets
+ * into the output container (-c copy -copyts). Chunks are taken exactly
+ * as WebCodecs encoders emit them (browser or this library's Node
+ * encoders):
  *
- *   H.264 / H.265   → Annex-B (length-prefixed chunks converted, the
- *                     description's parameter sets put before key chunks)
- *   VP8 / VP9 / AV1 → IVF (IVFWriter header + one record per chunk)
- *   AAC             → ADTS (raw chunks get a header built from the
- *                     description's AudioSpecificConfig)
- *   Opus            → OGG (OggWriter headers + one page per packet)
+ *   H.264 / H.265   avcC / hvcC description → length-prefixed chunks as
+ *                   they are; no description → Annex-B chunks, the
+ *                   record built from the first key chunk's SPS/PPS
+ *   VP8 / VP9 / AV1 chunks as they are
+ *   AAC             AudioSpecificConfig from the description (or from
+ *                   the ADTS header / the config); ADTS headers stripped
+ *   Opus            the encoder's OpusHead (description) verbatim
+ *   MP3 / FLAC      as they are (FLAC: description = 'fLaC' + STREAMINFO)
+ *
+ * Other audio codecs (G.711, Vorbis) go through FFmpeg's raw demuxers
+ * as before — timed by sample count.
+ *
+ * Before: H.264/H.265 went in as raw Annex-B read at a constant frame
+ * rate, AAC as ADTS and Opus as Ogg, both timed by sample count. Chunk
+ * timestamps were thrown away: a 1 s gap in the video (frames dropped,
+ * capture paused) came out as no gap at all, so the video ran 1 s ahead
+ * of the audio from that point on.
  *
  * Pass each chunk's metadata along (addVideoChunk(chunk, metadata)): the
  * first one carries decoderConfig.description, which decides the form.
+ *
+ * FFmpeg starts once every configured track has delivered its first
+ * usable chunk (each input's header needs it); chunks before that are
+ * held. A track that never delivers anything is left out at finalize().
  */
 
 import FFmpegProcess from './ffmpeg_process.js';
 import EventEmitter from './core/events.js';
 import { normalizeCodec } from './utils/codec_strings.js';
-import { avccToAnnexb, bitstreamFromDescription } from './utils/nalu_utils.js';
-import { adtsHeaderLength, parseAudioSpecificConfig, wrapAdtsWithConfig } from './utils/aac_utils.js';
+import {
+  parseAvcC, parseHvcC, detectFormat, annexbToAvcc,
+  buildAvcCFromAnnexB, buildHvcCFromAnnexB,
+} from './utils/nalu_utils.js';
+import {
+  adtsHeaderLength, stripAdts, parseAudioSpecificConfig,
+  audioSpecificConfigFromAdts, buildAudioSpecificConfig,
+} from './utils/aac_utils.js';
+import { buildOpusHead, parseOpusHead } from './utils/opus_utils.js';
 import { toUint8Array } from './core/buffer_source.js';
-import IVFWriter from './writer_ivf.js';
-import OggWriter from './writer_ogg.js';
+import MKVWriter from './writer_mkv.js';
 
 var FORMAT_MAP = {
   '.mp4': 'mp4', '.m4v': 'mp4', '.m4a': 'mp4',
   '.webm': 'webm', '.mkv': 'matroska', '.mka': 'matroska',
-  '.ogg': 'ogg', '.avi': 'avi', '.ts': 'mpegts',
+  '.ogg': 'ogg', '.opus': 'ogg', '.avi': 'avi', '.ts': 'mpegts',
 };
 
-// Input format flag for FFmpeg based on codec
-var VIDEO_INPUT_FMT = {
-  h264: 'h264', h265: 'hevc', vp8: 'ivf', vp9: 'ivf', av1: 'ivf',
+var MKV_VIDEO_CODEC = {
+  h264: 'V_MPEG4/ISO/AVC', h265: 'V_MPEGH/ISO/HEVC',
+  vp8: 'V_VP8', vp9: 'V_VP9', av1: 'V_AV1',
 };
-// FFmpeg's ADTS demuxer is named 'aac' — there is no 'adts' demuxer
-// ('adts' is only a muxer), so '-f adts' made every AAC mux fail.
+
+// Audio codecs without a Matroska mapping here: FFmpeg's raw demuxers.
+// Its ADTS demuxer is named 'aac' — there is no 'adts' demuxer.
 var AUDIO_INPUT_FMT = {
-  aac: 'aac', opus: 'ogg', vorbis: 'ogg', mp3: 'mp3', flac: 'flac',
+  vorbis: 'ogg',
   alaw: 'alaw', ulaw: 'mulaw', 'g711-alaw': 'alaw', 'g711-ulaw': 'mulaw',
 };
 
 function Muxer(opts) {
   if (!opts) opts = {};
   this._ee = new EventEmitter();
-  this._file = opts.file || null;
-  this._format = opts.format || _guessFormat(opts.file);
+  // `output` is accepted as an alias: MediaRecorder passed {output} and
+  // the Muxer read only `file`, so no file was ever written (FFmpeg
+  // streamed the recording into a stdout nobody read).
+  this._file = opts.file || (typeof opts.output === 'string' ? opts.output : null);
+  this._format = opts.format || _guessFormat(this._file);
+  this._fragmentDurationUs = opts.fragmentDuration || 0;
+  this._outputArgs = opts.outputArgs || [];   // extra FFmpeg muxer options
   this._video = opts.video || null;
   this._audio = opts.audio || null;
   this._ffmpeg = new FFmpegProcess(opts);
-  this._started = false;
+  this._started = false;      // FFmpeg spawned
   this._proc = null;
+  this._finalizing = false;
+  this._stopped = false;      // close() / timeout kill: no 'error' for that exit
+  this._tsBias = null;        // µs added to every timestamp (Cluster timestamps are unsigned)
+  this._tracks = {
+    video: this._video ? _newTrack('video', this._video) : null,
+    audio: this._audio ? _newTrack('audio', this._audio) : null,
+  };
+}
+
+function _newTrack(kind, cfg) {
+  return {
+    kind: kind,
+    codec: normalizeCodec(cfg.codec || (kind === 'video' ? 'h264' : 'aac')),
+    cfg: cfg,
+    raw: false,          // true: fed to a raw FFmpeg demuxer, not Matroska
+    header: null,        // first bytes of this track's input (null = not ready)
+    pending: [],         // input bytes held until FFmpeg starts
+    pipe: -1,            // stdio index once started; -1 = not an input
+    mkv: null,
+  };
 }
 
 Muxer.prototype.on = function (ev, fn) { this._ee.on(ev, fn); };
 Muxer.prototype.off = function (ev, fn) { this._ee.off(ev, fn); };
 
 /**
- * Add an EncodedVideoChunk. For H.264 / H.265 pass the encoder's
- * metadata too: its decoderConfig.description says whether the chunks
- * are length-prefixed ('avc'/'hevc', the WebCodecs default) or Annex-B.
- * FFmpeg reads raw H.264/H.265 as Annex-B, so length-prefixed chunks are
- * converted and the parameter sets are put in front of every key chunk.
+ * Add an EncodedVideoChunk (pass its metadata too — see the header).
  */
 Muxer.prototype.addVideoChunk = function (chunk, metadata) {
-  if (!this._started) this._start();
-  if (!chunk.data) return;
-  var codec = normalizeCodec((this._video && this._video.codec) || 'h264');
-  if (codec === 'vp8' || codec === 'vp9' || codec === 'av1') {
-    // Raw frames → IVF records (the ivf demuxer needs the framing).
-    if (!this._ivf) {
-      this._ivf = new IVFWriter({ codec: codec, width: this._video.width || 0, height: this._video.height || 0 });
-      this._ffmpeg.write(this._ivf.writeHeader());
-    }
-    this._ffmpeg.write(this._ivf.writeFrame(chunk.data, chunk.timestamp));
-    return;
-  }
-  if (codec !== 'h264' && codec !== 'h265') { this._ffmpeg.write(chunk.data); return; }
-
+  var st = this._tracks.video;
+  if (!st || this._finalizing) return;
+  var data = _chunkBytes(chunk);
+  if (!data) return;
   var dc = metadata && metadata.decoderConfig;
-  if (dc && dc.description) {
-    var bs = bitstreamFromDescription(toUint8Array(dc.description), codec === 'h265');
-    if (bs.error) { this._ee.emit('error', new Error('Muxer: ' + bs.error)); return; }
-    this._videoBitstream = bs;
+  var isH26x = st.codec === 'h264' || st.codec === 'h265';
+  var isH265 = st.codec === 'h265';
+
+  if (!st.header) {
+    if (!MKV_VIDEO_CODEC[st.codec]) {
+      this._ee.emit('error', new Error('Muxer: unsupported video codec ' + st.codec));
+      return;
+    }
+    var priv = null;
+    if (isH26x) {
+      var desc = (dc && dc.description) ? toUint8Array(dc.description) : null;
+      if (desc && desc.length) {
+        if (isH265 ? parseHvcC(desc) : parseAvcC(desc)) {
+          priv = desc;                         // chunks are length-prefixed
+        } else if (detectFormat(desc) === 'annexb') {
+          // Not a spec form (older code here put Annex-B parameter sets
+          // in the description): chunks are Annex-B.
+          priv = isH265 ? buildHvcCFromAnnexB(desc) : buildAvcCFromAnnexB(desc);
+          st.annexb = true;
+        } else {
+          this._ee.emit('error', new Error('Muxer: description is not a valid ' + (isH265 ? 'hvcC' : 'avcC') + ' record'));
+          return;
+        }
+      } else {
+        // 'annexb' format: parameter sets are in the key chunks. Nothing
+        // before the first key chunk can be decoded, so it is dropped.
+        st.annexb = true;
+        if (chunk.type !== 'key') return;
+        priv = isH265 ? buildHvcCFromAnnexB(data) : buildAvcCFromAnnexB(data);
+      }
+      if (!priv) return;                        // no parameter sets yet
+    } else if (st.codec === 'av1' && dc && dc.description) {
+      priv = toUint8Array(dc.description);      // av1C
+    }
+    st.mkv = new MKVWriter({ tracks: [{
+      type: 'video', codecId: MKV_VIDEO_CODEC[st.codec], codecPrivate: priv,
+      width: st.cfg.width || (dc && dc.codedWidth) || 0,
+      height: st.cfg.height || (dc && dc.codedHeight) || 0,
+    }] });
+    st.header = st.mkv.writeHeader();
+    this._track(st, st.header);
   }
-  var bsCur = this._videoBitstream;
-  var data = (bsCur && bsCur.lengthSize) ? avccToAnnexb(chunk.data, bsCur.lengthSize) : chunk.data;
-  if (chunk.type === 'key' && bsCur && bsCur.lengthSize && bsCur.paramSets) {
-    var withPs = new Uint8Array(bsCur.paramSets.length + data.length);
-    withPs.set(bsCur.paramSets, 0);
-    withPs.set(data, bsCur.paramSets.length);
-    data = withPs;
-  }
-  this._ffmpeg.write(data);
+  if (isH26x && st.annexb) data = annexbToAvcc(data, isH265);   // all NAL units kept, 4-byte lengths
+  this._track(st, st.mkv.writeFrame(1, data, this._ts(chunk), chunk.type === 'key'));
 };
 
 /**
  * Add an EncodedAudioChunk (pass its metadata too — see the header).
  */
 Muxer.prototype.addAudioChunk = function (chunk, metadata) {
-  if (!this._started) this._start();
-  if (!chunk.data) return;
-  var codec = normalizeCodec((this._audio && this._audio.codec) || 'aac');
+  var st = this._tracks.audio;
+  if (!st || this._finalizing) return;
+  var data = _chunkBytes(chunk);
+  if (!data) return;
   var dc = metadata && metadata.decoderConfig;
-  var desc = dc && dc.description ? toUint8Array(dc.description) : null;
+  var desc = (dc && dc.description) ? toUint8Array(dc.description) : null;
+  var cfg = st.cfg;
+  var channels = cfg.channels || cfg.numberOfChannels || (dc && dc.numberOfChannels) || 2;
+  var sampleRate = cfg.sampleRate || (dc && dc.sampleRate) || 48000;
 
-  if (codec === 'aac') {
-    // Raw access units ('aac' format, the encoder default) → ADTS.
-    if (desc) this._aacConfig = parseAudioSpecificConfig(desc);
-    if (adtsHeaderLength(chunk.data)) { this._writeAudio(chunk.data); return; }
-    var cfg = this._aacConfig || {
-      objectType: 2,
-      sampleRate: this._audio.sampleRate || 48000,
-      channels: this._audio.channels || this._audio.numberOfChannels || 2,
-    };
-    this._writeAudio(wrapAdtsWithConfig(chunk.data, cfg));
-    return;
-  }
-
-  if (codec === 'opus') {
-    // Raw Opus packets → OGG pages. The OpusHead description (if any)
-    // supplies the encoder's pre-skip, so the muxed file trims the
-    // encoder delay exactly like the original stream.
-    if (!this._ogg) {
-      var preSkip = (desc && desc.length >= 12) ? (desc[10] | (desc[11] << 8)) : 0;
-      this._ogg = new OggWriter({
-        channels: this._audio.channels || this._audio.numberOfChannels || 2,
-        preSkip: preSkip,
-      });
-      this._writeAudio(this._ogg.writeHeaders());
+  if (!st.header) {
+    var track = null;
+    if (st.codec === 'aac') {
+      var asc = (desc && parseAudioSpecificConfig(desc)) ? desc
+        : (adtsHeaderLength(data) ? audioSpecificConfigFromAdts(data) : null);
+      if (!asc) {
+        try { asc = buildAudioSpecificConfig({ sampleRate: sampleRate, channels: channels }); } catch (e) { asc = null; }
+      }
+      var info = asc ? parseAudioSpecificConfig(asc) : null;
+      if (!info) { this._ee.emit('error', new Error('Muxer: no usable AudioSpecificConfig for AAC')); return; }
+      track = { type: 'audio', codecId: 'A_AAC', codecPrivate: asc,
+                sampleRate: info.sampleRate, channels: info.channels || channels };
+    } else if (st.codec === 'opus') {
+      // The encoder's OpusHead verbatim: it holds the channel mapping the
+      // packets were coded with. A rebuilt one was always family 0, which
+      // FFmpeg rejects for more than 2 channels (6-channel Opus could not
+      // be muxed at all).
+      var head = (desc && parseOpusHead(desc)) ? desc : buildOpusHead({ channels: channels, inputSampleRate: sampleRate });
+      track = { type: 'audio', codecId: 'A_OPUS', codecPrivate: head,
+                sampleRate: 48000, channels: parseOpusHead(head).channels,
+                seekPreRollNs: 80000000 };
+    } else if (st.codec === 'mp3') {
+      track = { type: 'audio', codecId: 'A_MPEG/L3', sampleRate: sampleRate, channels: channels };
+    } else if (st.codec === 'flac' && desc && desc.length > 4) {
+      track = { type: 'audio', codecId: 'A_FLAC', codecPrivate: desc, sampleRate: sampleRate, channels: channels };
     }
-    this._writeAudio(this._ogg.writePacket(chunk.data));
-    return;
+    if (track) {
+      st.mkv = new MKVWriter({ tracks: [track] });
+      st.header = st.mkv.writeHeader();
+    } else {
+      st.raw = true;
+      st.header = new Uint8Array(0);
+    }
+    this._track(st, st.header);
   }
-
-  this._writeAudio(chunk.data);
+  if (st.raw) { this._track(st, data); return; }
+  if (st.codec === 'aac') data = stripAdts(data);
+  this._track(st, st.mkv.writeFrame(1, data, this._ts(chunk), true));
 };
 
-// Audio goes to pipe:3 (when both tracks) or stdin (audio-only).
-Muxer.prototype._writeAudio = function (bytes) {
-  if (this._video && this._audio) {
-    if (this._proc && this._proc.stdio[3]) this._proc.stdio[3].write(bytes);
-  } else {
-    this._ffmpeg.write(bytes);
+// Chunk timestamp (µs) on the Matroska timeline. The first chunk of the
+// muxer fixes one bias for all tracks, so their relative timing is kept.
+Muxer.prototype._ts = function (chunk) {
+  var t = typeof chunk.timestamp === 'number' ? chunk.timestamp : 0;
+  if (this._tsBias === null) this._tsBias = t < 0 ? -t : 0;
+  return Math.max(0, t + this._tsBias);
+};
+
+// Route a track's input bytes: held until FFmpeg runs, then written.
+Muxer.prototype._track = function (st, bytes) {
+  if (!bytes || !bytes.length) { if (!this._started) this._maybeStart(); return; }
+  if (!this._started) {
+    st.pending.push(bytes);
+    this._maybeStart();
+    return;
   }
+  this._writePipe(st, bytes);
+};
+
+Muxer.prototype._writePipe = function (st, bytes) {
+  if (st.pipe === 0) this._ffmpeg.write(bytes);
+  else if (st.pipe > 0) this._ffmpeg.writeTo(st.pipe, bytes);
+};
+
+Muxer.prototype._maybeStart = function () {
+  var v = this._tracks.video, a = this._tracks.audio;
+  if ((v && !v.header) || (a && !a.header)) return;
+  this._start();
 };
 
 /**
@@ -171,20 +273,14 @@ Muxer.prototype._writeAudio = function (bytes) {
  * caller forever because it waited on a 'close' event that could not
  * arrive:
  *
- *   1. FFmpeg was never started. _start() runs lazily on the first
- *      chunk, so a recording that produced none has no child process
- *      and no 'close'. A recording that captured nothing is exactly
- *      the case a caller is most likely to finalize.
+ *   1. FFmpeg was never started. A recording that produced no chunk
+ *      has no child process and no 'close'.
  *   2. FFmpeg already exited — it failed at startup, or finalize() was
  *      called twice. The event fired before the listener was attached.
  *   3. FFmpeg hung. Nothing bounded the wait.
  *
  * This matters beyond the Muxer: MediaRecorder.stop() in muxer mode
- * awaits finalize() before dispatching 'stop', so any of the above
- * meant onstop never fired and the recording never appeared to end.
- *
- * base_coder's flushCoder already solves the same problem with a
- * bounded wait and paired listener cleanup; this mirrors it.
+ * awaits finalize() before dispatching 'stop'.
  *
  * @param {Function} [cb] — callback style; omit for a Promise.
  * @param {number} [timeoutMs=10000] — upper bound on the wait.
@@ -197,6 +293,15 @@ Muxer.prototype.finalize = function (cb, timeoutMs) {
     var tmo = cb;   // called as finalize(timeoutMs)
     return new Promise(function (resolve) { self.finalize(resolve, tmo); });
   }
+
+  // FFmpeg waits for every configured track before it starts. A track
+  // that never produced a usable chunk is left out now, so what the
+  // others delivered is still written.
+  if (!this._started && !this._stopped) {
+    var v = this._tracks.video, a = this._tracks.audio;
+    if ((v && v.header) || (a && a.header)) this._start();
+  }
+  this._finalizing = true;
 
   // Nothing was ever spawned, or it has already exited: there is no
   // trailer left to write and no event coming. Complete on the next
@@ -220,6 +325,7 @@ Muxer.prototype.finalize = function (cb, timeoutMs) {
     // FFmpeg is wedged. Kill it so the caller isn't held hostage; the
     // output file may be missing its trailer, which is the lesser
     // failure compared with never returning.
+    self._stopped = true;
     self._ffmpeg.stop();
     finish();
   }, timeoutMs || FINALIZE_TIMEOUT);
@@ -230,18 +336,18 @@ Muxer.prototype.finalize = function (cb, timeoutMs) {
 };
 
 Muxer.prototype._finishInputs = function () {
-  // End audio pipe:3 first, then stdin
-  if (this._video && this._audio && this._proc && this._proc.stdio[3]) {
-    this._proc.stdio[3].end();
+  var proc = this._proc;
+  if (proc && proc.stdio[3] && proc.stdio[3].writable) {
+    try { proc.stdio[3].end(); } catch (e) {}
   }
   this._ffmpeg.endInput();
 };
 
 Muxer.prototype.close = function () {
+  this._stopped = true;
   this._ffmpeg.stop();
   // Reset so the instance is not left in a half-open state where
-  // _started is true but no process exists — addVideoChunk() would then
-  // write into nothing and finalize() would wait on a dead handle.
+  // _started is true but no process exists.
   this._started = false;
   this._proc = null;
 };
@@ -251,52 +357,90 @@ Muxer.prototype._start = function () {
   this._started = true;
   var self = this;
 
+  var inputs = [];
+  if (this._tracks.video && this._tracks.video.header) inputs.push(this._tracks.video);
+  if (this._tracks.audio && this._tracks.audio.header) inputs.push(this._tracks.audio);
+
   var args = ['-hide_banner', '-loglevel', 'error', '-y'];
-  var hasVideo = !!this._video;
-  var hasAudio = !!this._audio;
-
-  // Video input on stdin (pipe:0)
-  if (hasVideo) {
-    var vc = normalizeCodec(this._video.codec || 'h264');
-    var vFmt = VIDEO_INPUT_FMT[vc] || 'h264';
-    args.push('-f', vFmt);
-    // Raw H.264/H.265 has no timestamps, so the rate is given; IVF
-    // records carry their own (and the ivf demuxer has no -framerate).
-    if (this._video.framerate && vFmt !== 'ivf') args.push('-framerate', String(this._video.framerate));
-    args.push('-i', 'pipe:0');
-  }
-
-  // Audio input on pipe:3 (dual track) or pipe:0 (audio only)
-  if (hasAudio) {
-    var ac = normalizeCodec(this._audio.codec || 'aac');
-    var aFmt = AUDIO_INPUT_FMT[ac] || 'aac';
-    if (hasVideo) {
-      args.push('-f', aFmt, '-i', 'pipe:3');
+  // Keep every input's timestamps as written. Without -copyts FFmpeg
+  // moves EACH input to start at 0, which would undo the relative
+  // timing of an audio input that starts later than the video.
+  args.push('-copyts');
+  for (var i = 0; i < inputs.length; i++) {
+    var st = inputs[i];
+    st.pipe = i === 0 ? 0 : 3;
+    if (st.raw) {
+      args.push('-f', AUDIO_INPUT_FMT[st.codec] || st.codec);
+      if (st.codec.indexOf('law') >= 0) {
+        args.push('-ar', String(st.cfg.sampleRate || 8000), '-ac', String(st.cfg.channels || st.cfg.numberOfChannels || 1));
+      }
     } else {
-      args.push('-f', aFmt, '-i', 'pipe:0');
+      args.push('-f', 'matroska');
     }
+    args.push('-i', 'pipe:' + st.pipe);
   }
+  for (var m = 0; m < inputs.length; m++) args.push('-map', m + ':0');
 
-  // Copy all streams to output
   args.push('-c', 'copy');
+  // One shift for all streams: the output starts at 0 as it always did,
+  // with the tracks' relative timing intact.
+  args.push('-avoid_negative_ts', 'make_zero');
+  var isMp4 = this._format === 'mp4' || this._format === 'mov' || this._format === 'ipod';
+  if (isMp4) args.push('-video_track_timescale', '90000');
+  if (isMp4 && !this._file) {
+    // A pipe cannot be seeked back to write the moov: fragmented MP4.
+    args.push('-movflags', 'frag_keyframe+empty_moov+default_base_moof');
+    if (this._fragmentDurationUs) args.push('-frag_duration', String(Math.round(this._fragmentDurationUs)));
+  }
+  Array.prototype.push.apply(args, this._outputArgs);
   if (this._format) args.push('-f', this._format);
-  if (this._file) {
-    args.push(this._file);
-  } else {
-    args.push('pipe:1');
-  }
+  args.push(this._file || 'pipe:1');
 
-  // stdio: [stdin=video, stdout, stderr, pipe3=audio]
-  var stdio;
-  if (hasVideo && hasAudio) {
-    stdio = ['pipe', this._file ? 'ignore' : 'pipe', 'pipe', 'pipe'];
-  } else {
-    stdio = ['pipe', this._file ? 'ignore' : 'pipe', 'pipe'];
-  }
+  // stdio: [stdin=input 0, stdout, stderr, pipe3=input 1]
+  var stdio = ['pipe', this._file ? 'ignore' : 'pipe', 'pipe'];
+  if (inputs.length > 1) stdio.push('pipe');
 
-  this._proc = self._ffmpeg.start(args, stdio);
-  self._ffmpeg.on('error', function (e) { self._ee.emit('error', e); });
+  // Without a file the container comes out of stdout; it was never
+  // forwarded, so a Muxer with no `file` produced output nobody could
+  // reach. 'data' carries it, 'end' follows the last byte.
+  this._ffmpeg.on('stdout', function (chunk) { self._ee.emit('data', chunk); });
+  this._ffmpeg.on('stdout_end', function () { self._ee.emit('end'); });
+  this._ffmpeg.on('error', function (e) { self._ee.emit('error', e); });
+  // A failing FFmpeg (bad input, unwritable file, codec the container
+  // cannot hold) used to end with no sign at all.
+  this._ffmpeg.on('close', function (code, signal) {
+    if (self._stopped || code === 0) return;
+    var why = self._ffmpeg.lastError;
+    self._ee.emit('error', new Error('Muxer: FFmpeg exited with ' +
+      (signal ? 'signal ' + signal : 'code ' + code) + (why ? ': ' + why : '')));
+  });
+
+  this._proc = this._ffmpeg.start(args, stdio);
+  if (!this._proc) return;
+  if (this._proc.stdio[3]) this._proc.stdio[3].on('error', function () {});   // EPIPE after an FFmpeg failure
+
+  for (var k = 0; k < inputs.length; k++) {
+    var t = inputs[k];
+    for (var p = 0; p < t.pending.length; p++) this._writePipe(t, t.pending[p]);
+    t.pending = [];
+  }
+  // A configured track left out of this run: drop what it holds.
+  var all = [this._tracks.video, this._tracks.audio];
+  for (var q = 0; q < all.length; q++) if (all[q] && all[q].pipe < 0) all[q].pending = [];
 };
+
+// The chunk's bytes: `.data` (this library's chunks, plain objects) or
+// copyTo() (any EncodedVideoChunk / EncodedAudioChunk).
+function _chunkBytes(chunk) {
+  if (!chunk) return null;
+  if (chunk.data) return toUint8Array(chunk.data);
+  if (typeof chunk.copyTo === 'function' && chunk.byteLength) {
+    var b = new Uint8Array(chunk.byteLength);
+    chunk.copyTo(b);
+    return b;
+  }
+  return null;
+}
 
 function _guessFormat(file) {
   if (!file) return 'mp4';

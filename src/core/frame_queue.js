@@ -157,6 +157,17 @@ Object.defineProperty(FrameQueue.prototype, 'buffered', {
 });
 
 /**
+ * Take the buffered bytes of the incomplete last frame (and clear them)
+ * — for a stream that has ended, whose tail would otherwise be lost.
+ * @returns {Uint8Array}
+ */
+FrameQueue.prototype.takeRemainder = function () {
+  var out = this._buf.slice(0, this._writePos);
+  this._writePos = 0;
+  return out;
+};
+
+/**
  * Reset the accumulator.
  */
 FrameQueue.prototype.reset = function () {

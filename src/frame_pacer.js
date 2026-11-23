@@ -46,6 +46,11 @@ function FramePacer(opts) {
   this._frameIndex = 0;
   this._callback = null;
   this._running = false;
+  // Paused by pause(). pause() used to only clear _timer — but inside the
+  // callback (the use the module's own doc shows) _timer is already null,
+  // so it cleared nothing and the tick rescheduled anyway; resume() then
+  // saw a live _timer and did nothing. A flag survives both.
+  this._paused = false;
 
   // Anchor for target-time scheduling. _anchorMs is the time at which
   // frame 0 was (or will be) emitted; subsequent frames target
@@ -65,6 +70,7 @@ FramePacer.prototype.start = function (cb) {
   }
   this._callback = cb;
   this._running = true;
+  this._paused = false;
   this._frameIndex = 0;
   this._anchorMs = _now();
   this._sinceAnchorIndex = 0;
@@ -75,6 +81,7 @@ FramePacer.prototype.start = function (cb) {
  * Pause delivery (backpressure). Call resume() when ready.
  */
 FramePacer.prototype.pause = function () {
+  this._paused = true;
   if (this._timer !== null) {
     clearTimeout(this._timer);
     this._timer = null;
@@ -90,7 +97,8 @@ FramePacer.prototype.pause = function () {
  * is reset.
  */
 FramePacer.prototype.resume = function () {
-  if (!this._running) return;
+  if (!this._running || !this._paused) return;
+  this._paused = false;
   if (this._timer !== null) return;
   this._anchorMs = _now();
   this._sinceAnchorIndex = 0;
@@ -179,7 +187,7 @@ FramePacer.prototype._scheduleNext = function () {
     }
     self._frameIndex++;
     self._sinceAnchorIndex++;
-    if (self._running) self._scheduleNext();
+    if (self._running && !self._paused) self._scheduleNext();
   }, delayMs);
 };
 
@@ -192,7 +200,7 @@ Object.defineProperty(FramePacer.prototype, 'frameIndex', {
 });
 
 Object.defineProperty(FramePacer.prototype, 'running', {
-  get: function () { return this._running && this._timer !== null; },
+  get: function () { return this._running && !this._paused; },
 });
 
 export default FramePacer;

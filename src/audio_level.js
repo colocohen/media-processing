@@ -43,7 +43,10 @@ export function computeAudioDbov(audioData) {
   if (rms <= 0) return 127;
   var db = 20 * Math.log10(rms);          // ≤ 0 for rms ≤ 1
   var level = Math.round(-db);
-  if (level < 0) level = 0;
+  // `<= 0`, not `< 0`: at full scale db is 0 and Math.round(-0) is -0,
+  // which `< 0` lets through — callers comparing with Object.is / strict
+  // deep-equal saw -0 instead of the RFC 6464 level 0.
+  if (level <= 0) level = 0;
   if (level > 127) level = 127;
   return level;
 }

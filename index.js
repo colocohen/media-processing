@@ -10,7 +10,7 @@
  * Collision notes:
  *  - extractParameterSets: only the nalu_utils form (structured
  *    {sps,pps,vps}) is exported here. reader_annexb's concatenated
- *    form stays internal to the Demuxer path.
+ *    form stays internal.
  *  - MediaDeviceInfo / InputDeviceInfo: exported from media_stream
  *    (get_user_media re-exports them internally; not re-exported here).
  *  - OGGReader is surfaced as `OggReader` for casing symmetry with
@@ -79,6 +79,9 @@ export { default as OggReader } from './src/reader_ogg.js';
 export { default as IVFReader, splitOBUs, extractSequenceHeader } from './src/reader_ivf.js';
 export { default as ADTSReader } from './src/reader_adts.js';
 export { default as AnnexBReader } from './src/reader_annexb.js';
+export { default as MP4Reader } from './src/reader_mp4.js';
+export { default as WebMReader } from './src/reader_webm.js';
+export { default as FileDemuxer } from './src/file_demuxer.js';
 
 // ── High-level Node ──
 export { default as Demuxer } from './src/demuxer.js';

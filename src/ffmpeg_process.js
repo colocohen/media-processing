@@ -7,8 +7,9 @@
  *  - EPIPE handling (normal when FFmpeg closes)
  *  - Listener cleanup on stop/restart (no leaks)
  *  - Graceful shutdown (SIGTERM then SIGKILL)
- *  - Parent-exit cleanup: registers SIGINT/SIGTERM/exit handlers once
- *    so a Node crash doesn't leave orphan FFmpeg processes
+ *  - Parent-exit cleanup: an 'exit' hook (also runs on an uncaught
+ *    exception) plus SIGINT/SIGTERM hooks that act only when nothing
+ *    else listens, so a Node crash doesn't leave orphan FFmpeg processes
  */
 
 import { spawn, execSync } from 'node:child_process';
@@ -38,38 +39,36 @@ function _installExitHooks() {
     });
     _liveChildren.clear();
   }
-  process.on('exit',    killAll);
-  // Also handle signals so Ctrl-C and `kill` clean up. Don't replace
-  // user handlers — `process.on` adds, doesn't override.
-  process.on('SIGINT',  function () { killAll(); process.exit(130); });
-  process.on('SIGTERM', function () { killAll(); process.exit(143); });
-  // uncaughtException leaves children alive by default; we kill them and
-  // rethrow so the user's handler (if any) still sees the error.
-  var _inFatalHandler = false;
-  process.on('uncaughtException', function (err) {
-    // RE-ENTRY GUARD — this handler's own rethrow comes back through here.
-    //
-    // The rethrow below is itself an uncaught exception. When this is the
-    // only listener, Node's default handler runs and the process exits, so
-    // the second pass never happens. But any OTHER listener — an
-    // application's, a framework's, or a synthetic process.emit from
-    // elsewhere in the stack — keeps the process alive, and then the
-    // rethrow re-enters, rethrows again, and the two feed each other.
-    //
-    // Measured: a single throw becomes ~200,000 handler invocations per
-    // second. It does not crash. The check and microtask queues starve, so
-    // every await in the process stops progressing and even SIGINT goes
-    // unanswered, while timers and sockets keep running — the process looks
-    // wedged, and nothing is logged, because the error never reaches the
-    // default handler that would print it.
-    //
-    // Killing the children once is all this handler owes anyone.
-    if (_inFatalHandler) return;
-    _inFatalHandler = true;
+  // 'exit' also runs when the process dies of an uncaught exception
+  // (Node emits it, code 1, before exiting) — no uncaughtException hook
+  // is needed for that.
+  //
+  // There was one, and it broke the application: ANY 'uncaughtException'
+  // listener switches off Node's default crash. Its "rethrow on next tick
+  // so the default handler runs" landed back in that same listener, which
+  // its re-entry guard then made return — so once a single FFmpeg had
+  // started, every uncaught exception in the whole app was swallowed: no
+  // stack trace, no exit, the process carried on in whatever state the
+  // throw left it.
+  process.on('exit', killAll);
+
+  // A signal's default action kills the process without 'exit', so the
+  // children need a signal hook — but only while it is the ONLY listener.
+  // It used to call process.exit(130/143) unconditionally, cutting off an
+  // application's own graceful shutdown (a server's async SIGINT handler
+  // never reached its end). When the app listens too, the signal is the
+  // app's to handle; the children are reaped by 'exit' when it does exit.
+  // When we are alone, kill the children and re-raise the signal with the
+  // default action, so the process still dies OF the signal (exit status
+  // 128+n, as without us).
+  function onSignal(sig) {
+    if (process.listenerCount(sig) > 1) return;
     killAll();
-    // Rethrow on next tick so default Node handler runs (which logs + exits 1).
-    process.nextTick(function () { throw err; });
-  });
+    process.removeListener(sig, onSignal);
+    process.kill(process.pid, sig);
+  }
+  process.on('SIGINT', onSignal);
+  process.on('SIGTERM', onSignal);
 }
 
 /**
@@ -153,6 +152,7 @@ function FFmpegProcess(opts) {
   this._ffmpegPath = opts.ffmpegPath || resolveFFmpegPath() || 'ffmpeg';
   this._handlers = [];
   this._stderrBuf = '';
+  this._lastErrors = [];   // the first 'ffmpeg:error' lines of this run (see lastError)
 }
 
 FFmpegProcess.prototype.on = function (ev, fn) { this._ee.on(ev, fn); };
@@ -187,6 +187,7 @@ FFmpegProcess.prototype.start = function (args, stdio) {
   this._started = true;
   this._handlers = [];
   this._stderrBuf = '';
+  this._lastErrors = [];
 
   // Track this child for orphan-cleanup on parent exit. Install hooks on
   // first ever use — cheap, and only Node startup pays for it.
@@ -202,12 +203,16 @@ FFmpegProcess.prototype.start = function (args, stdio) {
     self._ee.emit('error', new Error('FFmpeg process error: ' + (e.message || e)));
   });
 
-  track(proc, 'close', function (code) {
+  // 'close' reaches listeners only when FFmpeg exited ON ITS OWN: stop()
+  // detaches this handler before it kills the process. (code, signal) as
+  // Node reports them — code 0 is a normal end of input; anything else,
+  // or a signal, is FFmpeg failing (see base_coder's exitError).
+  track(proc, 'close', function (code, signal) {
     // Untrack first — even if listeners or emit() throw, we don't want
     // a permanently-live entry in _liveChildren.
     _liveChildren.delete(proc);
     self._detachAll();
-    self._ee.emit('close', code);
+    self._ee.emit('close', code, signal);
   });
 
   // Catch all stdin write errors — PERMANENT handler, not tracked.
@@ -267,6 +272,7 @@ FFmpegProcess.prototype._parseStderr = function (text) {
     }
     // Error/warning
     else if (line.indexOf('Error') >= 0 || line.indexOf('error') >= 0) {
+      if (this._lastErrors.length < 4) this._lastErrors.push(line);   // the first ones say why
       this._ee.emit('ffmpeg:error', line);
     }
     else if (line.indexOf('Warning') >= 0 || line.indexOf('warning') >= 0) {
@@ -362,6 +368,18 @@ FFmpegProcess.prototype.stop = function () {
 
 Object.defineProperty(FFmpegProcess.prototype, 'running', {
   get: function () { return this._started; },
+});
+
+/**
+ * The first error FFmpeg printed in the current run, or ''. When an
+ * encoder fails to open FFmpeg prints the cause first ("x265 [error]:
+ * frameNumThreads ... must be [0 .. X265_MAX_FRAME_THREADS)") and then a
+ * cascade of generic lines ("Error while opening encoder", "Task
+ * finished with error code"), so the first error of the run is the one
+ * that says why. Needs stderr piped (stdio[2] === 'pipe').
+ */
+Object.defineProperty(FFmpegProcess.prototype, 'lastError', {
+  get: function () { return this._lastErrors.length ? this._lastErrors[0] : ''; },
 });
 
 Object.defineProperty(FFmpegProcess.prototype, 'process', {

@@ -36,8 +36,10 @@
  *     pushed up to HLSEncoder.
  *   - PCR rides on the video PID (or audio if video-less). Standard
  *     practice and matches FFmpeg's output.
- *   - Continuity counters reset on reset() — call between segments
- *     so each segment is self-contained.
+ *   - Continuity counters run on across writeSegment() calls, as
+ *     FFmpeg's HLS muxer writes them: a player concatenates the
+ *     segments of a playlist into one TS stream. reset() still zeroes
+ *     them for a caller that wants that.
  */
 
 import { writeU32BE, concat } from './core/bytes.js';
@@ -271,10 +273,9 @@ TSWriter.prototype.writeAudio = function (adts, opts) {
 };
 
 /**
- * Reset all continuity counters to zero. Call at segment boundaries
- * before the next writePSI(): every HLS segment is independently
- * decodable, and the convention (FFmpeg, etc.) is to reset CCs so a
- * player can splice segments in any order.
+ * Reset all continuity counters to zero. Starts a NEW stream as far as
+ * continuity is concerned — writeSegment() no longer calls it (see
+ * there).
  */
 TSWriter.prototype.reset = function () {
   this._cc[PID_PAT]      = 0;
@@ -351,7 +352,14 @@ TSWriter.prototype.writeSegment = function (videoChunks, audioChunks, endPtsUs, 
     this.enableMetadata();
   }
 
-  this.reset();
+  // Continuity counters are NOT reset per segment. They were, so the
+  // concatenation of two segments — what a player demuxes when it plays
+  // a playlist, and what FFmpeg's own HLS muxer keeps continuous — read
+  // as packet loss on every PID at every boundary: "Continuity check
+  // failed for pid 256 expected 5 got 0", and FFmpeg flagged the first
+  // video packet of the next segment corrupt. Segments are still
+  // independently decodable (PAT/PMT lead each one); a demuxer joining
+  // mid-stream does not check the first CC it sees.
 
   // Sort all chunks by DTS (video) / PTS (audio + metadata). MPEG-TS
   // tolerates any interleaving, but DTS-ordered output minimizes
@@ -710,8 +718,11 @@ TSWriter.prototype._writePMTPacketInto = function (buf, base) {
 TSWriter.prototype._buildPES = function (streamId, payload, ptsUs, dtsUs, useLength) {
   // Convert µs to 90 kHz ticks. PTS/DTS are 33-bit fields — at 90 kHz
   // they wrap at 26.5 hours, well beyond any HLS segment use case.
-  var pts = Math.floor(ptsUs * 90 / 1000);
-  var dts = (dtsUs !== null && dtsUs !== undefined) ? Math.floor(dtsUs * 90 / 1000) : null;
+  // Rounded, not floored: a µs timestamp is itself rounded, so flooring
+  // put ticks one short — 21333 µs (one AAC frame) became 1919 instead
+  // of 1920, and the 1024-sample spacing read 1919/1921/1920 in ffprobe.
+  var pts = Math.round(ptsUs * 90 / 1000);
+  var dts = (dtsUs !== null && dtsUs !== undefined) ? Math.round(dtsUs * 90 / 1000) : null;
 
   // Only emit a separate DTS field when DTS actually differs from PTS.
   // Saves 5 bytes per video frame in the no-B-frames case.

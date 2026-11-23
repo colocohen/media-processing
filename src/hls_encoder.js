@@ -25,6 +25,7 @@
  *   });
  *
  *   encoder.on('error', function (err) { console.error(err); });
+ *   encoder.on('dequeue', fn);   // encodeQueueSize dropped — feed more (a file, faster than real time)
  *
  *   // Drive it with frames, then finalize:
  *   cameraFrames.on('frame', function (frame) { encoder.feed(frame); });
@@ -91,7 +92,8 @@ import EventEmitter from './core/events.js';
 import { isValidVideoRange } from './utils/playlist_utils.js';
 import { createEncryptor, ivFromHex, ivToHex } from './encryption.js';
 import CEA608Encoder, { buildCea608SeiNalu } from './cea608_encoder.js';
-import { injectSeiIntoAU } from './utils/nalu_utils.js';
+import { injectSeiIntoAU, codecStringFromAnnexB, codecStringFromAvcC,
+         codecStringFromHvcC } from './utils/nalu_utils.js';
 
 
 // Fallback frame duration when the encoder doesn't report chunk.duration.
@@ -182,52 +184,35 @@ function _aacEncoderDelay(codecString) {
  * to the player — a wrong string can lead to the player rejecting
  * the variant before even attempting to fetch it.
  *
- * Source preference, from best to fallback:
- *   1. Caller-provided `video.codecString`           (canonical, ALWAYS wins)
- *   2. avcC/hvcC bytes captured from the encoder     (h264/h265 only)
- *   3. Built-in defaults                             (common-case profiles)
+ * Source preference:
+ *   1. `actual` — read from the encoder's output (SPS / avcC / hvcC of
+ *      the first keyframe, see _captureVideoCodecString).
+ *   2. The codec string the VideoEncoder was configured with.
+ *
+ * This used to fall back to fixed generic strings whenever no avcC had
+ * been captured (always, for TS): a 1080p stream encoded as High@4.0
+ * was advertised as avc1.42e01e (Baseline@3.0), VP9 as Level 1.0, and
+ * H.265 as 'hvc1.…' with a hard-coded level while the fMP4 sample
+ * entry is 'hev1' — players that check CODECS against their decoder
+ * (or against the sample entry) then skip or mis-configure the variant.
  *
  * Returns null if we don't have enough info to construct anything
  * meaningful (e.g., no opts.video at all).
  */
-function _deriveVideoCodecString(opts, capturedConfig) {
+function _deriveVideoCodecString(opts, actual) {
   if (!opts) return null;
-  if (opts.codecString) return opts.codecString;
-
-  var codec = opts.codec || 'h264';
-
-  if (codec === 'h264' && capturedConfig && capturedConfig.length >= 4) {
-    // avcC bytes 1..3 = profile_idc, profile_compatibility, level_idc.
-    // Codec string format: avc1.PPCCLL (lowercase hex, zero-padded).
-    var p  = capturedConfig[1].toString(16); if (p.length  < 2) p  = '0' + p;
-    var cc = capturedConfig[2].toString(16); if (cc.length < 2) cc = '0' + cc;
-    var lv = capturedConfig[3].toString(16); if (lv.length < 2) lv = '0' + lv;
-    return 'avc1.' + p + cc + lv;
-  }
-
-  if (codec === 'h265' && capturedConfig && capturedConfig.length >= 13) {
-    // hvcC parsing is more complex; for the general case we fall back
-    // to a reasonable default unless the user gave us a codecString.
-    // The structured form is: hvc1.PROFILE.PROFILE_COMPAT.LEVEL.CONSTRAINTS.
-    // Most mobile encoders produce Main profile @ Level 4.0.
-    return 'hvc1.1.6.L120.B0';
-  }
-
-  // Defaults by codec — generic enough that any decoder advertising
-  // support for that codec accepts them. Caller can override via
-  // opts.codecString if they need precision.
-  if (codec === 'h264') return 'avc1.42e01e';   // Constrained Baseline 3.0
-  if (codec === 'h265') return 'hvc1.1.6.L93.B0'; // Main profile, Level 3.1
-  if (codec === 'vp9')  return 'vp09.00.10.08'; // Profile 0, Level 1.0, 8bit
-  if (codec === 'av1')  return 'av01.0.04M.08'; // Main profile, Level 3.0, 8bit
-  return null;
+  if (actual) return actual;
+  return opts.codecString ||
+         _defaultVideoCodecString(opts.codec || 'h264', opts.width, opts.height);
 }
 
 /**
  * Derive the HLS CODECS string for an audio track.
  */
-function _deriveAudioCodecString(opts) {
-  if (!opts) return null;
+function _deriveAudioCodecString(opts, dropped) {
+  // A configured audio track that never delivered anything is not in
+  // the stream (see HLSEncoder._maybeDropSilentAudio).
+  if (!opts || dropped) return null;
   if (opts.codecString) return opts.codecString;
   if (opts.codec === 'opus') return 'opus';
   return 'mp4a.40.2';  // AAC LC default
@@ -458,6 +443,10 @@ function _extractAv1ConfigFromChunk(au, codecString) {
 // ══════════════════════════════════════════════════════════
 
 /**
+ * Output timestamps start at 0 whatever the input's time base (see
+ * _joinTimeline); encoders fed the same source share one timeline, so
+ * renditions added mid-stream stay aligned.
+ *
  * @param {object} opts
  * @param {string} [opts.format='ts']         'ts' (MPEG-TS .ts segments) or
  *                                            'fmp4' (Fragmented MP4 .m4s
@@ -506,7 +495,109 @@ function _extractAv1ConfigFromChunk(au, codecString) {
  * @param {number} [opts.audio.channels=2]
  * @param {number} [opts.audio.bitrate=128_000]
  * @param {string} [opts.audio.codecString]   Override default codec string.
+ * @param {boolean} [opts.alignTrackClocks=true]  When the first AudioData and
+ *                                            first VideoFrame carry timestamps
+ *                                            from different clocks (Chrome's
+ *                                            MediaStreamTrackProcessor), move
+ *                                            audio onto the video clock.
  */
+// Two first-input timestamps that disagree with their arrival times by
+// more than this come from different clocks (see _alignClocks). Capture
+// latency differences between a camera and a microphone are tens of
+// milliseconds; Chrome's two clocks differ by the machine's uptime.
+var _CLOCK_MISMATCH_US = 2000000;
+
+function _nowMs() {
+  return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+}
+
+// ── Shared output timelines ──
+// Segments start at media time 0, not at the input's first timestamp.
+// Input timestamps used to be written as they came, and in a browser a
+// camera's VideoFrame timestamps are the time since the machine booted
+// (Chrome: ~30 000 s after 8 h of uptime). So every recording carried
+// the machine's uptime in its tfdt / PTS; SubtitleEncoder's
+// X-TIMESTAMP-MAP (MPEGTS:0 — it assumes a stream that starts at 0)
+// put WebVTT cues hours away from the video; and in MPEG-TS, whose PTS
+// is 33 bits at 90 kHz, a machine up for more than 26.5 h wrapped the
+// PTS.
+//
+// Subtracting each encoder's own first timestamp would break encoders
+// that must share one timeline: an ABR rendition added mid-stream, or
+// an encoder that takes over a stream after a restart, would start at
+// 0 too and sit apart from the others. So encoders share timelines,
+// with nothing for the caller to set: an encoder whose first input
+// timestamp lies within _TIMELINE_JOIN_US of the latest timestamp
+// another encoder was fed (the same source, at the same moment — in
+// real time or fed fast from a file alike) joins that timeline and its
+// origin; otherwise it opens a new timeline that starts at 0. A
+// timeline nobody has fed for _TIMELINE_KEEP_MS is forgotten.
+//
+// One timeline can be fed from more than one input CLOCK. In Chrome a
+// camera's frames and a microphone's AudioData carry timestamps from
+// different clocks (see _alignClocks in the constructor), so an
+// audio-only encoder — the separate audio rendition of an ABR ladder,
+// linked by EXT-X-MEDIA TYPE=AUDIO — matched no video timeline by
+// timestamp, opened its own timeline at 0, and played out of sync with
+// the video renditions. Each timeline therefore keeps its clocks, each
+// with its offset onto the timeline's own clock:
+//   1. a first timestamp close to one clock's latest → that clock, with
+//      its exact offset (every video rendition gets the same one);
+//   2. else, a timeline fed by the OTHER kind of input (video ↔ audio)
+//      within the last _TIMELINE_LIVE_MS is running right now: the new
+//      input is added as a clock, its offset taken from arrival times
+//      — the same measurement as audio ↔ video inside one encoder;
+//   3. else a new timeline.
+var _TIMELINE_JOIN_US = 2000000;
+var _TIMELINE_KEEP_MS = 60000;
+var _TIMELINE_LIVE_MS = 1000;
+var _timelines = [];
+
+/**
+ * @param {number} ts    first input timestamp (µs, the input's clock)
+ * @param {string} kind  'video' (encoders with video) | 'audio' (audio-only)
+ * @returns {{timeline: object, clock: object}}
+ */
+function _joinTimeline(ts, kind) {
+  var now = _nowMs(), i, j, t, c;
+  _timelines = _timelines.filter(function (x) { return now - x.at <= _TIMELINE_KEEP_MS; });
+
+  // 1. The same clock as one already feeding a timeline.
+  var best = null, bestGap = Infinity;
+  for (i = 0; i < _timelines.length; i++) {
+    t = _timelines[i];
+    for (j = 0; j < t.clocks.length; j++) {
+      c = t.clocks[j];
+      var gap = Math.abs(ts - c.lastUs);
+      if (gap <= _TIMELINE_JOIN_US && gap < bestGap && ts + c.offsetUs >= t.originUs) {
+        best = { timeline: t, clock: c }; bestGap = gap;
+      }
+    }
+  }
+  if (best) return best;
+
+  // 2. Another kind of input, live on a timeline right now.
+  for (i = _timelines.length - 1; i >= 0; i--) {
+    t = _timelines[i];
+    for (j = 0; j < t.clocks.length; j++) {
+      c = t.clocks[j];
+      if (c.kind === kind || now - c.at > _TIMELINE_LIVE_MS) continue;
+      // Where `ts` sits on the timeline's clock: that clock's latest
+      // timestamp, plus the wall time since it arrived.
+      var expected = c.lastUs + c.offsetUs + Math.round((now - c.at) * 1000);
+      var nc = { kind: kind, offsetUs: expected - ts, lastUs: ts, at: now };
+      t.clocks.push(nc);
+      return { timeline: t, clock: nc };
+    }
+  }
+
+  // 3. A new timeline, starting at 0.
+  var c0 = { kind: kind, offsetUs: 0, lastUs: ts, at: now };
+  t = { originUs: ts, at: now, clocks: [c0] };
+  _timelines.push(t);
+  return { timeline: t, clock: c0 };
+}
+
 function HLSEncoder(opts) {
   if (!opts) opts = {};
   if (!opts.video && !opts.audio) {
@@ -617,6 +708,17 @@ function HLSEncoder(opts) {
                         'or "0x" + 32 hex digits (omit for sequence-derived)');
       }
     }
+    // I-frame playlists list byte ranges inside the segments. Under
+    // AES-128 the whole segment is one CBC stream, so a range from the
+    // middle can't be decrypted without the preceding ciphertext block
+    // as IV — and the I-frame playlist was written with no EXT-X-KEY at
+    // all, advertising plaintext ranges of encrypted files. Refuse.
+    if (opts.iFramePlaylist) {
+      throw new Error('HLSEncoder: iFramePlaylist is not supported with ' +
+                      'encryption (AES-128 encrypts the whole segment as one ' +
+                      'CBC stream, so I-frame byte ranges cannot be decrypted ' +
+                      'on their own); disable one of them');
+    }
     // LL-HLS encryption requires per-part IV management which we don't
     // yet implement. Reject the combination upfront.
     if (opts.partDuration && opts.partDuration > 0) {
@@ -685,6 +787,15 @@ function HLSEncoder(opts) {
   // the first encoder output of each track. Set once, never reset.
   this._videoConfigCaptured = false;
   this._audioConfigCaptured = false;
+  // CODECS value for the video track, read from the first keyframe.
+  this._actualVideoCodecString = null;
+  // fMP4: width/height handed to the writer with the video config (kept
+  // so a replacement writer gets the same; see _maybeDropSilentAudio).
+  this._videoConfigDims = null;
+  // fMP4: true once a configured audio track was dropped for never
+  // delivering any data (see _maybeDropSilentAudio).
+  this._audioDropped = false;
+  this._audioDroppedReported = false;
 
   // For TS format: tracks whether the writer's PMT has been rebuilt
   // to declare the metadata stream. Flipped to true on the first
@@ -692,6 +803,7 @@ function HLSEncoder(opts) {
   this._tsMetadataEnabled = false;
 
   this._lastForcedKeyframeUs = null;
+  this._lastKeyCell = -Infinity;   // grid cell of the last forced keyframe
 
   // ── Bandwidth tracking (for getStreamInf / master playlist) ──
   // The HLS spec requires the BANDWIDTH attribute on EXT-X-STREAM-INF
@@ -744,6 +856,37 @@ function HLSEncoder(opts) {
   // chunk N's PTS = first_chunk_pts + N * 1024 / sampleRate (in µs).
   this._audioFirstChunkPtsUs = null;
   this._audioChunksEmitted   = 0;
+
+  // ── Audio / video clock alignment ──
+  // Chrome's MediaStreamTrackProcessor stamps VideoFrames on the system
+  // monotonic clock (time since boot: ~30 000 s on a box up for 8 h) but
+  // AudioData on a clock that starts near 0 when capture starts. The
+  // two timelines were mixed as if they were one: every audio chunk sat
+  // hours before the first video frame, SegmentBuilder dropped it as
+  // "late", and each recording of the browser demo came out with an
+  // audio track in the init segment and no audio samples at all
+  // (measured in Chrome: 996 AudioData fed, 0 audio samples written,
+  // for H.264 / VP9 / AV1 alike).
+  //
+  // The first VideoFrame and the first AudioData arrive at known wall-
+  // clock times. On one shared clock their timestamp gap matches their
+  // arrival gap (to within capture latency); when the two disagree by
+  // more than _CLOCK_MISMATCH_US, the tracks run on different clocks
+  // and audio is moved onto the video clock by that difference. Input
+  // fed on one clock (Node, a demuxed file) is left untouched.
+  // opts.alignTrackClocks === false turns this off.
+  this._alignClocks = opts.alignTrackClocks !== false;
+  this._clockVideo = null;          // {ts, at} of the first VideoFrame
+  this._clockAudio = null;          // {ts, at} of the first AudioData
+  this._audioClockOffsetUs = null;  // null until both are known
+  this._audioHeld = [];             // chunks waiting for the offset
+  // Output timeline (see _joinTimeline): its originUs is subtracted
+  // from every timestamp handed to the SegmentBuilder. Everything the
+  // caller passes in (frames, feedMetadata, addCaption) stays on the
+  // input's own time base.
+  this._timeline = null;
+  this._timelineClock = null;       // this encoder's input clock on it
+  this._metadataHeld = [];          // feedMetadata before the first input
   this._ended = false;
 
   // CEA-608/708 closed-captions state. Caption cues are scheduled as
@@ -814,6 +957,28 @@ function HLSEncoder(opts) {
 
 HLSEncoder.prototype.on  = function (ev, fn) { this._ee.on(ev, fn);  return this; };
 HLSEncoder.prototype.off = function (ev, fn) { this._ee.off(ev, fn); return this; };
+
+/**
+ * Frames and audio fed and not yet taken by the encoders — video and
+ * audio together (WebCodecs' encodeQueueSize). A caller feeding faster
+ * than real time (a file) waits while it's high; 'dequeue' says when it
+ * drops.
+ */
+Object.defineProperty(HLSEncoder.prototype, 'encodeQueueSize', {
+  get: function () {
+    return (this._videoEncoder ? this._videoEncoder.encodeQueueSize || 0 : 0) +
+           (this._audioEncoder ? this._audioEncoder.encodeQueueSize || 0 : 0);
+  },
+});
+
+// 'dequeue' — an encoder took something from its queue (WebCodecs'
+// own event; an encoder without it — a polyfill — emits none).
+HLSEncoder.prototype._listenDequeue = function (enc) {
+  var ee = this._ee;
+  if (enc && typeof enc.addEventListener === 'function') {
+    enc.addEventListener('dequeue', function () { ee.emit('dequeue'); });
+  }
+};
 
 /**
  * Push input into the pipeline. Auto-detects the type:
@@ -904,7 +1069,10 @@ HLSEncoder.prototype.feedAudio = function (input, ptsUs) {
  * @param {Uint8Array}  opts.data         ID3v2 frame bytes. Caller is
  *                                        responsible for building a
  *                                        well-formed ID3 tag.
- * @param {number}      opts.timestampUs  Presentation time in microseconds.
+ * @param {number}      opts.timestampUs  Presentation time in microseconds,
+ *                                        on the time base of the frames
+ *                                        fed (the output timeline is
+ *                                        shifted to start at 0 for you).
  *                                        Should fall within (or very close
  *                                        to) the active segment's PTS range
  *                                        — events outside it are dropped
@@ -931,11 +1099,42 @@ HLSEncoder.prototype.feedMetadata = function (opts) {
     this._writer.enableMetadata();
     this._tsMetadataEnabled = true;
   }
-  this._segmentBuilder.pushMetadata(opts.data, {
-    ptsUs:      opts.timestampUs,
-    durationUs: opts.durationUs || 0,
-  });
+  var item = { data: opts.data, ptsUs: opts.timestampUs, durationUs: opts.durationUs || 0 };
+  if (!this._timeline) this._metadataHeld.push(item);   // origin not known yet
+  else this._pushMetadata(item);
   return this;
+};
+
+HLSEncoder.prototype._pushMetadata = function (item) {
+  this._segmentBuilder.pushMetadata(item.data, {
+    ptsUs:      item.ptsUs - this._originUs(),
+    durationUs: item.durationUs,
+  });
+};
+
+/** What to subtract from an input timestamp: the timeline's origin, on this input's clock. */
+HLSEncoder.prototype._originUs = function () {
+  return this._timeline ? this._timeline.originUs - this._timelineClock.offsetUs : 0;
+};
+
+/**
+ * Note an input timestamp on this encoder's output timeline, joining or
+ * opening one on the first (see _joinTimeline), and release metadata
+ * fed before it.
+ */
+HLSEncoder.prototype._touchTimeline = function (ts) {
+  if (!this._timeline) {
+    var j = _joinTimeline(ts, this._opts.video ? 'video' : 'audio');
+    this._timeline = j.timeline;
+    this._timelineClock = j.clock;
+    var held = this._metadataHeld;
+    this._metadataHeld = [];
+    for (var i = 0; i < held.length; i++) this._pushMetadata(held[i]);
+  }
+  var c = this._timelineClock, now = _nowMs();
+  if (ts > c.lastUs) c.lastUs = ts;
+  c.at = now;
+  this._timeline.at = now;
 };
 
 /**
@@ -1041,17 +1240,20 @@ HLSEncoder.prototype.setStart = function (opts) {
  * UI. Requires `captions` option in the HLSEncoder constructor.
  *
  * @param {object} cue
- * @param {number} cue.start  Start time in seconds (>= 0). The caption
+ * @param {number} cue.start  Start time in seconds (>= 0), on the time
+ *                            base of the frames fed. The caption
  *                            becomes visible at this PTS.
  * @param {number} cue.end    End time in seconds (> start). The
  *                            caption disappears at this PTS.
  * @param {string} cue.text   Caption text. Multi-line via "\n".
  *                            Auto-wrapped to 32 cols × 4 rows max.
- *                            Latin-1 extended characters (à, Ç, ß,
- *                            ¿, etc.) emit ASCII fallback + 2-byte
- *                            escape sequences. Characters outside
- *                            the Latin Extended sets fall back to
- *                            "?" (no Cyrillic/Greek/CJK support).
+ *                            CEA-608 character sets: basic-set
+ *                            accents (é, ñ, ...) are single bytes;
+ *                            special characters (®, ½, ♪) are 2-byte
+ *                            codes; extended ones (Ç, ß, ¿) send an
+ *                            ASCII fallback + 2-byte code. Others
+ *                            lose their accents, else become "?"
+ *                            (no Cyrillic/Greek/CJK in 608).
  * @returns {HLSEncoder}      this, for chaining.
  */
 HLSEncoder.prototype.addCaption = function (cue) {
@@ -1164,9 +1366,11 @@ HLSEncoder.prototype.removeRenditionReport = function (uri) {
  *   averageBandwidth  — running mean over all emitted segments.
  *                       Optional in the spec but useful for player ABR.
  *   resolution        — "WxH" derived from video.width/height.
- *   codecs            — comma-joined HLS codec strings derived from
- *                       configured codecs and (when available) the
- *                       captured avcC/hvcC bytes for accurate profile.
+ *   codecs            — comma-joined HLS codec strings. Video: read
+ *                       from the first keyframe's SPS / avcC / hvcC
+ *                       (profile, level, and the 'hev1' sample entry
+ *                       the fMP4 writer uses); before that, the codec
+ *                       string the encoder was configured with.
  *   frameRate         — from video.framerate (default 30).
  *
  * The caller can override any field. Common reasons:
@@ -1223,12 +1427,10 @@ HLSEncoder.prototype.getStreamInf = function (opts) {
   }
 
   // Codecs: video first, then audio. Per HLS RFC 8216 §4.3.4.2 this is
-  // a comma-separated list, no whitespace. The captured avcC/hvcC
-  // (videoConfig on the writer) is non-null only after the first chunk.
-  var capturedConfig = (this._writer && this._writer.getVideoConfig)
-    ? this._writer.getVideoConfig() : null;
-  var vCodecStr = _deriveVideoCodecString(v, capturedConfig);
-  var aCodecStr = _deriveAudioCodecString(a);
+  // a comma-separated list, no whitespace. The bitstream-derived video
+  // string exists from the first keyframe on.
+  var vCodecStr = _deriveVideoCodecString(v, this._actualVideoCodecString);
+  var aCodecStr = _deriveAudioCodecString(a, this._audioDropped);
   var codecsStr;
   if (vCodecStr && aCodecStr) {
     codecsStr = vCodecStr + ',' + aCodecStr;
@@ -1345,9 +1547,7 @@ HLSEncoder.prototype.getIFrameStreamInf = function (opts) {
   }
 
   // Codecs: only video — I-frame variant has no audio.
-  var capturedConfig = (this._writer && this._writer.getVideoConfig)
-    ? this._writer.getVideoConfig() : null;
-  var vCodecStr = _deriveVideoCodecString(v, capturedConfig);
+  var vCodecStr = _deriveVideoCodecString(v, this._actualVideoCodecString);
 
   var resolution;
   if (v && v.width && v.height) {
@@ -1530,27 +1730,64 @@ HLSEncoder.prototype.end = function (callback) {
     pending.push(self._audioEncoder.flush());
   }
 
+  // Every step below is guarded: a throw used to escape from inside
+  // Promise.then(afterFlush) as an unhandled rejection, so end() never
+  // resolved, no 'error' was emitted and the encoders' FFmpeg processes
+  // were left running (fMP4 with a silent audio track: flush() threw).
+  // Now the error goes to 'error' and shutdown always completes.
+  var finished = false;
+  function finish() {
+    if (finished) return;
+    finished = true;
+    try {
+      self._playlist.end();
+      self._ee.emit('manifest', self._playlist.serialize());
+    } catch (e) {
+      self._ee.emit('error', e);
+    }
+    try {
+      if (self._videoEncoder && self._videoEncoder.state !== 'closed') {
+        self._videoEncoder.close();
+      }
+    } catch (e) { self._ee.emit('error', e); }
+    try {
+      if (self._audioEncoder && self._audioEncoder.state !== 'closed') {
+        self._audioEncoder.close();
+      }
+    } catch (e) { self._ee.emit('error', e); }
+    done();
+  }
+
   function afterFlush() {
-    // Step 2 — force any tail content out as the final segment.
-    self._segmentBuilder.flush();
+    try {
+      // Audio held for a VideoFrame that never came: place it as is.
+      self._resolveAudioClock(true);
+      // Metadata fed with no media at all: on its own time base.
+      if (!self._timeline && self._metadataHeld.length) {
+        var mh = self._metadataHeld;
+        self._metadataHeld = [];
+        for (var k = 0; k < mh.length; k++) self._pushMetadata(mh[k]);
+      }
+      // A configured audio track that never delivered anything must not
+      // keep the fMP4 init segment (and so every segment) from being
+      // written — see _maybeDropSilentAudio.
+      self._maybeDropSilentAudio(true);
+      // Step 2 — force any tail content out as the final segment.
+      self._segmentBuilder.flush();
+    } catch (e) {
+      self._ee.emit('error', e);
+    }
 
     // Step 3 — drain the encryption queue. onEncryptionDrained fires
     // its callback on the next tick when nothing's queued, so the
     // shape is identical whether encryption is on or off.
-    self._segmentBuilder.onEncryptionDrained(function () {
-      // Step 4 — finalize and fire the user's callback.
-      self._playlist.end();
-      self._ee.emit('manifest', self._playlist.serialize());
-
-      if (self._videoEncoder && self._videoEncoder.state !== 'closed') {
-        self._videoEncoder.close();
-      }
-      if (self._audioEncoder && self._audioEncoder.state !== 'closed') {
-        self._audioEncoder.close();
-      }
-
-      done();
-    });
+    // Step 4 — finalize and fire the user's callback.
+    try {
+      self._segmentBuilder.onEncryptionDrained(finish);
+    } catch (e) {
+      self._ee.emit('error', e);
+      finish();
+    }
   }
 
   if (pending.length === 0) {
@@ -1699,6 +1936,7 @@ HLSEncoder.prototype._ensureConfigured = function () {
     partDuration: this._partDurationSec,
     iFramePlaylist: this._iFramePlaylistEnabled,
     hasVideo: !!opts.video,
+    gridAligned: this._forceKeyframes,
     encryption: encryptionForBuilder,
     onSegment: function (info) { self._onSegment(info); },
     onPart:    function (info) { self._onPart(info); },
@@ -1751,6 +1989,7 @@ HLSEncoder.prototype._configureVideoEncoder = function () {
     output: function (chunk, metadata) { self._onVideoChunk(chunk, metadata); },
     error:  function (err) { self._ee.emit('error', err); },
   });
+  this._listenDequeue(this._videoEncoder);
 
   var cfg = {
     codec: codec,
@@ -1840,6 +2079,7 @@ HLSEncoder.prototype._configureAudioEncoder = function () {
     output: function (chunk, metadata) { self._onAudioChunk(chunk, metadata); },
     error:  function (err) { self._ee.emit('error', err); },
   });
+  this._listenDequeue(this._audioEncoder);
   this._audioEncoderConfigured = false;
 };
 
@@ -1904,18 +2144,40 @@ HLSEncoder.prototype._encodeVideoFrame = function (frame, ptsUsOverride) {
     throw new Error('HLSEncoder.feed: VideoFrame has no timestamp; pass ptsUs as 2nd arg');
   }
 
-  // Decide whether to force a keyframe at this frame.
+  this._touchTimeline(ts);
+
+  // Decide whether to force a keyframe at this frame: the first frame,
+  // then the first frame on or after each multiple of segmentDuration
+  // on the shared timeline — the grid SegmentBuilder cuts on
+  // (gridAligned). It used to be segmentDuration after this encoder's
+  // previous forced keyframe, so a rendition that joined mid-stream
+  // keyed (and segmented) out of step with the others.
   var forceKey = false;
   if (this._forceKeyframes) {
-    forceKey = (this._lastForcedKeyframeUs === null) ||
-               (ts - this._lastForcedKeyframeUs >= this._segmentDurationUs);
+    var cell = Math.floor((ts - this._originUs()) / this._segmentDurationUs);
+    forceKey = (this._lastForcedKeyframeUs === null) || cell > this._lastKeyCell;
+    if (forceKey) this._lastKeyCell = cell;
   }
+
+  // A segment-boundary keyframe is mandatory, so it carries
+  // bypassThrottle (as GopCoordinator's do). Without it, the Node
+  // VideoEncoder's PLI-storm guard drops any forced keyframe within
+  // 1000 ms of WALL-CLOCK time of the previous one: 20 s of input fed
+  // in 368 ms produced segments of 2.000 s and then 18.032 s under
+  // TARGETDURATION:2, and in real time with segmentDuration:1 every
+  // boundary slipped a frame (1.033 s). A browser VideoEncoder ignores
+  // the unknown member, so the call is the same in both environments.
+  var encodeOpts = forceKey ? { keyFrame: true, bypassThrottle: true } : { keyFrame: false };
 
   // If the user supplied a timestamp override that differs from the
   // frame's own timestamp, we wrap into a new VideoFrame. The new
   // frame shares the underlying buffer (zero-copy) and is closed
   // immediately after encode() takes its data.
   this._videoInputPtsQueue.push(ts);
+  if (!this._clockVideo) {
+    this._clockVideo = { ts: ts, at: _nowMs() };
+    this._resolveAudioClock();
+  }
   if (hasOverride && ts !== frame.timestamp) {
     // Re-wrap with the overridden timestamp. Use the incoming frame's
     // OWN constructor rather than a global `VideoFrame` — in Node the
@@ -1924,10 +2186,10 @@ HLSEncoder.prototype._encodeVideoFrame = function (frame, ptsUsOverride) {
     // injection seam). Shares the underlying buffer (zero-copy).
     var VF = frame.constructor;
     var wrapped = new VF(frame, { timestamp: ts });
-    this._videoEncoder.encode(wrapped, { keyFrame: forceKey });
+    this._videoEncoder.encode(wrapped, encodeOpts);
     wrapped.close();
   } else {
-    this._videoEncoder.encode(frame, { keyFrame: forceKey });
+    this._videoEncoder.encode(frame, encodeOpts);
   }
 
   if (forceKey) this._lastForcedKeyframeUs = ts;
@@ -1945,6 +2207,26 @@ HLSEncoder.prototype._encodeAudioData = function (audioData, ptsUsOverride) {
   }
   if (audioData.timestamp === null || audioData.timestamp === undefined) {
     throw new Error('HLSEncoder.feed: AudioData has no timestamp');
+  }
+
+  if (this._audioDropped) {
+    // The track was dropped (see _maybeDropSilentAudio) and the init
+    // segment has no audio — this data has nowhere to go.
+    if (!this._audioDroppedReported) {
+      this._audioDroppedReported = true;
+      this._ee.emit('error', new Error('HLSEncoder: AudioData arrived after the ' +
+        'audio track was dropped for delivering nothing for a whole segment; ' +
+        'the stream continues video-only and this audio is discarded'));
+    }
+    return;
+  }
+
+  // Audio sets the timeline only without video: with video, audio may
+  // run on another clock and is moved onto the video's.
+  if (!this._opts.video) this._touchTimeline(audioData.timestamp);
+  if (!this._clockAudio) {
+    this._clockAudio = { ts: audioData.timestamp, at: _nowMs() };
+    this._resolveAudioClock();
   }
 
   // Lazy configure on first frame so we can match the input's actual
@@ -2006,19 +2288,46 @@ HLSEncoder.prototype._onVideoChunk = function (chunk, metadata) {
     }
 
     if (configBytes) {
-      this._writer.setVideoConfig(configBytes, {
+      this._videoConfigDims = {
         width:  (dcfg && dcfg.codedWidth)  || v.width,
         height: (dcfg && dcfg.codedHeight) || v.height,
-      });
+      };
+      this._writer.setVideoConfig(configBytes, this._videoConfigDims);
       this._videoConfigCaptured = true;
     }
+  }
+
+  // Before caption SEI injection: the AU exactly as the encoder made it.
+  if (this._actualVideoCodecString === null && chunk.type === 'key') {
+    this._captureVideoCodecString(au, metadata && metadata.decoderConfig);
   }
 
   // Use the input frame's PTS, not chunk.timestamp — see the comment
   // at _videoInputPtsQueue in the constructor for why. With realtime
   // mode the queue is FIFO (no reordering), so shift() always pairs
   // the next chunk with its original input PTS.
-  var ptsUs = this._videoInputPtsQueue.shift();
+  //
+  // But an encoder may also DROP frames (the Node VideoEncoder evicts a
+  // retired FFmpeg's buffered frames when more than 4 keyframe restarts
+  // are pending — input fed much faster than real time). Then the FIFO
+  // pairs every later chunk with an earlier frame's PTS: measured, chunk
+  // #8 (timestamp 2.000 s) was stamped 0.267 s and segment durations
+  // came out 2.467 / 9.633 / 4.167 s. So when chunk.timestamp equals a
+  // queued input PTS, that is the frame — the entries before it were
+  // dropped and are discarded. Only when it matches none (a browser
+  // that regenerated timestamps) is the FIFO head used.
+  var ptsUs;
+  var q = this._videoInputPtsQueue;
+  var hit = -1;
+  for (var qi = 0; qi < q.length && qi < 256; qi++) {
+    if (q[qi] === chunk.timestamp) { hit = qi; break; }
+  }
+  if (hit >= 0) {
+    ptsUs = q[hit];
+    q.splice(0, hit + 1);
+  } else {
+    ptsUs = q.shift();
+  }
   if (ptsUs === undefined) {
     // Defensive: should never happen in practice. Fall back to
     // chunk.timestamp so we still produce output rather than crash.
@@ -2046,10 +2355,77 @@ HLSEncoder.prototype._onVideoChunk = function (chunk, metadata) {
     }
   }
 
+  // CEA-608 above is scheduled on the input time base (addCaption's
+  // times are); the builder gets the output timeline.
   this._segmentBuilder.pushVideo(au, {
-    ptsUs: ptsUs,
+    ptsUs: ptsUs - this._originUs(),
     isKey: chunk.type === 'key',
   });
+  this._maybeDropSilentAudio(false);
+};
+
+/**
+ * Record the CODECS string of the video the encoder actually produced:
+ * H.264 / H.265 from the SPS (TS: the Annex-B keyframe; fMP4: the
+ * avcC / hvcC handed to the writer), else decoderConfig.codec. H.265 is
+ * always 'hev1' — the fMP4 writer's sample entry is hev1 and TS carries
+ * the parameter sets in-band.
+ */
+HLSEncoder.prototype._captureVideoCodecString = function (au, dcfg) {
+  var codec = (this._opts.video && this._opts.video.codec) || 'h264';
+  var str = null;
+  try {
+    if (codec === 'h264' || codec === 'h265') {
+      var isH265 = codec === 'h265';
+      if (this._format === 'ts') {
+        str = codecStringFromAnnexB(au, isH265);
+      } else {
+        var rec = this._writer.getVideoConfig ? this._writer.getVideoConfig() : null;
+        if (rec) str = isH265 ? codecStringFromHvcC(rec, 'hev1') : codecStringFromAvcC(rec, 'avc1');
+      }
+    }
+  } catch (e) { str = null; }
+  if (!str && dcfg && typeof dcfg.codec === 'string' && dcfg.codec.indexOf('.') > 0) {
+    str = dcfg.codec;
+  }
+  if (str && codec === 'h265' && str.indexOf('hvc1') === 0) str = 'hev1' + str.slice(4);
+  if (str) this._actualVideoCodecString = str;
+};
+
+/**
+ * fMP4 with an audio track configured that never delivers anything (a
+ * muted / ended mic, a video-only source): the init segment needs the
+ * AAC AudioSpecificConfig, which only comes with the first audio chunk,
+ * so nothing could ever be written. Segments piled up behind
+ * canWriteInit(), SegmentBuilder.flush() threw inside end()'s promise
+ * chain (an unhandled rejection), end() never resolved, no 'error' was
+ * emitted and the video encoder's FFmpeg was left running.
+ *
+ * Instead, once a full segment of video is waiting and no AudioData has
+ * been fed at all — or at end() with still no audio config — the audio
+ * track is dropped: the writer is rebuilt without it, the init segment
+ * is written with video only and CODECS no longer lists audio. Audio fed
+ * after that is refused with one 'error'.
+ *
+ * @param {boolean} atEnd  end of stream: drop even if AudioData was fed
+ */
+HLSEncoder.prototype._maybeDropSilentAudio = function (atEnd) {
+  if (this._format !== 'fmp4' || !this._opts.audio || !this._opts.video) return;
+  if (this._audioDropped || this._audioConfigCaptured || !this._videoConfigCaptured) return;
+  if (!this._segmentBuilder) return;
+  if (!atEnd) {
+    // AudioData was fed: chunks are on their way (encoder latency).
+    if (this._audioEncoderConfigured) return;
+    if (!this._segmentBuilder.hasPendingBoundary()) return;
+  }
+  var v = this._opts.video;
+  var writer = new FMP4Writer({
+    video: { codec: v.codec || 'h264', width: v.width, height: v.height },
+  });
+  writer.setVideoConfig(this._writer.getVideoConfig(), this._videoConfigDims);
+  this._writer = writer;
+  this._audioDropped = true;
+  this._segmentBuilder.disableAudio(writer);
 };
 
 HLSEncoder.prototype._onAudioChunk = function (chunk, metadata) {
@@ -2110,10 +2486,50 @@ HLSEncoder.prototype._onAudioChunk = function (chunk, metadata) {
 
   this._audioChunksEmitted++;
 
+  // Until the first VideoFrame has arrived the clock offset is unknown
+  // (see _alignClocks in the constructor); hold the chunk rather than
+  // place it on a timeline that may be the wrong one.
+  if (this._audioClockOffsetUs === null) {
+    this._audioHeld.push({ data: data, ptsUs: ptsUs, durationUs: durationUs });
+    return;
+  }
   this._segmentBuilder.pushAudio(data, {
-    ptsUs: ptsUs,
+    ptsUs: ptsUs + this._audioClockOffsetUs - this._originUs(),
     durationUs: durationUs,
   });
+};
+
+/**
+ * Settle the audio → video clock offset once it can be known: when both
+ * first inputs have arrived, or right away when there is no video track
+ * to align to. Releases the audio chunks held meanwhile.
+ *
+ * @param {boolean} force  end of stream: no video is coming, use 0
+ */
+HLSEncoder.prototype._resolveAudioClock = function (force) {
+  if (this._audioClockOffsetUs !== null) return;
+  var off = 0;
+  if (this._opts.video && !force) {
+    if (!this._clockVideo || !this._clockAudio) return;
+    var v = this._clockVideo, a = this._clockAudio;
+    // Where the first AudioData would sit on the video clock.
+    var expected = v.ts + Math.round((a.at - v.at) * 1000);
+    if (this._alignClocks && Math.abs(expected - a.ts) > _CLOCK_MISMATCH_US) {
+      off = expected - a.ts;
+    }
+  }
+  this._audioClockOffsetUs = off;
+  // No VideoFrame ever came (end of stream): the audio sets the timeline.
+  if (!this._timeline && this._clockAudio) this._touchTimeline(this._clockAudio.ts);
+  var origin = this._originUs();
+  var held = this._audioHeld;
+  this._audioHeld = [];
+  for (var i = 0; i < held.length; i++) {
+    this._segmentBuilder.pushAudio(held[i].data, {
+      ptsUs: held[i].ptsUs + off - origin,
+      durationUs: held[i].durationUs,
+    });
+  }
 };
 
 
@@ -2135,6 +2551,18 @@ HLSEncoder.prototype._onSegment = function (info) {
 
   // Media segment.
   var uri = this._segmentUriPattern.replace('{n}', info.sequence);
+
+  // A segment that failed to encrypt (SegmentBuilder delivers it with
+  // gap:true, bytes:null; the 'error' event already fired). It is listed
+  // as EXT-X-GAP so it keeps its Media Sequence Number — the AES-128 IV
+  // of every later segment is its MSN — and the timeline keeps its
+  // duration. No 'segment' event: there are no bytes to publish, and
+  // players don't fetch a GAP URI.
+  if (info.gap) {
+    this._playlist.addSegment({ uri: uri, duration: info.duration, gap: true });
+    this._ee.emit('manifest', this._playlist.serialize());
+    return;
+  }
 
   this._playlist.addSegment({
     uri: uri,

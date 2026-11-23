@@ -49,6 +49,7 @@
  */
 
 import { writeU16BE, writeU32BE, writeU64BE, concat, fromAscii } from './core/bytes.js';
+import { getOpusPacketDurationUs } from './utils/opus_utils.js';
 
 
 // ── Box helpers ────────────────────────────────────────────
@@ -754,7 +755,7 @@ function _writeTfdtInto(buf, off, baseDecodeTime) {
   return off + 20;
 }
 
-function _writeVideoTrunInto(buf, off, chunks, dtsTicks, ptsTicks, dataOffset, endPtsUs) {
+function _writeVideoTrunInto(buf, off, chunks, dtsTicks, ptsTicks, dataOffset, endTicks) {
   var perSample = 16;
   var size = 20 + chunks.length * perSample;
   // flags: data_offset + per-sample duration/size/flags + composition_time_offset
@@ -770,18 +771,15 @@ function _writeVideoTrunInto(buf, off, chunks, dtsTicks, ptsTicks, dataOffset, e
   writeU32BE(buf, off + 16, dataOffset);
 
   var n = chunks.length;
-  var endTicks = (endPtsUs !== undefined && endPtsUs !== null)
-    ? _usToTicks(endPtsUs, VIDEO_TIMESCALE)
-    : -1;
 
   var p = off + 20;
   for (var i = 0; i < n; i++) {
     var c = chunks[i];
     var dts_i = dtsTicks[i];
 
-    // duration = next DTS - this DTS. Last sample uses endPtsUs (next
-    // segment boundary) when available, otherwise the previous frame's
-    // interval. See the longer comment in writeSegment for why this
+    // duration = next DTS - this DTS. Last sample uses endTicks — the
+    // segment boundary on the DECODE timeline, see writeSegment — when
+    // available, otherwise the previous frame's interval. See the longer comment in writeSegment for why this
     // matters — under-counting the last sample's duration leaves
     // audio-leads-video drift across segment boundaries.
     var durTicks;
@@ -841,12 +839,12 @@ function _writeAudioTrunInto(buf, off, chunks, dataOffset, samplesPerFrame) {
   return off + size;
 }
 
-function _writeVideoTrafInto(buf, off, baseDts, chunks, dtsTicks, ptsTicks, dataOffset, endPtsUs) {
+function _writeVideoTrafInto(buf, off, baseDts, chunks, dtsTicks, ptsTicks, dataOffset, endTicks) {
   var trafBase = off;
   off += 8;  // reserve space for traf header (size + 'traf'); patched below
   off = _writeTfhdInto(buf, off, VIDEO_TRACK_ID);
   off = _writeTfdtInto(buf, off, baseDts);
-  off = _writeVideoTrunInto(buf, off, chunks, dtsTicks, ptsTicks, dataOffset, endPtsUs);
+  off = _writeVideoTrunInto(buf, off, chunks, dtsTicks, ptsTicks, dataOffset, endTicks);
   writeU32BE(buf, trafBase, off - trafBase);
   buf[trafBase + 4] = 0x74; buf[trafBase + 5] = 0x72; buf[trafBase + 6] = 0x61; buf[trafBase + 7] = 0x66;  // 'traf'
   return off;
@@ -992,6 +990,15 @@ function FMP4Writer(opts) {
   this._audioFirstChunkBaseTicks = null;
   this._audioCumulativeSamples = 0;
   this._audioSamplesPerFrame = null;
+
+  // Decode-timeline shift for video, in VIDEO_TIMESCALE ticks, fixed on
+  // the first video segment (null until then). With B-frames the first
+  // DTS precedes the first PTS — WebCodecs-style PTS 0 gives DTS -66667
+  // µs for two reordered frames — and tfdt.baseMediaDecodeTime is
+  // UNSIGNED: -6000 ticks was written as 2^64-6000. Every DTS is moved
+  // forward by the same amount so the first one is 0, and the PTS are
+  // kept exactly by the (signed, trun v1) composition offsets.
+  this._videoDtsShift = null;
 
   // Sequential ID for emsg events. Players use this to dedupe events
   // when the same segment is delivered more than once (e.g., on retry
@@ -1220,7 +1227,7 @@ FMP4Writer.prototype.writeSegment = function (videoChunks, audioChunks, endPtsUs
   // sample-object array is allocated.
 
   var videoSorted = null, videoSize = 0, videoBaseDts = 0;
-  var videoDtsTicks = null, videoPtsTicks = null;
+  var videoDtsTicks = null, videoPtsTicks = null, videoEndTicks = -1;
   if (videoChunks.length > 0) {
     // fMP4 trun is a decode-order list, so we need DTS-ascending. Inputs
     // come from the segment-builder which doesn't reorder; in WebCodecs
@@ -1246,11 +1253,28 @@ FMP4Writer.prototype.writeSegment = function (videoChunks, audioChunks, endPtsUs
     videoPtsTicks = new Float64Array(v.length);
     for (var vi = 0; vi < v.length; vi++) {
       var vc = v[vi];
-      videoDtsTicks[vi] = _usToTicks(vc.dtsUs, VIDEO_TIMESCALE);
+      var dUs = (vc.dtsUs !== undefined && vc.dtsUs !== null) ? vc.dtsUs : vc.ptsUs;
+      videoDtsTicks[vi] = _usToTicks(dUs, VIDEO_TIMESCALE);
       videoPtsTicks[vi] = _usToTicks(vc.ptsUs, VIDEO_TIMESCALE);
       videoSize += vc.au.length;
     }
+    if (this._videoDtsShift === null) {
+      this._videoDtsShift = videoDtsTicks[0] < 0 ? -videoDtsTicks[0] : 0;
+    }
+    if (this._videoDtsShift) {
+      for (var vs = 0; vs < v.length; vs++) videoDtsTicks[vs] += this._videoDtsShift;
+    }
     videoBaseDts = videoDtsTicks[0];
+    if (videoBaseDts < 0) videoBaseDts = 0;   // unsigned field; earlier than the first segment's DTS
+
+    // The last sample's duration ends at the segment boundary on the
+    // DECODE timeline: endPts minus the reorder delay (PTS - DTS) of the
+    // segment's first sample, which is a keyframe. It was endPts - lastDts,
+    // mixing the two timelines: with two reordered frames the last frame
+    // of each segment lasted 3 frames (9000 ticks instead of 3000).
+    if (endPtsUs !== undefined && endPtsUs !== null) {
+      videoEndTicks = _usToTicks(endPtsUs, VIDEO_TIMESCALE) - (videoPtsTicks[0] - videoDtsTicks[0]);
+    }
   }
 
   var audioSorted = null, audioSize = 0, audioBaseDts = 0;
@@ -1277,9 +1301,13 @@ FMP4Writer.prototype.writeSegment = function (videoChunks, audioChunks, endPtsUs
       var firstDurUs = a[0].durationUs;
       if (firstDurUs && firstDurUs > 0) {
         this._audioSamplesPerFrame = Math.round(firstDurUs * aTimescale / 1000000);
+      } else if (this._audio && this._audio.codec === 'opus') {
+        // No duration: Opus frames are read from the TOC byte. The
+        // fallback was 1024 (AAC's) for every codec, so a 20 ms Opus
+        // stream (960 samples) ran 6.7% slow against video.
+        this._audioSamplesPerFrame = Math.round(getOpusPacketDurationUs(a[0].data) * aTimescale / 1000000) || 960;
       } else {
-        // No duration on the chunk — assume AAC LC (1024). This matches
-        // existing behavior for callers who never populated durationUs.
+        // No duration on the chunk — AAC LC (1024 samples per frame).
         this._audioSamplesPerFrame = 1024;
       }
     }
@@ -1370,7 +1398,7 @@ FMP4Writer.prototype.writeSegment = function (videoChunks, audioChunks, endPtsUs
   if (videoSorted) {
     mp = _writeVideoTrafInto(out, mp, videoBaseDts, videoSorted,
                              videoDtsTicks, videoPtsTicks,
-                             dataOffsetVideo, endPtsUs);
+                             dataOffsetVideo, videoEndTicks);
   }
   if (audioSorted) {
     mp = _writeAudioTrafInto(out, mp, audioBaseDts, audioSorted,

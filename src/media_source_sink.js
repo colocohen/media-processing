@@ -17,7 +17,10 @@ import AudioData from './audio_data.js';
 function _createTrack(self, kind, label) {
   var track = new MediaStreamTrack({ kind: kind, label: label });
   self._tracks.push(track);
-  track.on('ended', function () {
+  // Dropped when its SOURCE stops — the track and every clone of it
+  // stopped. Its own stop() is not enough: a clone may still be live and
+  // is fed through it (track._push reaches all tracks of the source).
+  track.on('_sourceStopped', function () {
     for (var i = 0; i < self._tracks.length; i++) {
       if (self._tracks[i].id === track.id) {
         self._tracks.splice(i, 1);
@@ -47,14 +50,33 @@ function _createTrack(self, kind, label) {
  */
 function _pushToTracks(self, data) {
   var delivered = 0;
+  var targets = [];
   for (var i = 0; i < self._tracks.length; i++) {
-    if (self._tracks[i].readyState === 'live') {
-      self._tracks[i]._push(data);
-      delivered++;
-    }
+    if (!self._tracks[i]._source || !self._tracks[i]._source.stopped) targets.push(self._tracks[i]);
   }
-  if (delivered === 0) _warnDropped(self);
+  for (var j = 0; j < targets.length; j++) {
+    // _push reaches the track and its clones. Each created track gets its
+    // own reference (consumers close() what they receive).
+    var d = (j < targets.length - 1 && data && typeof data.clone === 'function') ? data.clone() : data;
+    delivered += targets[j]._push(d);
+  }
+  if (delivered === 0) {
+    try { if (data && typeof data.close === 'function' && !targets.length) data.close(); } catch (e) {}
+    _warnDropped(self);
+  }
   return delivered;
+}
+
+// Every track of every source this producer created: the created tracks
+// and their clones.
+function _allTracks(self) {
+  var out = [];
+  for (var i = 0; i < self._tracks.length; i++) {
+    var src = self._tracks[i]._source;
+    var list = src ? src.tracks : [self._tracks[i]];
+    for (var j = 0; j < list.length; j++) out.push(list[j]);
+  }
+  return out;
 }
 
 function _warnDropped(self) {
@@ -140,8 +162,9 @@ VideoSource.prototype.onFrame = function (frame) {
   if (w && h && (w !== this._lastWidth || h !== this._lastHeight)) {
     this._lastWidth = w;
     this._lastHeight = h;
-    for (var i = 0; i < this._tracks.length; i++) {
-      var t = this._tracks[i];
+    var all = _allTracks(this);
+    for (var i = 0; i < all.length; i++) {
+      var t = all[i];
       if (!t._settings) t._settings = {};
       t._settings.width = w;
       t._settings.height = h;
@@ -174,7 +197,12 @@ AudioSource.prototype.onData = function (data) {
   if (!data || !data.samples) return 0;
   var sampleRate = data.sampleRate || 48000;
   var channels = data.channelCount || 1;
-  var buf = data.samples instanceof Uint8Array ? data.samples : new Uint8Array(data.samples.buffer);
+  // The view's own bytes: `.buffer` alone is the WHOLE underlying
+  // ArrayBuffer, so a subarray() — or an Int16Array over a pooled Buffer —
+  // sent everything around it too (960 frames for a 480-frame view).
+  var s = data.samples;
+  var buf = s instanceof Uint8Array ? s : (ArrayBuffer.isView(s)
+    ? new Uint8Array(s.buffer, s.byteOffset, s.byteLength) : new Uint8Array(s));
   var numberOfFrames = data.numberOfFrames || (buf.length / (channels * 2));
   var durationUs = Math.round((numberOfFrames * 1e6) / sampleRate);
 
@@ -197,9 +225,10 @@ AudioSource.prototype.onData = function (data) {
 function _defineLiveTrackCount(Ctor) {
   Object.defineProperty(Ctor.prototype, 'liveTrackCount', {
     get: function () {
-      var n = 0;
-      for (var i = 0; i < this._tracks.length; i++) {
-        if (this._tracks[i].readyState === 'live') n++;
+      // Clones count: they receive what is pushed.
+      var all = _allTracks(this), n = 0;
+      for (var i = 0; i < all.length; i++) {
+        if (all[i].readyState === 'live') n++;
       }
       return n;
     },
@@ -232,7 +261,12 @@ function _setupSink(self, track, kind, eventName, cbProp) {
   };
 
   track.on(eventName, self._handler);
-  track.on('ended', function () { self.stop(); });
+  // A reference, so stop() can remove it: it leaked one 'ended' listener
+  // on the track per sink ever created (100 sinks → 100 listeners).
+  // '_stopped': the track stopped delivering — by its own stop() (which
+  // fires no 'ended') or because the source ended.
+  self._onEnded = function () { self.stop(); };
+  track.on('_stopped', self._onEnded);
 
   self.on = function (ev, fn) { self._ee.on(ev, fn); };
   self.off = function (ev, fn) { self._ee.off(ev, fn); };
@@ -240,6 +274,7 @@ function _setupSink(self, track, kind, eventName, cbProp) {
     if (self.stopped) return;
     self.stopped = true;
     track.off(eventName, self._handler);
+    track.off('_stopped', self._onEnded);
     self._ee.emit('stopped');
   };
 }

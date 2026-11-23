@@ -12,6 +12,14 @@
  *         Each is given an ADTS header built from the ASC before FFmpeg.
  *         without description: ADTS frames, passed through as-is.
  *
+ *   PCM   'pcm-u8' / 'pcm-s16' / 'pcm-s24' / 'pcm-s32' / 'pcm-f32'
+ *         (WebCodecs registry: interleaved samples) — raw input, with
+ *         the sample format, rate and channels given to FFmpeg.
+ *
+ *   Vorbis raw packets + description (the Xiph-laced identification,
+ *         comment and setup headers): wrapped in Matroska, whose A_VORBIS
+ *         CodecPrivate is exactly that description.
+ *
  *   Others (MP3, FLAC, …) are passed through; FFmpeg auto-detects.
  *
  * Before this, Opus needed a non-standard `rawFrames: true` (without it
@@ -19,7 +27,24 @@
  * of the first chunk, so the browser's default raw-AAC form did not decode.
  */
 
-import { initCoder, configureCoder, applyCoderPrototype } from './base_coder.js';
+import { initCoder, configureCoder, applyCoderPrototype, watchExit, detachCoderListeners } from './base_coder.js';
+
+// Output PCM: FFmpeg's interleaved format and bytes per sample, by the
+// outputFormat's sample type.
+var _FF_PCM  = { u8: 'u8', s16: 's16le', s32: 's32le', f32: 'f32le' };
+var _OUT_BPS = { u8: 1, s16: 2, s32: 4, f32: 4 };
+function _baseFormat(fmt) { return String(fmt || 's16').replace('-planar', ''); }
+function _isG711(codec) { return codec === 'g711-alaw' || codec === 'g711-ulaw' || codec === 'alaw' || codec === 'ulaw'; }
+// WebCodecs PCM codec strings → FFmpeg raw input format, bytes/sample.
+// There was no PCM input at all: 'pcm-s16' had no container, so the
+// chunks the Demuxer emits for a WAV/PCM track could not be decoded.
+var _PCM_IN = {
+  'pcm-u8':  { fmt: 'u8',    bps: 1 },
+  'pcm-s16': { fmt: 's16le', bps: 2 },
+  'pcm-s24': { fmt: 's24le', bps: 3 },
+  'pcm-s32': { fmt: 's32le', bps: 4 },
+  'pcm-f32': { fmt: 'f32le', bps: 4 },
+};
 import { normalizeCodec } from './utils/codec_strings.js';
 import FrameQueue from './core/frame_queue.js';
 import AudioData from './audio_data.js';
@@ -28,6 +53,7 @@ import { getOpusPacketDurationUs } from './utils/opus_utils.js';
 import { parseAudioSpecificConfig, wrapAdtsWithConfig } from './utils/aac_utils.js';
 import { toUint8Array } from './core/buffer_source.js';
 import { getDefaultContainer, getContainer, getContainerFormat } from './containers.js';
+import MKVWriter from './writer_mkv.js';
 
 function AudioDecoder(init) {
   if (!init) throw new TypeError('AudioDecoder: init required');
@@ -77,12 +103,43 @@ AudioDecoder.prototype.configure = function (config) {
 
   this._descriptionSent = false;
   this._keyChunkRequired = true;   // reset per configure(), per spec
+  this._pcmIn = _PCM_IN[this._config.codec] || null;
+
+  // Vorbis: raw packets need the three header packets, which WebCodecs
+  // carries as the description. Without one there is nothing to decode
+  // with (the registry makes it required).
+  this._mkv = null;
+  if (this._config.codec === 'vorbis') {
+    if (!this._config.description) {
+      throw new TypeError('AudioDecoder.configure: vorbis requires a description (Xiph-laced header packets)');
+    }
+    this._mkv = new MKVWriter({ tracks: [{
+      type: 'audio', codecId: 'A_VORBIS',
+      codecPrivate: new Uint8Array(toUint8Array(this._config.description)),
+      sampleRate: this._config.sampleRate, channels: this._config.numberOfChannels,
+    }] });
+  }
 
   // Opus chunks are raw packets (as in a browser): wrap them in OGG.
   this._oggMuxer = null;
   this._oggHeadersFed = false;
   if (this._config.codec === 'opus') {
+    // The description, when given, IS the stream's OpusHead (WebCodecs
+    // Opus registration): use it, so a multichannel stream keeps its
+    // channel mapping family and table. A header rebuilt from the
+    // channel count alone matched only the libopus default layout.
+    // Its pre-skip is zeroed for the reason below.
+    var head = null;
+    if (this._config.description) {
+      head = new Uint8Array(toUint8Array(this._config.description));
+      if (head.length >= 19 && String.fromCharCode.apply(null, head.subarray(0, 8)) === 'OpusHead') {
+        head[10] = 0; head[11] = 0;
+      } else {
+        head = null;
+      }
+    }
     this._oggMuxer = new OggWriter({
+      opusHead:   head || undefined,
       channels:   this._config.numberOfChannels,
       // Mid-stream wrapping — don't ask the decoder to discard samples.
       // (pre-skip is only meaningful when starting a fresh encode.)
@@ -92,9 +149,17 @@ AudioDecoder.prototype.configure = function (config) {
   }
 
   this._frameIndex = 0;
-  this._inputQueue = [];        // MP-23: clear any prior session's records
-  this._consumedAtHead = 0;
-  var bps = (this._config.outputFormat === 'f32' || this._config.outputFormat === 'f32-planar') ? 4 : 2;
+  // Input records, one per decode(): {start, samples, timestamp} — where
+  // the chunk's samples begin in this run's output PCM stream, how many
+  // there are, and its timestamp. Outputs are stamped from the record
+  // holding their first sample (_timestampAt), and a record leaves the
+  // queue — decodeQueueSize drops by one — once the output has passed
+  // all of its samples (see _emitPcm).
+  this._inputQueue = [];
+  this._runInputSamples = 0;
+  this._outPos = 0;
+  this._queueByInput = true;
+  var bps = _OUT_BPS[_baseFormat(this._config.outputFormat)] || 2;
   this._bytesPerChunk = Math.floor(this._config.sampleRate / 100) * this._config.numberOfChannels * bps;
   this._fq = null;
 
@@ -177,15 +242,30 @@ AudioDecoder.prototype.decode = function (chunk) {
     // 48-kHz-Opus-clock samples to output-rate samples for the
     // output PCM stream.
     var outputSamplesForChunk = Math.round(samples * this._config.sampleRate / 48000);
-    this._inputQueue.push({
-      timestamp: chunk.timestamp,
-      samplesRemaining: outputSamplesForChunk,
-    });
+    this._pushInputRecord(chunk.timestamp, outputSamplesForChunk);
     this._ffmpeg.write(this._oggMuxer.writePacket(chunk.data, samples));
     return;
   }
 
-  if (this._config.codec === 'aac') {
+  if (this._mkv) {
+    // Vorbis: one SimpleBlock per packet, after the Matroska header.
+    // Block timestamps are relative to the run's first chunk (they
+    // must be >= 0); output timestamps come from the input records.
+    this._queueSize++;
+    if (!this._mkvHeaderFed) {
+      this._ffmpeg.write(this._mkv.writeHeader());
+      this._mkvHeaderFed = true;
+      this._mkvBaseTs = chunk.timestamp;
+    }
+    this._ffmpeg.write(this._mkv.writeFrame(1, chunk.data, chunk.timestamp - this._mkvBaseTs, true));
+  } else if (this._pcmIn) {
+    // Raw PCM: the sample count is exact — bytes / (channels * bytes per sample).
+    this._queueSize++;
+    this._ffmpeg.write(chunk.data);
+    var pcmFrames = Math.floor(chunk.data.length / (this._config.numberOfChannels * this._pcmIn.bps));
+    this._pushInputRecord(chunk.timestamp, pcmFrames);
+    return;
+  } else if (this._config.codec === 'aac') {
     // Raw AAC (description given) → ADTS; ADTS chunks pass through.
     this._queueSize++;
     this._ffmpeg.write(this._aacConfig ? wrapAdtsWithConfig(chunk.data, this._aacConfig) : chunk.data);
@@ -213,6 +293,9 @@ AudioDecoder.prototype.decode = function (chunk) {
   var outSamples;
   if (chunk.duration && chunk.duration > 0) {
     outSamples = Math.round(chunk.duration * this._config.sampleRate / 1e6);
+  } else if (_isG711(this._config.codec)) {
+    // One 8 kHz sample per byte — exact, unlike the 1024 guess below.
+    outSamples = Math.round(chunk.data.length * this._config.sampleRate / 8000);
   } else {
     // Codec-default frame size at config sample rate. For AAC/MP3
     // this is typically 1024; for FLAC, variable. This is best-effort
@@ -220,17 +303,108 @@ AudioDecoder.prototype.decode = function (chunk) {
     // chunk.duration so this path isn't hit.
     outSamples = 1024;
   }
-  this._inputQueue.push({
-    timestamp: chunk.timestamp,
-    samplesRemaining: outSamples,
+  this._pushInputRecord(chunk.timestamp, outSamples);
+};
+
+AudioDecoder.prototype._pushInputRecord = function (timestamp, samples) {
+  this._inputQueue.push({ start: this._runInputSamples, samples: samples, timestamp: timestamp });
+  this._runInputSamples += samples;
+};
+
+/**
+ * Timestamp of the output sample at `pos` (samples from the start of the
+ * run): the input chunk it came from plus the offset into it.
+ *
+ * This replaced per-record "samplesRemaining" bookkeeping that, whenever
+ * an output (10 ms) ran past the end of its record, dropped the record
+ * and restarted the count at 0 — the overshoot was thrown away instead of
+ * carried. Any chunk that is not a multiple of 10 ms drifted: AAC (21.33
+ * ms) lost 580 ms over 2 s (0, 10, 20, 21.3, 31.3 ms...), 5 ms Opus ran
+ * at half speed.
+ */
+AudioDecoder.prototype._timestampAt = function (pos) {
+  var q = this._inputQueue, sr = this._config.sampleRate;
+  for (var i = 0; i < q.length; i++) {
+    if (pos < q[i].start + q[i].samples || i === q.length - 1) {
+      return Math.round(q[i].timestamp + (pos - q[i].start) * 1e6 / sr);
+    }
+  }
+  var last = this._lastRecord;   // the queue ran dry: continue the last one
+  if (last) return Math.round(last.timestamp + (pos - last.start) * 1e6 / sr);
+  return Math.round(pos * 1e6 / sr);
+};
+
+/** Emit decoded PCM (interleaved, the FFmpeg output format) as AudioData. */
+AudioDecoder.prototype._emitPcm = function (pcmBuf) {
+  var cfg = this._config;
+  var base = _baseFormat(cfg.outputFormat);
+  var bps = _OUT_BPS[base];
+  var frames = Math.floor(pcmBuf.length / (cfg.numberOfChannels * bps));
+  if (frames <= 0) return;
+  if (frames * cfg.numberOfChannels * bps !== pcmBuf.length) {
+    pcmBuf = pcmBuf.subarray(0, frames * cfg.numberOfChannels * bps);
+  }
+  var ts = this._timestampAt(this._outPos);
+  this._outPos += frames;
+  // Records the output has now passed entirely are done: decodeQueueSize
+  // counts decode() calls, and dropped by one per 10 ms OUTPUT before —
+  // twice per 20 ms packet, reaching 0 with ~40 decodes still pending.
+  var q = this._inputQueue;
+  while (q.length && q[0].start + q[0].samples <= this._outPos) {
+    this._lastRecord = q.shift();
+    if (this._queueSize > 0) this._queueSize--;
+  }
+
+  var ad = new AudioData({
+    data: pcmBuf, format: base, sampleRate: cfg.sampleRate,
+    numberOfChannels: cfg.numberOfChannels, numberOfFrames: frames,
+    timestamp: ts, duration: Math.round(frames * 1e6 / cfg.sampleRate),
   });
+  // A planar outputFormat: FFmpeg writes interleaved, so de-interleave.
+  // The AudioData used to be LABELLED planar over interleaved bytes —
+  // left and right read as one smeared signal.
+  if (base !== cfg.outputFormat) {
+    var opt = { format: cfg.outputFormat };
+    var planes = new Uint8Array(ad.allocationSize(opt));
+    ad.copyTo(planes, opt);
+    var timestamp = ad.timestamp, duration = ad.duration;
+    ad.close();
+    ad = new AudioData({
+      data: planes, format: cfg.outputFormat, sampleRate: cfg.sampleRate,
+      numberOfChannels: cfg.numberOfChannels, numberOfFrames: frames,
+      timestamp: timestamp, duration: duration,
+    });
+  }
+  this._output(ad);
+  this._frameIndex++;
+  this.context.frameCount = this._frameIndex;
 };
 
 AudioDecoder.prototype._startFFmpeg = function () {
+  // One run's listeners at a time (see base_coder detachCoderListeners):
+  // after a flush() this starts a new run on the same process object.
+  detachCoderListeners(this._ffmpeg);
   var self = this;
   var cfg = this._config;
   var containerName = getDefaultContainer(cfg.codec);
   var containerDef = getContainer(containerName);
+
+  // A new run (the first, or the next after flush()): its PCM stream
+  // starts at 0, and an Opus run needs its own OpusHead/OpusTags pages.
+  // _oggHeadersFed stayed true across a flush, so the next run got Opus
+  // packets with no header: FFmpeg failed to open its input and the
+  // decoder could not decode anything after its first flush().
+  this._inputQueue = [];
+  this._runInputSamples = 0;
+  this._outPos = 0;
+  this._lastRecord = null;
+  if (this._oggMuxer) {
+    this._oggMuxer.reset();
+    this._oggHeadersFed = false;
+  }
+  // Likewise a Matroska (Vorbis) run starts with its own header.
+  this._mkvHeaderFed = false;
+  if (this._mkv) this._mkv = new MKVWriter({ tracks: this._mkv._tracks });
 
   // Small probesize for audio — ADTS/OGG streams are typically only a few KB.
   // No '-fflags nobuffer': it discards the packets read while probing,
@@ -249,76 +423,45 @@ AudioDecoder.prototype._startFFmpeg = function () {
   if (self._oggMuxer) {
     args.push('-f', 'ogg');
   }
+  if (self._mkv) args.push('-f', 'matroska');
+  if (self._pcmIn) {
+    args.push('-f', self._pcmIn.fmt, '-ar', String(cfg.sampleRate), '-ac', String(cfg.numberOfChannels));
+  }
+  // G.711 has no container and nothing to detect it by: FFmpeg was given
+  // bare mu-law/A-law bytes with no -f and failed to open the input
+  // ("Invalid data found") — G.711 decoding never worked. Raw input needs
+  // its format, rate and channels spelled out.
+  if (containerName === 'raw' && containerDef) {
+    args.push('-f', getContainerFormat(containerDef, cfg.codec));
+    if (_isG711(cfg.codec)) args.push('-ar', '8000', '-ac', '1');
+    else args.push('-ar', String(cfg.sampleRate), '-ac', String(cfg.numberOfChannels));
+  }
 
   // Don't specify -f for input in the default (container-wrapped) path:
   // FFmpeg auto-detects ADTS/OGG/MP3 from stream content.
   // Some FFmpeg builds lack specific demuxers (e.g. 'adts') but auto-detect works.
   // Output format: s16le (default) or f32le
-  var outFmt = cfg.outputFormat || 's16';
-  var ffOutFmt = (outFmt === 'f32' || outFmt === 'f32-planar') ? 'f32le' : 's16le';
-  var bps = (outFmt === 'f32' || outFmt === 'f32-planar') ? 4 : 2;
+  // FFmpeg writes interleaved PCM in the output format's sample type —
+  // all four of them: s32 and u8 were written as s16 and labelled s32/u8
+  // (half the bytes the AudioData claimed). Planar is made in _emitPcm.
+  var ffOutFmt = _FF_PCM[_baseFormat(cfg.outputFormat)];
 
   args.push('-i', 'pipe:0');
   args.push('-vn', '-f', ffOutFmt, '-ar', String(cfg.sampleRate), '-ac', String(cfg.numberOfChannels), 'pipe:1');
 
   self._ffmpeg.start(args, ['pipe', 'pipe', 'pipe']);
+  // FFmpeg failing (non-zero exit) closes this coder with an EncodingError
+  // — see base_coder's failCoder. It used to fail silently.
+  watchExit(self);
 
-  var samplesPerChunk = self._bytesPerChunk / (cfg.numberOfChannels * bps);
-  // _consumedAtHead tracks how many output samples the FrameQueue has
-  // consumed from the head of _inputQueue. When it equals the head
-  // record's samplesRemaining, we shift to the next record.
-  self._consumedAtHead = 0;
-
-  self._fq = new FrameQueue(self._bytesPerChunk, function (pcmBuf) {
-    var durationUs = Math.round((samplesPerChunk * 1e6) / cfg.sampleRate);
-
-    // Compute output timestamp from the head of _inputQueue (MP-23).
-    // Per W3C WebCodecs §3.5: the output's timestamp must derive from
-    // the input chunk's timestamp, not from a free-running counter.
-    //
-    // Math:
-    //   output.timestamp = head.timestamp +
-    //                      (consumedAtHead / sampleRate) microseconds
-    // Then we advance consumedAtHead by samplesPerChunk; when it
-    // reaches the head's allotment, we move to the next input record.
-    //
-    // Fallback (shouldn't happen in normal operation): if _inputQueue
-    // is empty when an output arrives — i.e. FFmpeg emitted PCM with
-    // no preceding decode() — extrapolate from the previous timestamp
-    // using frame counter math. This preserves monotonicity at least.
-    var outTimestamp;
-    if (self._inputQueue.length > 0) {
-      var head = self._inputQueue[0];
-      var offsetUs = Math.round((self._consumedAtHead * 1e6) / cfg.sampleRate);
-      outTimestamp = head.timestamp + offsetUs;
-      self._consumedAtHead += samplesPerChunk;
-      // Drain the head record once we've covered its full extent.
-      // Use >= because FFmpeg's PCM output may slightly under- or
-      // over-fill on the boundary depending on resample; we always
-      // advance to keep the queue from growing without bound.
-      if (self._consumedAtHead >= head.samplesRemaining) {
-        self._inputQueue.shift();
-        self._consumedAtHead = 0;
-      }
-    } else {
-      // No input record matches — best-effort extrapolation. This
-      // happens if FFmpeg produces output before any decode() (rare,
-      // typically a startup transient) or if the stream gets out of
-      // sync after an error. Use frame counter as a stable fallback.
-      outTimestamp = Math.round((self._frameIndex * 1e6 * samplesPerChunk) / cfg.sampleRate);
-    }
-
-    self._output(new AudioData({
-      data: pcmBuf,
-      format: outFmt,
-      sampleRate: cfg.sampleRate,
-      numberOfChannels: cfg.numberOfChannels,
-      numberOfFrames: samplesPerChunk,
-      timestamp: outTimestamp,
-      duration: durationUs,
-    }));
-    self._frameIndex++;
-    self.context.frameCount = self._frameIndex;
+  self._fq = new FrameQueue(self._bytesPerChunk, function (pcmBuf) { self._emitPcm(pcmBuf); });
+  // The stream ended (FFmpeg exited after flush()'s end of input): the
+  // tail shorter than one 10 ms frame goes out too — it was dropped.
+  // This runs before flush() resolves (its 'close' listener comes later).
+  self._ffmpeg.on('close', function (code) {
+    if (code !== 0 || !self._fq) return;
+    var rest = self._fq.takeRemainder();
+    if (rest.length) self._emitPcm(rest);
   });
 
   // Listen on stdout (pipe:1) for decoded PCM data
@@ -327,7 +470,9 @@ AudioDecoder.prototype._startFFmpeg = function () {
 };
 
 AudioDecoder.isConfigSupported = function (config) {
-  var supported = !!(config && getDefaultContainer(normalizeCodec(config.codec)));
+  var name = config && config.codec ? normalizeCodec(config.codec) : null;
+  var supported = !!(name && (getDefaultContainer(name) || _PCM_IN[name]));
+  if (name === 'vorbis' && !(config && config.description)) supported = false;
   // W3C AudioDecoderSupport carries `config` alongside `supported`; see
   // the matching note on VideoDecoder.isConfigSupported.
   return Promise.resolve({ supported: supported, config: _cloneAudioDecoderConfig(config) });

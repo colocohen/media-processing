@@ -16,9 +16,9 @@
  * Output: dist/media-processing.browser.js  (ESM, minified)
  *
  * Note: the readers (reader_ts, reader_fmp4, ...) are themselves
- * browser-safe (pure Uint8Array parsing). They're omitted from this
- * entry because the current browser use case is HLS *writing*; add them
- * here when browser-side HLS *reading* is implemented.
+ * browser-safe (pure Uint8Array parsing). Only the file demuxers (a
+ * file → samples, for transcoding a picked video) are in this entry;
+ * add the others here when browser-side HLS *reading* is implemented.
  */
 
 import { build } from 'esbuild';
@@ -43,6 +43,14 @@ const BROWSER_ENTRY = `
   export { default as IVFWriter } from './src/writer_ivf.js';
   export { default as ADTSWriter } from './src/writer_adts.js';
   export { default as AnnexBWriter } from './src/writer_annexb.js';
+
+  // ── Readers (demuxers) ──
+  // A file fed in pieces → its samples — pure parsing, the same code as
+  // in Node. FileDemuxer picks the container: MP4 / MOV / 3GP / fMP4
+  // (MP4Reader) or WebM / MKV (WebMReader).
+  export { default as FileDemuxer } from './src/file_demuxer.js';
+  export { default as MP4Reader } from './src/reader_mp4.js';
+  export { default as WebMReader } from './src/reader_webm.js';
 
   // ── Bitstream / codec utilities ──
   export {

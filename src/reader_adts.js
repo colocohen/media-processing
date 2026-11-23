@@ -18,7 +18,7 @@ function ADTSReader(opts) {
   // Fallback sample rate, used only if a frame's header is malformed.
   // Actual per-frame sample rate is read from the ADTS header.
   this._fallbackSampleRate = opts.sampleRate || 48000;
-  this._nextPtsUs = 0;
+  this._nextSamples = 0;   // samples emitted so far (timestamps derive from it)
 }
 
 ADTSReader.prototype.on = function (ev, fn) { this._ee.on(ev, fn); };
@@ -51,9 +51,14 @@ ADTSReader.prototype.feed = function (chunk) {
     // with the 1024-samples-per-frame frame size, so duration math
     // gives the right wall-clock value regardless of LC vs HE-AAC.
     var sampleRate = info.sampleRate || this._fallbackSampleRate;
-    var durationUs = Math.floor(info.samplesPerFrame * 1000000 / sampleRate);
-    var ptsUs = this._nextPtsUs;
-    this._nextPtsUs += durationUs;
+    // Timestamps from the SAMPLE count, not a sum of per-frame durations.
+    // Each frame's duration was floored to whole µs and the floors were
+    // added up (1024 samples @ 48 kHz = 21333.33 → 21333): 21333, 42666,
+    // 63999 ... — 56 ms behind after an hour. The duration of each frame
+    // is the difference of its rounded endpoints, so they sum exactly.
+    var ptsUs = Math.round(this._nextSamples * 1000000 / sampleRate);
+    this._nextSamples += info.samplesPerFrame;
+    var durationUs = Math.round(this._nextSamples * 1000000 / sampleRate) - ptsUs;
 
     this._ee.emit('audio', {
       payload: frame,

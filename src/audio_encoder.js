@@ -3,7 +3,7 @@
  * Validates input data alignment.
  */
 
-import { initCoder, configureCoder, wireReader, applyCoderPrototype } from './base_coder.js';
+import { initCoder, configureCoder, wireReader, applyCoderPrototype, watchExit, detachCoderListeners, failCoder } from './base_coder.js';
 import { normalizeCodec } from './utils/codec_strings.js';
 import { EncodedAudioChunk } from './encoded_chunk.js';
 import { getAudioCodec } from './codecs.js';
@@ -255,19 +255,37 @@ AudioEncoder.prototype.configure = function (config) {
     }
   }
 
+  // W3C: a config the codec rejects (getAudioCodec throws
+  // NotSupportedError — e.g. Opus at 44100 Hz) closes the encoder with
+  // that error, asynchronously. It surfaced as an exception thrown out of
+  // the FIRST encode() instead, from _startFFmpeg.
+  try { getAudioCodec(normalizedCodec, this._config); }
+  catch (eCfg) {
+    var selfCfg = this;
+    var nsErr = new Error(eCfg && eCfg.message || String(eCfg));
+    nsErr.name = 'NotSupportedError';
+    queueMicrotask(function () { failCoder(selfCfg, nsErr); });
+  }
+
   this._encodeCount = 0;
   // ── W3C timestamp anchoring ──
-  // Browser AudioEncoder derives output chunk timestamps from the INPUT
-  // AudioData timeline. Output pts = _basePtsUs (first input's timestamp)
-  // + accumulated encoded duration + _gapAccumUs (input gaps re-inserted).
-  // With 0-based sources (media_source_sink counters) base ≈ 0 → identical
-  // to the old counter behavior, so muxer consumers see no change; with
-  // wallclock/capture-anchored sources (live WebRTC, browser parity) the
-  // output now follows the input timeline — keeping long-run A/V sync
-  // even across capture gaps (DTX, source hiccups).
-  this._basePtsUs = null;      // first input AudioData.timestamp
-  this._inputAccumUs = 0;      // total input duration fed
-  this._gapAccumUs = 0;        // detected input-timeline gaps, re-applied to output
+  // A browser AudioEncoder stamps each output chunk from the INPUT
+  // timeline: the chunk that starts with input frame i's samples carries
+  // i's timestamp. FFmpeg sees one continuous PCM stream and reports
+  // positions in it (µs from the start of the run); _runSegments maps
+  // those positions back: one entry per encode(), {startUs: where its
+  // samples begin in the run's stream, timestamp: its AudioData
+  // timestamp}. See _inputTimestampAt.
+  //
+  // This replaced a running "gap" total added to every chunk emitted
+  // after a gap was SEEN AT INPUT — so packets already inside FFmpeg
+  // (~80 ms in realtime; everything when fed faster than realtime) were
+  // shifted by the gap too (a 300 ms gap stamped the 3 packets before it
+  // 300 ms late; fed at once, 90 of 100 timestamps were wrong), gaps of
+  // ≤100 ms were ignored until they summed past it, and after a flush()
+  // the next run's output restarted at the first run's timestamps.
+  this._runSegments = [];
+  this._runInputUs = 0;
   this._decoderConfigSent = false;  // emit decoderConfig on first output chunk
   this._opusHead = null;            // captured from ogg stream (opus only)
   this.context.state = 'configured';
@@ -278,41 +296,25 @@ AudioEncoder.prototype.configure = function (config) {
 };
 
 AudioEncoder.prototype.encode = function (audioData) {
+  // W3C: encode() THROWS — InvalidStateError when not "configured", a
+  // TypeError for a closed (detached) AudioData. Both went to the error
+  // callback as plain Errors, so a caller's try/catch caught nothing.
+  // (VideoEncoder and the decoders already throw.)
   if (this._state !== 'configured') {
-    this._error(new Error('AudioEncoder: not configured'));
-    return;
+    var stErr = new Error('AudioEncoder.encode: state is "' + this._state + '", not "configured"');
+    stErr.name = 'InvalidStateError';
+    throw stErr;
   }
-  if (!audioData || !audioData.data) {
-    this._error(new Error('AudioEncoder.encode: audioData.data required'));
-    return;
+  if (!audioData || audioData._closed || !audioData.data) {
+    throw new TypeError('AudioEncoder.encode: audioData is closed or has no data');
   }
 
-  // ── Input-timeline tracking (W3C timestamp anchoring) ──
-  // Gap detection: if this AudioData's timestamp is ahead of where the
-  // continuous input timeline says it should be (> 100ms), the source
-  // skipped time (DTX / dropped capture). FFmpeg encodes the PCM stream
-  // as continuous, so we re-insert the gap into the OUTPUT timeline via
-  // _gapAccumUs. (Applied immediately — frames already in the FFmpeg
-  // pipe shift with it; the error is bounded by pipeline depth, tens of
-  // ms, only at gap moments — vs unbounded cumulative drift without it.)
-  if (typeof audioData.timestamp === 'number' && isFinite(audioData.timestamp)) {
-    if (this._basePtsUs === null) {
-      this._basePtsUs = audioData.timestamp;
-    } else {
-      var _expectedTs = this._basePtsUs + this._inputAccumUs + this._gapAccumUs;
-      var _aheadUs = audioData.timestamp - _expectedTs;
-      if (_aheadUs > 100000) this._gapAccumUs += _aheadUs;
-    }
-  } else if (this._basePtsUs === null) {
-    this._basePtsUs = 0;
-  }
   var _inDurUs = 0;
   if (typeof audioData.numberOfFrames === 'number' && audioData.sampleRate) {
-    _inDurUs = Math.round(audioData.numberOfFrames * 1e6 / audioData.sampleRate);
+    _inDurUs = audioData.numberOfFrames * 1e6 / audioData.sampleRate;
   } else if (typeof audioData.duration === 'number') {
     _inDurUs = audioData.duration;
   }
-  this._inputAccumUs += _inDurUs;
 
   // ── Per-frame format consistency check (W3C WebCodecs alignment) ──
   //
@@ -373,8 +375,30 @@ AudioEncoder.prototype.encode = function (audioData) {
     return;
   }
 
-  // Remember input format for FFmpeg startup
-  if (!this._inputFormat) this._inputFormat = fmt;
+  // ── The PCM FFmpeg reads: interleaved s16 or f32, nothing else ──
+  //
+  // FFmpeg is started with -f s16le or -f f32le — interleaved — chosen
+  // from the first frame. The frame's bytes were written as they were:
+  // a *-planar frame was read as interleaved (stereo became both
+  // channels smeared together), s32 as twice as many s16 samples (2 s of
+  // noise per second), u8 as half as many, and any later frame in
+  // another format than the first was misread the same way. Every
+  // AudioSampleFormat is now converted to the pipeline's format
+  // (AudioData.copyTo does the conversion); s16/u8 sources run the
+  // pipeline in s16, the rest in f32.
+  if (!this._inputFormat) {
+    var _b = String(fmt).replace('-planar', '');
+    this._inputFormat = (_b === 's16' || _b === 'u8') ? 's16' : 'f32';
+  }
+  var pcm = audioData.data;
+  if (fmt !== this._inputFormat) {
+    if (typeof audioData.copyTo !== 'function') {
+      throw new TypeError('AudioEncoder.encode: format "' + fmt + '" needs an AudioData (copyTo) to convert to ' + this._inputFormat);
+    }
+    var _conv = { planeIndex: 0, format: this._inputFormat };
+    pcm = new Uint8Array(audioData.allocationSize(_conv));
+    audioData.copyTo(pcm, _conv);
+  }
 
   if (!this._ffmpeg.running) {
     // The first start is not a restart; every later one is (FFmpeg
@@ -382,6 +406,16 @@ AudioEncoder.prototype.encode = function (audioData) {
     if (this._encodeCount > 0) this._stats.ffmpegRestarts++;
     this._startFFmpeg();
   }
+
+  // Where this frame's samples begin in the run's stream, and its
+  // timestamp (a missing one continues from the previous frame).
+  var _ts = audioData.timestamp;
+  if (typeof _ts !== 'number' || !isFinite(_ts)) {
+    var _last = this._runSegments[this._runSegments.length - 1];
+    _ts = _last ? _last.timestamp + (this._runInputUs - _last.startUs) : 0;
+  }
+  this._runSegments.push({ startUs: this._runInputUs, timestamp: _ts });
+  this._runInputUs += _inDurUs;
 
   // ── Backpressure tracking (diagnostic only) ──
   //
@@ -398,7 +432,7 @@ AudioEncoder.prototype.encode = function (audioData) {
   // would gate audio behind drain cycles even when the kernel is
   // perfectly happy.
   this._queueSize++;
-  var ok = this._ffmpeg.write(audioData.data);
+  var ok = this._ffmpeg.write(pcm);
   this._encodeCount++;
   this.context.frameCount = this._encodeCount;
 
@@ -409,9 +443,25 @@ AudioEncoder.prototype.encode = function (audioData) {
   return ok;
 };
 
+/**
+ * The input timestamp of the sample at `posUs` in the current run's PCM
+ * stream: the AudioData that sample came from, plus the offset into it.
+ * Entries the output has moved past are dropped.
+ */
+AudioEncoder.prototype._inputTimestampAt = function (posUs) {
+  var segs = this._runSegments;
+  while (segs.length > 1 && segs[1].startUs <= posUs) segs.shift();
+  var seg = segs[0];
+  if (!seg) return Math.round(posUs);
+  return Math.round(seg.timestamp + (posUs - seg.startUs));
+};
+
 AudioEncoder.prototype._startFFmpeg = function () {
   var self = this;
   var cfg = this._config;
+  // A new run: FFmpeg's stream positions restart at 0 (see configure()).
+  this._runSegments = [];
+  this._runInputUs = 0;
 
   // ── Defensive listener cleanup (fix #1: listener doubling) ──
   //
@@ -428,9 +478,7 @@ AudioEncoder.prototype._startFFmpeg = function () {
   // unconditional call before each spawn — handles the "running=false
   // → restart" path AND any future code that might call _startFFmpeg
   // for other reasons. Cheap insurance.
-  self._ffmpeg.removeAllListeners('data');
-  self._ffmpeg.removeAllListeners('error');
-  self._ffmpeg.removeAllListeners('close');
+  detachCoderListeners(self._ffmpeg);
 
   var codecDef = getAudioCodec(cfg.codec, cfg);
   if (!codecDef) { self._error(new Error('Unknown codec: ' + cfg.codec)); return; }
@@ -466,7 +514,7 @@ AudioEncoder.prototype._startFFmpeg = function () {
   ];
 
   // Input format: s16le (default) or f32le
-  var ffFmt = (self._inputFormat === 'f32' || self._inputFormat === 'f32-planar') ? 'f32le' : 's16le';
+  var ffFmt = (self._inputFormat === 'f32') ? 'f32le' : 's16le';   // see encode()
   args.push('-f', ffFmt, '-ar', String(cfg.sampleRate), '-ac', String(cfg.numberOfChannels), '-i', 'pipe:0');
   Array.prototype.push.apply(args, codecDef.args);
 
@@ -494,6 +542,9 @@ AudioEncoder.prototype._startFFmpeg = function () {
   args.push('pipe:3');
 
   self._ffmpeg.start(args, ['pipe', 'ignore', 'pipe', 'pipe']);
+  // FFmpeg failing (non-zero exit) closes this coder with an EncodingError
+  // — see base_coder's failCoder. It used to fail silently.
+  watchExit(self);
 
   if (containerDef && containerDef.createReader) {
     var reader = containerDef.createReader({ sampleRate: cfg.sampleRate });
@@ -507,32 +558,56 @@ AudioEncoder.prototype._startFFmpeg = function () {
         var meta = self._takeFirstChunkMetadata(f.payload);
         self._output(new EncodedAudioChunk({
           type: 'key',
-          // Reader pts are 0-based per-stream — anchor them to the input
-          // timeline the same way as the raw path.
-          timestamp: (self._basePtsUs || 0) + self._gapAccumUs + f.ptsUs,
+          // Reader pts are positions in this run's stream (from 0) —
+          // mapped back to the input timeline (_inputTimestampAt).
+          timestamp: self._inputTimestampAt(f.ptsUs),
           duration: f.durationUs, data: payload,
         }), meta);
       },
     });
+  } else if (_rawBytesPerSecond(cfg)) {
+    // ── Constant-rate raw output (G.711, PCM): cut into ptime frames ──
+    //
+    // These have no container and no packet structure, so FFmpeg's pipe
+    // writes were emitted as chunks as they came: arbitrary sizes (512
+    // bytes = 64 ms of G.711, in bursts), each stamped with the duration
+    // of 1024 samples at the CONFIGURED rate (128 ms for 8 kHz G.711 —
+    // 2.048 s of timestamps per second of audio; 21 ms at a 48 kHz input
+    // config), and decoderConfig said 48000 Hz for an 8000 Hz stream. The
+    // byte rate is constant, so frames are cut at exactly ptime (default
+    // 20 ms: 160 bytes of G.711, what RTP carries — RFC 3551 §4.5.14),
+    // with the duration of their bytes. The tail goes out at the end.
+    var bps = _rawBytesPerSecond(cfg);
+    var frameBytes = Math.max(1, Math.round(bps * ((cfg.ptimeMs > 0 ? cfg.ptimeMs : 20) / 1000)));
+    var pending = null, posBytes = 0;
+    function emitRaw(bytes) {
+      var posUs = posBytes * 1e6 / bps;
+      posBytes += bytes.length;
+      self._output(new EncodedAudioChunk({
+        type: 'key', timestamp: self._inputTimestampAt(posUs),
+        duration: Math.round(bytes.length * 1e6 / bps), data: bytes,
+      }), self._takeFirstChunkMetadata());
+    }
+    self._ffmpeg.on('data', function (chunk) {
+      var buf = pending ? Buffer.concat([pending, chunk]) : chunk;
+      var off = 0;
+      while (buf.length - off >= frameBytes) {
+        emitRaw(Buffer.from(buf.subarray(off, off + frameBytes)));
+        off += frameBytes;
+      }
+      pending = (off < buf.length) ? Buffer.from(buf.subarray(off)) : null;
+    });
+    // FFmpeg exited: the last partial frame (before a flush completes —
+    // flush() listens on 'close' after this does).
+    self._ffmpeg.on('close', function () {
+      if (pending && pending.length) { var p = pending; pending = null; emitRaw(p); }
+    });
+    self._ffmpeg.on('error', function (e) { self._error(e); });
   } else {
-    // No reader — emit raw encoded data chunks directly.
-    //
-    // PTS is accumulated in microseconds, with each chunk's duration
-    // derived from its actual content:
-    //
-    //   Opus: parse the TOC byte (RFC 6716 §3.1) via the shared
-    //         getOpusPacketDurationUs() helper. This stays correct
-    //         across all six Opus frame durations (2.5 / 5 / 10 /
-    //         20 / 40 / 60 ms) without the encoder needing prior
-    //         knowledge of -frame_duration.
-    //   Other codecs: AAC LC's 1024-sample frame is the historical
-    //         default this code path was written for. Other codecs
-    //         that fall through here would need their own duration
-    //         calc, but in practice they ship with a container reader.
-    //
-    // Using a wrong frame size produces metallic / "alien" audio:
-    // the receiver's decoder triggers Packet Loss Concealment to
-    // synthesize the apparent gap, firing 50 times per second.
+    // No reader and no constant byte rate — emit FFmpeg's writes as
+    // chunks. Opus: parse the TOC byte (RFC 6716 §3.1) for the duration;
+    // anything else: AAC LC's 1024 samples, what this path was written
+    // for. (Every codec configured today has a reader or a byte rate.)
     var totalDurUs = 0;
     self._ffmpeg.on('data', function (chunk) {
       var sr = cfg.sampleRate || 48000;
@@ -542,9 +617,7 @@ AudioEncoder.prototype._startFFmpeg = function () {
       } else {
         durUs = Math.round(1024 * 1e6 / sr);  // AAC LC default
       }
-      // Anchor to the input timeline (see configure() comment): base +
-      // gaps + accumulated encoded duration. 0-based inputs → unchanged.
-      var ptsUs = (self._basePtsUs || 0) + self._gapAccumUs + totalDurUs;
+      var ptsUs = self._inputTimestampAt(totalDurUs);
       totalDurUs += durUs;
       self._output(new EncodedAudioChunk({
         type: 'key', timestamp: ptsUs, duration: durUs, data: chunk,
@@ -553,6 +626,19 @@ AudioEncoder.prototype._startFFmpeg = function () {
     self._ffmpeg.on('error', function (e) { self._error(e); });
   }
 };
+
+// Codecs whose output is a constant byte rate with no framing: G.711
+// (8000 one-byte samples a second, mono — FFmpeg resamples to it) and
+// raw PCM. 0 for the rest.
+function _isG711(codec) { return codec === 'g711-alaw' || codec === 'g711-ulaw' || codec === 'alaw' || codec === 'ulaw'; }
+function _rawBytesPerSecond(cfg) {
+  if (_isG711(cfg.codec)) return 8000;
+  if (cfg.codec === 'pcm') {
+    var b = (cfg.format === 'f32' || cfg.format === 'f32le') ? 4 : 2;
+    return (cfg.sampleRate || 48000) * (cfg.numberOfChannels || 1) * b;
+  }
+  return 0;
+}
 
 /**
  * Build the metadata for the FIRST encoded chunk, mirroring the browser
@@ -570,8 +656,10 @@ AudioEncoder.prototype._takeFirstChunkMetadata = function (firstFrame) {
   var cfg = this._config;
   var dc = {
     codec: _outputCodecString(cfg, firstFrame),
-    sampleRate: cfg.sampleRate,
-    numberOfChannels: cfg.numberOfChannels,
+    // G.711 is always 8 kHz mono (FFmpeg resamples to it) — not the
+    // configured input layout, which decoderConfig used to report.
+    sampleRate: _isG711(cfg.codec) ? 8000 : cfg.sampleRate,
+    numberOfChannels: _isG711(cfg.codec) ? 1 : cfg.numberOfChannels,
   };
   if (cfg.codec === 'aac') {
     // Only the raw ('aac') form carries an AudioSpecificConfig. Built
@@ -607,8 +695,14 @@ function _outputCodecString(cfg, firstFrame) {
 AudioEncoder.isConfigSupported = function (config) {
   // W3C AudioEncoderSupport carries `config` alongside `supported`;
   // see the matching note on VideoEncoder.isConfigSupported.
+  // getAudioCodec THROWS NotSupportedError for a config it rejects
+  // (Opus at 44100 Hz) — and it threw out of isConfigSupported
+  // synchronously. W3C: an unsupported config resolves {supported:false}.
+  var supported;
+  try { supported = !!getAudioCodec(normalizeCodec(config.codec), config); }
+  catch (e) { supported = false; }
   return Promise.resolve({
-    supported: !!getAudioCodec(config.codec, config),
+    supported: supported,
     config: _cloneAudioEncoderConfig(config),
   });
 };

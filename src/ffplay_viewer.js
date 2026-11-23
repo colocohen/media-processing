@@ -33,6 +33,7 @@
 
 import { spawn } from 'node:child_process';
 import { MediaStreamTrackProcessor } from './track_processor.js';
+import { frameByteSize } from './core/frame_size.js';
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -85,10 +86,15 @@ export function startFfplayViewer(track, opts) {
     lastFrameAt:    0,
     onError:        opts.onError || function () {},
     diagInterval:   null,
+    reader:         null,
+    track:          track,
+    endedEvent:     null,    // the track event autoclose listens to …
+    endedFn:        null,    // … and its listener, removed by stop()
   };
 
   var processor = new MediaStreamTrackProcessor({ track: track });
   var reader    = processor.readable.getReader();
+  state.reader  = reader;
 
   // Diagnostic heartbeat — logs every 5s so freezes are visible. The line
   // shape lets you see at a glance whether the pump is alive (lastFrameAt
@@ -131,7 +137,10 @@ export function startFfplayViewer(track, opts) {
             continue;
           }
           lastSampledAt = now;
-          _handleFrame(state, frame, opts);
+          // Awaited: copyTo may complete asynchronously (it returns a
+          // Promise, as in browsers), and the frame must stay open until
+          // it has.
+          await _handleFrame(state, frame, opts);
         } finally {
           // Always close the frame to release the underlying buffer —
           // VideoFrames hold native memory until close() is called.
@@ -141,7 +150,9 @@ export function startFfplayViewer(track, opts) {
     } catch (e) {
       state.onError(e);
     } finally {
-      _closeFfplay(state);
+      // Track ended or stop(): release everything (also the heartbeat
+      // timer and the track listener, which used to outlive the pump).
+      _stop(state);
     }
   })();
 
@@ -149,7 +160,10 @@ export function startFfplayViewer(track, opts) {
   // returning {done:true} — the close-on-ended path below covers the case
   // where the track was already ended before we wired up.)
   if (opts.autoclose !== false && typeof track.on === 'function') {
-    track.on('ended', function () { _stop(state); });
+    // '_stopped': ended by stop() too, which fires no 'ended'.
+    state.endedEvent = track._source ? '_stopped' : 'ended';
+    state.endedFn = function () { _stop(state); };
+    track.on(state.endedEvent, state.endedFn);
   }
 
   return {
@@ -177,16 +191,21 @@ function _handleFrame(state, frame, opts) {
     return;
   }
 
+  // What copyTo() writes is the VISIBLE rect (the whole coded frame
+  // when there is no crop), so that is the size ffplay must be told.
+  var vr = frame.visibleRect;
+  var fw = vr && vr.width ? vr.width : frame.codedWidth;
+  var fh = vr && vr.height ? vr.height : frame.codedHeight;
+
   // Dimension change → restart ffplay (rawvideo container is fixed-size).
-  if (state.proc && (frame.codedWidth !== state.width ||
-                     frame.codedHeight !== state.height)) {
+  if (state.proc && (fw !== state.width || fh !== state.height)) {
     _closeFfplay(state);
   }
 
   // Spawn (lazy) on first frame, or after a dimension-change close.
   if (!state.proc) {
-    state.width  = frame.codedWidth;
-    state.height = frame.codedHeight;
+    state.width  = fw;
+    state.height = fh;
     if (!state.width || !state.height) {
       state.framesDropped++;
       return;  // first frame somehow has zero dims; skip and try again
@@ -194,18 +213,47 @@ function _handleFrame(state, frame, opts) {
     if (!_spawnFfplay(state, opts)) return;
   }
 
-  // Allocate I420 buffer: 1.5 * width * height bytes (Y full + U/V quarter each).
-  var ySize  = state.width * state.height;
-  var uvSize = (state.width >> 1) * (state.height >> 1);
-  var size   = ySize + 2 * uvSize;
-  var buf    = new Uint8Array(size);
-
-  try {
-    frame.copyTo(buf);
-  } catch (e) {
-    state.framesCopyToErr++;
+  // While ffplay is behind, drop before paying for the copy.
+  if (state.pipeFull) {
     state.framesDropped++;
-    state.onError(new Error('ffplay_viewer: VideoFrame.copyTo failed: ' + e.message));
+    state.framesBackpressured++;
+    return;
+  }
+
+  // I420 with ceil(w/2) x ceil(h/2) chroma (core/frame_size.js). This
+  // was (w >> 1) * (h >> 1): 65x49 needs 4835 bytes, the buffer had
+  // 4721, so every odd-sized frame failed copyTo.
+  var buf = new Uint8Array(frameByteSize('I420', state.width, state.height));
+
+  // copyTo() returns a Promise (W3C; this library's too) and reports
+  // errors by REJECTING it. The try/catch around a bare copyTo() caught
+  // nothing, and the rejection — e.g. the 65x49 size error above —
+  // crashed the process as an unhandled rejection. Handle both a
+  // Promise and a synchronous implementation.
+  var res;
+  try {
+    res = frame.copyTo(buf);
+  } catch (e) {
+    _copyToFailed(state, e);
+    return;
+  }
+  if (res && typeof res.then === 'function') {
+    return res.then(function () { _writeFrame(state, buf); },
+                    function (e) { _copyToFailed(state, e); });
+  }
+  _writeFrame(state, buf);
+}
+
+function _copyToFailed(state, e) {
+  state.framesCopyToErr++;
+  state.framesDropped++;
+  state.onError(new Error('ffplay_viewer: VideoFrame.copyTo failed: ' + (e && e.message || e)));
+}
+
+function _writeFrame(state, buf) {
+  // stop() or a respawn may have happened while copyTo was pending.
+  if (state.stopped || !state.proc) {
+    state.framesDropped++;
     return;
   }
 
@@ -348,6 +396,20 @@ function _stop(state) {
   if (state.diagInterval) {
     clearInterval(state.diagInterval);
     state.diagInterval = null;
+  }
+  // Release the track. stop() used to only kill ffplay: the
+  // MediaStreamTrackProcessor stayed attached (track._consumerCount()
+  // stayed 1, so the source kept producing and cloning frames for
+  // nobody) and the pump sat in reader.read() forever. cancel()
+  // detaches the processor and ends the pending read.
+  if (state.reader) {
+    var r = state.reader;
+    state.reader = null;
+    try { r.cancel().catch(function () {}); } catch (e) {}
+  }
+  if (state.endedFn && state.track && typeof state.track.off === 'function') {
+    state.track.off(state.endedEvent, state.endedFn);
+    state.endedFn = null;
   }
   _closeFfplay(state);
 }

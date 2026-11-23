@@ -75,6 +75,12 @@ function parseCodecString(str) {
       lower === 'av1' || lower === 'aac' || lower === 'opus') {
     return lower;
   }
+  // G.711 under every name it goes by: the library's own (g711-alaw,
+  // alaw, ...), and the RTP/SDP ones (PCMA/PCMU, RFC 3551). None was
+  // recognised, so mediaCapabilities never reported G.711 as supported.
+  if (lower === 'g711-alaw' || lower === 'alaw' || lower === 'g711-ulaw' || lower === 'ulaw') return lower;
+  if (lower === 'pcma') return 'g711-alaw';
+  if (lower === 'pcmu') return 'g711-ulaw';
   for (var i = 0; i < CODEC_MAP.length; i++) {
     if (CODEC_MAP[i].pattern.test(s)) return CODEC_MAP[i].name;
   }
@@ -331,4 +337,18 @@ function _av1LevelToIdx(level) {
   return Math.max(0, (maj - 2) * 4 + min);
 }
 
-export { parseCodecString, normalizeCodec, parseCodecDetails, buildCodecString };
+/**
+ * 'av01.P.LLT.DD' from an AV1CodecConfigurationRecord (av1C — an MP4
+ * sample entry's box, or a Matroska CodecPrivate): seq_profile,
+ * seq_level_idx_0, seq_tier_0, and the bit depth from high_bitdepth /
+ * twelve_bit. null when it isn't one.
+ */
+function codecStringFromAv1C(rec) {
+  if (!rec || rec.length < 4 || (rec[0] & 0x80) === 0) return null;
+  var profile = rec[1] >> 5, level = rec[1] & 0x1F;
+  var tier = rec[2] >> 7, high = (rec[2] >> 6) & 1, twelve = (rec[2] >> 5) & 1;
+  var depth = twelve ? 12 : high ? 10 : 8;
+  return 'av01.' + profile + '.' + _pad2(level) + (tier ? 'H' : 'M') + '.' + _pad2(depth);
+}
+
+export { parseCodecString, normalizeCodec, parseCodecDetails, buildCodecString, codecStringFromAv1C };

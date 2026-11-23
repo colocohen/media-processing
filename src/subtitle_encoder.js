@@ -450,6 +450,11 @@ function _buildVtt(cues) {
 
   for (var i = 0; i < cues.length; i++) {
     var c = cues[i];
+    var payload = _sanitizeVttPayload(c.text);
+    // A cue with nothing to show is left out: an empty payload puts a
+    // blank line right after the timing line, and FFmpeg's WebVTT
+    // demuxer then lost that cue AND every cue after it.
+    if (payload.trim() === '') continue;
     if (c.identifier) {
       // WebVTT cue identifiers go on a line by themselves before the
       // timing line. Players use them to de-dupe cross-segment cues.
@@ -458,24 +463,31 @@ function _buildVtt(cues) {
     var timing = _formatVttTime(c.start) + ' --> ' + _formatVttTime(c.end);
     if (c.settings) timing += ' ' + c.settings;
     lines.push(timing);
-    // Cue payload, sanitised. WebVTT's block structure makes two things
-    // in the text unrepresentable, and passing them through verbatim
-    // silently corrupted the file:
+    // Cue payload, sanitised. WebVTT's block structure makes these
+    // things in the text unrepresentable, and passing them through
+    // verbatim silently corrupted the file:
     //
     //   - A BLANK LINE terminates the cue (§3.4). Text like
     //     "line one\n\nline two" produced a cue containing only
     //     "line one"; "line two" was then read as the IDENTIFIER of the
     //     next block, which had no timing line, so that cue was dropped
-    //     too. One blank line cost two cues.
+    //     too. One blank line cost two cues. A LEADING newline was
+    //     worse: the blank line came right after the timing line, the
+    //     cue was empty, and FFmpeg's WebVTT demuxer dropped it and
+    //     every later cue (3 cues in, 0 out).
     //
     //   - "-->" inside the payload is forbidden and leads parsers to
     //     treat the line as a timing line.
     //
-    // Both come from real content (transcripts, translations, ASR
+    //   - cue.text is plain text (the README and the IMSC path treat it
+    //     so), but a WebVTT payload is markup: "a < b" opened a bogus
+    //     tag and "&" started an entity. They are written as &lt; &gt;
+    //     &amp; (WebVTT §4.2.2 escapes).
+    //
+    // All come from real content (transcripts, translations, ASR
     // output), so throwing would be hostile. Blank lines collapse to a
-    // single line break, which preserves the visible text; "-->" is
-    // written as the entity form, which WebVTT renders as "-->".
-    lines.push(_sanitizeVttPayload(c.text));
+    // single line break, which preserves the visible text.
+    lines.push(payload);
     lines.push('');
   }
 
@@ -494,16 +506,22 @@ function _buildVtt(cues) {
  */
 function _sanitizeVttPayload(text) {
   return String(text)
-    // Normalise line endings first so the blank-line collapse below
+    // Normalise line endings first so the blank-line handling below
     // sees a single form.
     .replace(/\r\n?/g, '\n')
+    // Leading / trailing blank (or whitespace-only) lines go: a payload
+    // cannot start or end with an empty line.
+    .replace(/^(?:[ \t]*\n)+/, '')
+    .replace(/(?:\n[ \t]*)+$/, '')
     // Two or more line breaks (optionally with whitespace between)
     // become one: a payload cannot contain an empty line.
     .replace(/\n[ \t]*(?=\n)/g, '')
-    // Trailing newline would create the terminating blank line early.
-    .replace(/\n+$/, '')
-    // "-->" is structural; the entity form renders identically.
-    .replace(/-->/g, '--&gt;');
+    // Plain text → WebVTT cue text. '&' first so the entities written
+    // below are not escaped again. Escaping '>' also turns "-->" into
+    // "--&gt;", which is not structural and renders as "-->".
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
 }
 
 /**
@@ -585,6 +603,75 @@ function _xmlEscape(s) {
  * xml:lang. Style and Region are inlined per the segmentation rules
  * in IMSC §11 — every segment must be self-contained.
  */
+// NCName (XML Namespaces §3 / XML 1.0 §2.3), BMP subset.
+var _NC_START = 'A-Z_a-z\u00C0-\u00D6\u00D8-\u00F6\u00F8-\u02FF\u0370-\u037D\u037F-\u1FFF\u200C-\u200D\u2070-\u218F\u2C00-\u2FEF\u3001-\uD7FF\uF900-\uFDCF\uFDF0-\uFFFD';
+var _NC_CHAR_RE = new RegExp('[^' + _NC_START + '\\-.0-9\u00B7\u0300-\u036F\u203F-\u2040]', 'g');
+var _NC_START_RE = new RegExp('^[' + _NC_START + ']');
+
+/**
+ * Turn any cue identifier into a valid, document-unique xml:id: chars
+ * an NCName cannot hold become '_', a name that cannot start one gets
+ * a 'c' prefix ("1" → "c1"), and a repeat gets "_2", "_3", ...
+ * Deterministic, so the same cue keeps its id in every segment.
+ */
+function _uniqueNcName(id, used) {
+  var n = String(id).replace(_NC_CHAR_RE, '_');
+  if (!_NC_START_RE.test(n)) n = 'c' + n;
+  var out = n, k = 2;
+  while (Object.prototype.hasOwnProperty.call(used, out)) out = n + '_' + (k++);
+  used[out] = true;
+  return out;
+}
+
+// ISO 639-1 → ISO 639-2/T, for the mdhd language (ISO 14496-12 §8.4.2:
+// ISO-639-2/T, three lower-case letters).
+var _ISO639_1_TO_2T = {
+  aa: 'aar', ab: 'abk', ae: 'ave', af: 'afr', ak: 'aka', am: 'amh', an: 'arg', ar: 'ara',
+  as: 'asm', av: 'ava', ay: 'aym', az: 'aze', ba: 'bak', be: 'bel', bg: 'bul', bi: 'bis',
+  bm: 'bam', bn: 'ben', bo: 'bod', br: 'bre', bs: 'bos', ca: 'cat', ce: 'che', ch: 'cha',
+  co: 'cos', cr: 'cre', cs: 'ces', cu: 'chu', cv: 'chv', cy: 'cym', da: 'dan', de: 'deu',
+  dv: 'div', dz: 'dzo', ee: 'ewe', el: 'ell', en: 'eng', eo: 'epo', es: 'spa', et: 'est',
+  eu: 'eus', fa: 'fas', ff: 'ful', fi: 'fin', fj: 'fij', fo: 'fao', fr: 'fra', fy: 'fry',
+  ga: 'gle', gd: 'gla', gl: 'glg', gn: 'grn', gu: 'guj', gv: 'glv', ha: 'hau', he: 'heb',
+  hi: 'hin', ho: 'hmo', hr: 'hrv', ht: 'hat', hu: 'hun', hy: 'hye', hz: 'her', ia: 'ina',
+  id: 'ind', ie: 'ile', ig: 'ibo', ii: 'iii', ik: 'ipk', io: 'ido', is: 'isl', it: 'ita',
+  iu: 'iku', ja: 'jpn', jv: 'jav', ka: 'kat', kg: 'kon', ki: 'kik', kj: 'kua', kk: 'kaz',
+  kl: 'kal', km: 'khm', kn: 'kan', ko: 'kor', kr: 'kau', ks: 'kas', ku: 'kur', kv: 'kom',
+  kw: 'cor', ky: 'kir', la: 'lat', lb: 'ltz', lg: 'lug', li: 'lim', ln: 'lin', lo: 'lao',
+  lt: 'lit', lu: 'lub', lv: 'lav', mg: 'mlg', mh: 'mah', mi: 'mri', mk: 'mkd', ml: 'mal',
+  mn: 'mon', mr: 'mar', ms: 'msa', mt: 'mlt', my: 'mya', na: 'nau', nb: 'nob', nd: 'nde',
+  ne: 'nep', ng: 'ndo', nl: 'nld', nn: 'nno', no: 'nor', nr: 'nbl', nv: 'nav', ny: 'nya',
+  oc: 'oci', oj: 'oji', om: 'orm', or: 'ori', os: 'oss', pa: 'pan', pi: 'pli', pl: 'pol',
+  ps: 'pus', pt: 'por', qu: 'que', rm: 'roh', rn: 'run', ro: 'ron', ru: 'rus', rw: 'kin',
+  sa: 'san', sc: 'srd', sd: 'snd', se: 'sme', sg: 'sag', si: 'sin', sk: 'slk', sl: 'slv',
+  sm: 'smo', sn: 'sna', so: 'som', sq: 'sqi', sr: 'srp', ss: 'ssw', st: 'sot', su: 'sun',
+  sv: 'swe', sw: 'swa', ta: 'tam', te: 'tel', tg: 'tgk', th: 'tha', ti: 'tir', tk: 'tuk',
+  tl: 'tgl', tn: 'tsn', to: 'ton', tr: 'tur', ts: 'tso', tt: 'tat', tw: 'twi', ty: 'tah',
+  ug: 'uig', uk: 'ukr', ur: 'urd', uz: 'uzb', ve: 'ven', vi: 'vie', vo: 'vol', wa: 'wln',
+  wo: 'wol', xh: 'xho', yi: 'yid', yo: 'yor', za: 'zha', zh: 'zho', zu: 'zul',
+  iw: 'heb', 'in': 'ind', ji: 'yid',   // deprecated BCP-47 aliases
+};
+// ISO 639-2/B ("bibliographic") codes whose /T form differs.
+var _ISO639_2B_TO_T = {
+  alb: 'sqi', arm: 'hye', baq: 'eus', bur: 'mya', chi: 'zho', cze: 'ces', dut: 'nld',
+  fre: 'fra', geo: 'kat', ger: 'deu', gre: 'ell', ice: 'isl', mac: 'mkd', mao: 'mri',
+  may: 'msa', per: 'fas', rum: 'ron', slo: 'slk', tib: 'bod', wel: 'cym',
+};
+
+/**
+ * BCP-47 tag → ISO 639-2/T code for mdhd. Only the primary language
+ * subtag counts. Before, the first three characters of the TAG were
+ * used: 'en-US' → "en-" → packed as "enm" (Middle English), 'de' →
+ * garbage; ffprobe showed language=enm for an en-US track.
+ */
+function _iso639_2T(bcp47) {
+  if (!bcp47) return 'und';
+  var primary = String(bcp47).split(/[-_]/)[0].toLowerCase();
+  if (/^[a-z]{2}$/.test(primary)) return _ISO639_1_TO_2T[primary] || 'und';
+  if (/^[a-z]{3}$/.test(primary)) return _ISO639_2B_TO_T[primary] || primary;
+  return 'und';
+}
+
 function _buildTtmlDocument(cues, language, region, style) {
   var lang = language || 'und';   // BCP-47 'undetermined' if no lang set
 
@@ -621,11 +708,15 @@ function _buildTtmlDocument(cues, language, region, style) {
   lines.push('  <body>');
   lines.push('    <div>');
 
+  var usedIds = { s0: true, r0: true };   // the style and region ids below
   for (var i = 0; i < cues.length; i++) {
     var c = cues[i];
     // xml:id per cue gives players a stable handle for cross-segment
     // de-dup. Use the caller's identifier if provided, else synthesize.
-    var idAttr = c.identifier ? c.identifier : ('c' + i);
+    // xml:id must be an NCName (XML ID); the caller's identifier was
+    // used verbatim, so the usual WebVTT-style "1", "2" made the
+    // document invalid XML-ID-wise (strict TTML parsers reject it).
+    var idAttr = _uniqueNcName(c.identifier ? c.identifier : ('c' + i), usedIds);
     // TTML allows multi-line cues via <br/>. Replace LF with <br/>.
     // Convert \n\n to a paragraph break is also possible but uncommon
     // in HLS subtitles — single <br/> per line is the convention.
@@ -720,11 +811,9 @@ function _fullBox(type, version, flags, payload) {
  *       trex  (default sample flags)
  */
 function _buildImscInit(language) {
-  var lang = language || 'und';
   // ISO 639-2 language packing for mdhd: 5 bits per letter, 3 letters,
   // each (letter - 0x60). MDHD language is 16 bits with high bit zero.
-  // BCP-47 "und" = "und" 3-letter code.
-  var langCode = (lang.length >= 3 ? lang.substring(0, 3) : 'und').toLowerCase();
+  var langCode = _iso639_2T(language);
   var langBits = (
     ((langCode.charCodeAt(0) - 0x60) & 0x1F) << 10 |
     ((langCode.charCodeAt(1) - 0x60) & 0x1F) << 5 |
@@ -861,7 +950,16 @@ function _buildImscInit(language) {
 
   var stbl = _box('stbl', concat([stsd, stts, stsc, stsz, stco]));
   var minf = _box('minf', concat([sthd, dinf, stbl]));
-  var mdia = _box('mdia', concat([mdhd, hdlr, minf]));
+  // elng (ISO 14496-12 §8.4.6, ExtendedLanguageBox): the full BCP-47
+  // tag — mdhd can only say "eng", elng keeps "en-US". Only when a
+  // language was given; readers that do not know elng skip it.
+  // Box order per ISO 14496-12 Table 1: mdhd, hdlr, elng, minf.
+  var mdiaKids = [mdhd, hdlr];
+  if (language) {
+    mdiaKids.push(_fullBox('elng', 0, 0, concat([_utf8Encode(String(language)), new Uint8Array([0])])));
+  }
+  mdiaKids.push(minf);
+  var mdia = _box('mdia', concat(mdiaKids));
   var trak = _box('trak', concat([tkhd, mdia]));
 
   // mvex + trex (default sample flags so trun is small)

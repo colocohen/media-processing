@@ -10,12 +10,17 @@
  *   4. flush() waits for the FINAL encoder (software after fallback)
  */
 
-import { initCoder, configureCoder, wireReader, applyCoderPrototype } from './base_coder.js';
+import {
+  initCoder, configureCoder, resetCoder, wireReader, applyCoderPrototype,
+  exitError, failCoder, notConfiguredError, detachCoderListeners, addPendingFlush, removePendingFlush, rejectPendingFlushes,
+} from './base_coder.js';
 import FFmpegProcess from './ffmpeg_process.js';
+import { frameByteSize } from './core/frame_size.js';
 import { EncodedVideoChunk } from './encoded_chunk.js';
 import { getVideoCodec } from './codecs.js';
+import { markEncoderFailed } from './hw_accel.js';
 import { normalizeCodec, parseCodecDetails, buildCodecString } from './utils/codec_strings.js';
-import { getDefaultContainer, getContainer, getContainerFormat, getContainerExtra } from './containers.js';
+import { getEncoderContainer, getContainer, getContainerFormat, getContainerExtra } from './containers.js';
 import { splitNALUs, buildAvcCFromAnnexB, buildHvcCFromAnnexB, annexbToAvccSample } from './utils/nalu_utils.js';
 
 // ── H.264 / H.265 bitstream format (W3C AVC & HEVC codec registrations) ──
@@ -163,18 +168,16 @@ function VideoEncoder(init) {
   //   - frame loss if cap evicts a still-buffered old process
   //   - visible output gaps during new's startup
   //
-  // The fix: during a transition, the NEW reader's outputs are
-  // buffered (not emitted). Only the OLD reader emits live. When all
-  // tracked old processes have signaled `output_end`, we flush the
-  // buffered new outputs in timestamp order, then return to direct
-  // emission. If old fails to drain within MAX_TRANSITION_MS, we
-  // give up waiting and flush — preserves liveness over correctness
-  // in pathological cases (FFmpeg subprocess hung).
+  // The fix: retired processes form a chain, oldest first. Only the
+  // chain's head emits live; every later process (retired or current)
+  // holds its outputs (proc._held) until all before it have drained,
+  // then they go out in order (_emitEncoded / _advanceChain). If the
+  // head stops making progress for MAX_IDLE_MS, everything held is
+  // released — liveness over order when an FFmpeg hangs.
   //
-  // _transitionPendingOld: set of old FFmpegProcess instances we're
-  //                        still waiting on for output_end. While
-  //                        non-empty, transition is active.
-  // _transitionBuffer:     [{chunk, metadata}] queued from new reader.
+  // _transitionPendingOld: retired processes not yet drained.
+  // _chain:                the same, in retirement order (head first).
+  // _transitionBuffer:     non-null while a transition is active.
   // _transitionTimer:      forcing timeout if drain stalls.
   // Set when a frame arrives with different geometry than the running
   // FFmpeg was spawned for. Forces a restart on the next encode and
@@ -184,7 +187,8 @@ function VideoEncoder(init) {
   this._activeOutputConfig = null;
 
   this._transitionPendingOld = new Set();
-  this._transitionBuffer = null;       // null when no transition active
+  this._transitionBuffer = null;       // non-null while a transition is active
+  this._chain = [];                    // retired processes, oldest first
   this._transitionTimer = null;
 
   // ── Keyframe-restart throttle (MP-14 Layer 1) ──
@@ -286,16 +290,41 @@ var FLUSH_TIMEOUT = 10000;
 // Override flush — Promise + callback, waits for output_end from all processes
 VideoEncoder.prototype.flush = function (cb) {
   var self = this;
+  // W3C: not "configured" → InvalidStateError (base_coder).
+  var stateErr = notConfiguredError(self, 'flush');
+  if (stateErr) {
+    if (typeof cb === 'function') { cb(stateErr); return; }
+    return Promise.reject(stateErr);
+  }
   if (typeof cb === 'function') {
-    self._flushImpl(cb);
+    self._flushImpl(cb);   // cb(err): err set when the flush was rejected
     return;
   }
-  return new Promise(function (resolve) { self._flushImpl(resolve); });
+  return new Promise(function (resolve, reject) {
+    self._flushImpl(function (err) { if (err) reject(err); else resolve(); });
+  });
 };
 
 VideoEncoder.prototype._flushImpl = function (cb) {
   if (this._hwProbing) {
+    var self0 = this;
     this._deferredFlush = cb;
+    // The hardware encoder may WORK: then no fallback runs, and only the
+    // fallback path consumed _deferredFlush — flush() called during the
+    // probe never settled. Complete it when this process exits cleanly
+    // and the callback is still ours (a fallback takes it over first:
+    // _wireReader's 'close' listener runs before this one).
+    var probed = this._ffmpeg;
+    probed.on('close', function (code, signal) {
+      if (self0._deferredFlush !== cb || self0._ffmpeg !== probed) return;
+      if (exitError(code, signal, probed)) return;     // failCoder rejects it
+      self0._deferredFlush = null;
+      self0._flushAllReaders();
+      self0._releaseTransitionForFlush();
+      self0._state = 'configured';
+      self0._queueSize = 0;
+      cb();
+    });
     this._ffmpeg.endInput();
     return;
   }
@@ -303,6 +332,16 @@ VideoEncoder.prototype._flushImpl = function (cb) {
   var self = this;
   var pending = 1;
   var done = false;
+
+  // Rejected by failCoder (FFmpeg failed: EncodingError) or by close()/
+  // reset() (AbortError) — see base_coder. Until then this flush waits.
+  function onFail(err) {
+    if (done) return;
+    done = true;
+    clearTimeout(timer);
+    if (cb) cb(err);
+  }
+  addPendingFlush(self, onFail);
 
   for (var i = 0; i < self._oldProcesses.length; i++) {
     if (self._oldProcesses[i].running) pending++;
@@ -316,6 +355,7 @@ VideoEncoder.prototype._flushImpl = function (cb) {
     // frames of every flush() are silently lost (no AUD start code
     // follows the last AU, so feed() never emits it).
     self._flushAllReaders();
+    self._releaseTransitionForFlush();
     self._ffmpeg.stop();
     for (var k = 0; k < self._oldProcesses.length; k++) {
       try { self._oldProcesses[k].stop(); } catch (e) {}
@@ -323,6 +363,7 @@ VideoEncoder.prototype._flushImpl = function (cb) {
     self._state = 'configured';
     self._queueSize = 0;
     self._oldProcesses = [];
+    removePendingFlush(self, onFail);
     if (cb) cb();
   }, FLUSH_TIMEOUT);
 
@@ -336,9 +377,11 @@ VideoEncoder.prototype._flushImpl = function (cb) {
       // still hold a buffered AU it hasn't emitted yet (waiting for
       // the next AUD that will never come).
       self._flushAllReaders();
+      self._releaseTransitionForFlush();
       self._state = 'configured';
       self._queueSize = 0;
       self._oldProcesses = [];
+      removePendingFlush(self, onFail);
       if (cb) cb();
     }
   }
@@ -357,15 +400,33 @@ VideoEncoder.prototype._flushImpl = function (cb) {
     }
   }
 
-  // Wait for current FFmpeg — output_end with close fallback
+  // Wait for current FFmpeg to exit (its exit code decides)
   if (this._ffmpeg.running) {
     var curDone = false;
-    this._ffmpeg.on('output_end', function () { if (!curDone) { curDone = true; onOneDone(); } });
-    this._ffmpeg.on('close', function () { if (!curDone) { curDone = true; onOneDone(); } });
+    var curFfmpeg = this._ffmpeg;
+    // Done on 'close', which carries the exit code — output_end (the
+    // pipe's EOF) comes first, and resolving on it reported a flush as
+    // successful before FFmpeg's failed exit was known (base_coder
+    // flushCoder). A failed exit is not "done": failCoder rejects (onFail).
+    this._ffmpeg.on('close', function (code, signal) {
+      if (exitError(code, signal, curFfmpeg)) return;
+      if (!curDone) { curDone = true; onOneDone(); }
+    });
     this._ffmpeg.endInput();
   } else {
     onOneDone();
   }
+};
+
+// W3C: flush() resolves after EVERY pending output has been emitted. The
+// new process's outputs held back during a keyframe restart (the
+// transition buffer) were not part of that: flush() resolved with them
+// still held (15 of 20 chunks out), they came out later from the timer —
+// or never, when the app close()d after the flush. Every process has
+// exited by now, so the transition has nothing left to wait for.
+VideoEncoder.prototype._releaseTransitionForFlush = function () {
+  this._transitionPendingOld.clear();
+  this._flushTransition('drain');
 };
 
 // Flush all readers (current + olds) so any trailing AU buffered with
@@ -384,8 +445,51 @@ VideoEncoder.prototype._flushAllReaders = function () {
   }
 };
 
+// Stop everything a keyframe restart or the warm pool left running, and
+// drop the transition state. Shared by close() and reset().
+VideoEncoder.prototype._stopAuxiliary = function () {
+  for (var i = 0; i < this._oldProcesses.length; i++) {
+    try { this._oldProcesses[i].stop(); } catch (e) {}
+  }
+  this._oldProcesses = [];
+  this._transitionPendingOld.clear();
+  this._transitionBuffer = null;
+  this._chain = [];
+  if (this._ffmpeg) this._ffmpeg._held = null;
+  if (this._transitionTimer) {
+    clearTimeout(this._transitionTimer);
+    this._transitionTimer = null;
+  }
+  this._drainWarmPool();
+};
+
+// reset(): the base resetCoder stops only the current FFmpeg. A warm-pool
+// process stayed alive (one child 2.5 s after reset()), and old processes
+// still draining from a keyframe restart went on emitting — chunks were
+// delivered after reset() returned, which W3C forbids (reset discards all
+// pending work). The current process's queues go with it.
+VideoEncoder.prototype.reset = function () {
+  this._stopAuxiliary();
+  this._deferredKeyFrame = false;
+  if (this._ffmpeg) {
+    this._ffmpeg._inputPtsQueue = [];
+    this._ffmpeg._totalInputs = 0;
+    this._ffmpeg._outputCount = 0;
+  }
+  resetCoder(this);
+  this.context.state = 'unconfigured';
+};
+
 // Override close to also stop old FFmpeg processes from keyframe restarts
 VideoEncoder.prototype.close = function () {
+  // W3C: a pending flush() is rejected with an AbortError (base_coder).
+  // failCoder rejects with its EncodingError first, so this finds none.
+  if (typeof DOMException !== 'undefined') {
+    rejectPendingFlushes(this, new DOMException('Aborted due to close()', 'AbortError'));
+  } else {
+    var abortErr = new Error('Aborted due to close()'); abortErr.name = 'AbortError';
+    rejectPendingFlushes(this, abortErr);
+  }
   // Stop old processes
   for (var i = 0; i < this._oldProcesses.length; i++) {
     try { this._oldProcesses[i].stop(); } catch (e) {}
@@ -395,6 +499,8 @@ VideoEncoder.prototype.close = function () {
   // to flush. Buffered frames are abandoned (caller is closing anyway).
   this._transitionPendingOld.clear();
   this._transitionBuffer = null;
+  this._chain = [];
+  if (this._ffmpeg) this._ffmpeg._held = null;
   if (this._transitionTimer) {
     clearTimeout(this._transitionTimer);
     this._transitionTimer = null;
@@ -430,6 +536,17 @@ VideoEncoder.prototype.close = function () {
 // on a chunk only when it differs from the active output config (spec:
 // Output EncodedVideoChunks).
 VideoEncoder.prototype._deliver = function (chunk, metadata) {
+  // [[active output config]] is reset by configure() — for the chunks of
+  // the NEW configuration. A process retired by configure() delivers its
+  // remaining chunks after that call, and they belong to the old one: the
+  // reset takes effect at the first chunk of the new configuration's
+  // runs (each run stamps the configuration epoch it started in).
+  var epoch = metadata && metadata._epoch;
+  if (metadata) delete metadata._epoch;
+  if (epoch !== undefined && epoch !== this._deliveredEpoch) {
+    this._deliveredEpoch = epoch;
+    this._activeOutputConfig = null;
+  }
   var oc = metadata && metadata._outputConfig;
   if (oc) {
     delete metadata._outputConfig;
@@ -447,15 +564,24 @@ VideoEncoder.prototype._emitEncoded = function (chunk, metadata, producingFfmpeg
     this._deliver(chunk, metadata);
     return;
   }
-  // Transition active. If this frame came from an OLD process, emit
-  // it live — those are the trailing pre-keyframe frames we want the
-  // receiver to see first. The new keyframe is buffered until they
-  // all drain.
-  if (this._transitionPendingOld.has(producingFfmpeg)) {
+  // Transition active: retired processes form a CHAIN in retirement
+  // order, and output order must follow it — the oldest retired process
+  // (the chain's head) emits live; every later process, retired or
+  // current, holds its outputs until all before it have drained.
+  //
+  // This was one buffer for "the new process" and live output for every
+  // retired one. With restarts in quick succession (an HLSEncoder fed
+  // faster than real time forces a segment-boundary keyframe several
+  // times per wall-clock second) a second restart came while the first
+  // was still draining: the buffer was replaced (its chunks lost, before
+  // the eviction cap was relaxed) and the middle process's outputs went
+  // out live alongside the oldest's — 300 frames out of order, so the
+  // HLS segmenter cut at the wrong keyframes (EXTINF 4.3 / 6.9 / 3.1 s
+  // for 2 s segments).
+  var head = this._chain[0];
+  if (producingFfmpeg === head) {
     this._deliver(chunk, metadata);
-
-    // Reset watchdog: OLD made progress. As long as OLD keeps
-    // emitting, we keep waiting (no premature flush).
+    // Reset watchdog: the head made progress.
     if (this._transitionTimer && this._transitionTimerDuration) {
       clearTimeout(this._transitionTimer);
       var self = this;
@@ -463,57 +589,69 @@ VideoEncoder.prototype._emitEncoded = function (chunk, metadata, producingFfmpeg
         self._flushTransition('timeout');
       }, this._transitionTimerDuration);
     }
-
-    // Count-based drain check: if this OLD has now produced as many
-    // outputs as it received inputs, it's fully drained. Trigger
-    // _onOldDrained synchronously — no waiting on async pipe events.
-    if (producingFfmpeg._drainTarget != null &&
-        producingFfmpeg._outputCount >= producingFfmpeg._drainTarget) {
-      if (producingFfmpeg._onDrainHook) {
-        producingFfmpeg._onDrainHook();
-      }
-    }
-    return;
+  } else {
+    if (!producingFfmpeg._held) producingFfmpeg._held = [];
+    producingFfmpeg._held.push({ chunk: chunk, metadata: metadata });
   }
-  // Otherwise it came from the NEW (current) FFmpeg → buffer.
-  this._transitionBuffer.push({ chunk: chunk, metadata: metadata });
+  // Count-based drain check (race-free, synchronous): a retired process
+  // that has produced as many outputs as it received inputs is drained.
+  if (this._transitionPendingOld.has(producingFfmpeg) &&
+      producingFfmpeg._drainTarget != null &&
+      producingFfmpeg._outputCount >= producingFfmpeg._drainTarget &&
+      producingFfmpeg._onDrainHook) {
+    producingFfmpeg._onDrainHook();
+  }
 };
 
-// Called when one old FFmpeg has drained (or closed). If it was the
-// last pending old, release the transition.
+// One retired process has drained (or closed). Release whatever the
+// chain now allows.
 VideoEncoder.prototype._onOldDrained = function (oldFfmpeg) {
-  // Remove from pending set. Set.delete is a no-op if already removed
-  // (e.g. cap eviction or double-fire from output_end + close).
+  oldFfmpeg._drained = true;
   this._transitionPendingOld.delete(oldFfmpeg);
-  if (this._transitionPendingOld.size === 0) {
-    this._flushTransition('drain');
-  }
+  this._advanceChain();
 };
 
-// Force-end the transition (timeout or all-drained). Flush buffered
-// new outputs in timestamp order, then return to direct mode.
-VideoEncoder.prototype._flushTransition = function (reason) {
+// Walk the chain from its head: release each process's held outputs; a
+// drained one leaves the chain and the next becomes head (and live). At
+// the end of the chain the current process's held outputs go out and
+// the transition ends.
+VideoEncoder.prototype._advanceChain = function () {
+  if (this._transitionBuffer === null) return;
+  while (this._chain.length) {
+    var h = this._chain[0];
+    this._releaseHeld(h);
+    if (!h._drained) return;
+    this._chain.shift();
+  }
+  this._endTransition();
+};
+
+VideoEncoder.prototype._releaseHeld = function (proc) {
+  var held = proc && proc._held;
+  if (!held || !held.length) return;
+  proc._held = null;
+  for (var i = 0; i < held.length; i++) this._deliver(held[i].chunk, held[i].metadata);
+};
+
+VideoEncoder.prototype._endTransition = function () {
   if (this._transitionTimer) {
     clearTimeout(this._transitionTimer);
     this._transitionTimer = null;
   }
-  if (this._transitionBuffer === null) return;   // already flushed
-
-  // Capture the buffer NOW and clear the active transition state
-  // BEFORE any side effects. Reader.flush() below can emit frames
-  // through the live path which may call back into _emitEncoded —
-  // and during a count-based drain check, _onOldDrained → recursive
-  // _flushTransition. Capturing first prevents the recursive call
-  // from re-flushing or NPE'ing on a null buffer.
-  var buffered = this._transitionBuffer;
   this._transitionBuffer = null;
+  this._chain = [];
+  this._releaseHeld(this._ffmpeg);
+};
 
-  // Flush any tail AUs from old readers. On the timeout path this
-  // catches frames that FFmpeg emitted just before going idle but
-  // the reader hadn't seen a following AUD for. On the drain path
-  // it's redundant but harmless. Late frames that surface from
-  // these flushes go straight to _output via the fast path (since
-  // _transitionBuffer is now null).
+// Force-end the transition (timeout, or flush() once every process has
+// exited): release everything held, in chain order, then direct mode.
+VideoEncoder.prototype._flushTransition = function (reason) {
+  if (this._transitionBuffer === null) return;   // already flushed
+  if (this._transitionTimer) {
+    clearTimeout(this._transitionTimer);
+    this._transitionTimer = null;
+  }
+  // Tail AUs still in retired readers (timeout path; harmless on drain).
   if (reason === 'timeout') {
     var pendingArr = Array.from(this._transitionPendingOld);
     for (var pi = 0; pi < pendingArr.length; pi++) {
@@ -523,25 +661,16 @@ VideoEncoder.prototype._flushTransition = function (reason) {
       }
     }
   }
-
-  // Sort by timestamp. Should already be in order from a single
-  // reader, but the cost is small and the safety is real.
-  buffered.sort(function (a, b) {
-    return a.chunk.timestamp - b.chunk.timestamp;
-  });
-
-  for (var i = 0; i < buffered.length; i++) {
-    this._deliver(buffered[i].chunk, buffered[i].metadata);
-  }
-
-  // If timeout-induced flush, the remaining olds are still in the
-  // pending set — clear it so the next restart starts fresh. Their
-  // frames (if they arrive late) will hit the fast path and emit
-  // directly, which can produce out-of-order output. This is the
-  // intentional liveness-over-correctness trade in the timeout path.
-  if (reason === 'timeout') {
-    this._transitionPendingOld.clear();
-  }
+  // Capture and clear first: delivering can re-enter (an output callback
+  // calling encode() → another restart).
+  var chain = this._chain;
+  this._chain = [];
+  this._transitionBuffer = null;
+  for (var i = 0; i < chain.length; i++) this._releaseHeld(chain[i]);
+  this._releaseHeld(this._ffmpeg);
+  // On timeout the remaining retired processes' late frames, if any,
+  // take the fast path — liveness over order, as before.
+  if (reason === 'timeout') this._transitionPendingOld.clear();
 };
 
 // Alias for backward compatibility with the constructor's reference
@@ -551,7 +680,34 @@ VideoEncoder.prototype.configure = function (config) {
   if (!config || !config.codec) throw new TypeError('VideoEncoder.configure: codec required');
   if (!config.width || !config.height) throw new TypeError('VideoEncoder.configure: width and height required');
 
+  // Reconfiguring a running encoder: the frames already passed to
+  // encode() are encoded with the configuration they were submitted
+  // under, and come out before anything of the new one. W3C queues
+  // configure() behind those encode() calls, and Chrome flushes its
+  // encoder before applying the new options. configureCoder() used to
+  // stop FFmpeg here, killing every frame in flight with it: 10 frames
+  // submitted back to back, then a bitrate change, and none of the 10
+  // came out. The process is retired instead (it drains, like after a
+  // keyframe restart) and the next encode() starts a new one.
+  if (this._state === 'configured' && this._ffmpeg && this._ffmpeg.running &&
+      !this._hwProbing &&
+      (this._ffmpeg._totalInputs || 0) > (this._ffmpeg._outputCount || 0)) {
+    this._retireFFmpeg();
+    this._ffmpeg = new FFmpegProcess();
+    this._reader = null;
+  }
+
   configureCoder(this);
+  // configureCoder stopped the running FFmpeg, but this FFmpegProcess
+  // object hosts the next run — and its timestamp queue still held the
+  // stopped run's frames, so the new run's outputs were stamped with
+  // THEIR timestamps (frames 10-19 came out labelled 0-9, the new
+  // keyframe with frame 9's). The queue belongs to the run.
+  if (this._ffmpeg) {
+    this._ffmpeg._inputPtsQueue = [];
+    this._ffmpeg._totalInputs = 0;
+    this._ffmpeg._outputCount = 0;
+  }
 
   // Drain any warm pool from a previous configuration. _refillWarmPool
   // will repopulate it after the new config takes effect (triggered
@@ -620,6 +776,12 @@ VideoEncoder.prototype.configure = function (config) {
     bitrateMode: config.bitrateMode || 'variable',
     scalabilityMode: config.scalabilityMode || null,
     codecOptions: config.codecOptions || null,
+    // Encoder thread count (non-standard; codecs.js's ENCODER_ARGS read
+    // cfg.threads, defaulting per encoder). It was never copied here, so
+    // every builder saw undefined: an explicit `threads` was ignored, and
+    // the defaults could not be overridden — libx265 got -threads <cpu
+    // count> and refused to open on any machine with more than 16.
+    threads: (typeof config.threads === 'number' && config.threads >= 0) ? config.threads : undefined,
     // H.264/H.265: explicit config overrides codec string extraction
     profile: config.profile || details.profile || null,
     level: config.level || details.level || null,
@@ -653,8 +815,10 @@ VideoEncoder.prototype.configure = function (config) {
   this._activeOrientation = null;
   // [[active output config]] — the decoderConfig most recently emitted.
   // Spec: decoderConfig is attached to a chunk only when it DIFFERS from
-  // this, not on every key frame.
-  this._activeOutputConfig = null;
+  // this, not on every key frame. Reset for this configuration through
+  // the epoch (see _deliver): chunks a retired process still delivers
+  // belong to the previous one.
+  this._configEpoch = (this._configEpoch || 0) + 1;
   this._hwProbing = false;
   this._pendingWrites = [];
   this._deferredFlush = null;
@@ -754,7 +918,7 @@ VideoEncoder.prototype.encode = function (frame, options) {
     // input geometry from an earlier frame; otherwise we genuinely
     // cannot interpret the buffer.
     if (this._inputWidth && this._inputHeight &&
-        frame.data.length === Math.floor(this._inputWidth * this._inputHeight * bpp)) {
+        frame.data.length === frameByteSize(fmt, this._inputWidth, this._inputHeight)) {
       inW = this._inputWidth;
       inH = this._inputHeight;
     } else {
@@ -768,7 +932,7 @@ VideoEncoder.prototype.encode = function (frame, options) {
     }
   }
 
-  var codedSize = Math.floor(inW * inH * bpp);
+  var codedSize = frameByteSize(fmt, inW, inH);   // chroma rounded up (core/frame_size.js)
   if (frame.data.length !== codedSize) {
     this._error(new Error(
       'VideoEncoder.encode: frame data length ' + frame.data.length +
@@ -807,10 +971,14 @@ VideoEncoder.prototype.encode = function (frame, options) {
   this._inputHeight = inH;
   this._inputVisible = visNorm;
 
-  // Store input format for FFmpeg startup (first frame determines format)
-  if (!this._inputPixelFormat) {
-    this._inputPixelFormat = _FORMAT_TO_FFMPEG[fmt] || 'yuv420p';
-  }
+  // The pixel format is input geometry too: FFmpeg's -pixel_format is
+  // fixed at spawn like -video_size. Only the first frame set it, so a
+  // later frame in another format of the same size (I420 then RGBA) was
+  // read with the old layout — 5 RGBA frames came out as 13 chunks of
+  // garbage with invented timestamps. A change restarts, like a resize.
+  var _pix = _FORMAT_TO_FFMPEG[fmt] || 'yuv420p';
+  if (this._inputPixelFormat && _pix !== this._inputPixelFormat) geometryChanged = true;
+  this._inputPixelFormat = _pix;
 
   if (geometryChanged) {
     // Warm pool entries were built for the previous geometry. Their
@@ -860,7 +1028,12 @@ VideoEncoder.prototype.encode = function (frame, options) {
   // A pending resize enters the same restart path: FFmpeg's rawvideo
   // input geometry is fixed at spawn, so new dimensions require a new
   // process, and this machinery already drains the old one in order.
-  if ((this._pendingResize || (options && options.keyFrame)) && this._ffmpeg.running) {
+  // A keyframe request the cooldown throttled is remembered and honoured
+  // on the first frame after the cooldown (_deferredKeyFrame). It was
+  // dropped: in realtime mode the GOP is infinite, so a receiver whose
+  // PLI landed inside the cooldown never got a keyframe at all.
+  var _wantKey = !!(options && options.keyFrame) || this._deferredKeyFrame;
+  if ((this._pendingResize || _wantKey) && this._ffmpeg.running) {
     var _kfNow = Date.now();
     var _kfSinceLast = _kfNow - this._lastKeyframeRestart;
     // The cooldown MUST NOT apply to a resize. Throttling a keyframe
@@ -890,7 +1063,8 @@ VideoEncoder.prototype.encode = function (frame, options) {
     if (!this._pendingResize && !_kfMandatory &&
         _kfSinceLast < this.RESTART_COOLDOWN_MS) {
       // Throttled; counted in _stats for after-the-fact diagnosis.
-      this._stats.keyframeThrottled++;
+      if (options && options.keyFrame) this._stats.keyframeThrottled++;   // requests, not frames waiting
+      this._deferredKeyFrame = true;
       // Skip the entire restart block. Frame falls through to the
       // standard encode path below — encoded as P-frame by the
       // currently-running FFmpeg. The receiver doesn't get a fresh
@@ -902,115 +1076,13 @@ VideoEncoder.prototype.encode = function (frame, options) {
       // subsequent requests within RESTART_COOLDOWN_MS get throttled.
       this._lastKeyframeRestart = _kfNow;
       this._pendingResize = false;
+      this._deferredKeyFrame = false;
 
-    var oldFfmpeg = this._ffmpeg;
-
-    // Let old FFmpeg finish processing — DON'T stop/kill yet.
-    // Capture the reader BEFORE replacing self._reader; we need it
-    // to flush trailing AUs after FFmpeg's stdio drains. Without this
-    // flush, the last AU(s) buffered in the reader (no following AUD
-    // start-code to terminate them) never get emitted — visible as
-    // frame loss + out-of-order outputs in real-world FFmpeg tests.
-    var oldReader = this._reader;
-    oldFfmpeg.endInput();
-    oldFfmpeg._oldReader = oldReader;   // keep reader reachable for flush
-    this._oldProcesses.push(oldFfmpeg);
-
-    // Track this old process as one we wait on before flushing.
-    //
-    // Drain detection: COUNT-BASED (race-free).
-    //
-    // Earlier event-based approach (waiting for stdio[3] 'end') was
-    // racey with Node's event loop:
-    //   - OLD subprocess might exit and emit 'end' BEFORE we attach
-    //     the listener (if endInput → exit → end happens fast).
-    //   - 'end' fires after all data events queued, but data events
-    //     can still be PENDING in the JS event queue when 'end' fires
-    //     synchronously.
-    //   - Result: transition releases before OLD's last frames have
-    //     been emitted, causing out-of-order outputs in real tests.
-    //
-    // Count approach: each FFmpeg instance tracks input frames
-    // pushed (_inputPtsQueue.length when restarted) vs output frames
-    // emitted (_outputCount). Drain is reached when output reaches
-    // input. This is checked from the reader callback (synchronous,
-    // race-free) AND from a fallback timer.
-    //
-    // Assumption: 1 input frame = 1 output frame. True for B-frame=0
-    // encoders (our WebRTC default). For codecs that reorder or
-    // produce multiple outputs per input, this would need adjustment.
-    oldFfmpeg._drainTarget = oldFfmpeg._totalInputs || 0;
-    oldFfmpeg._outputCount = oldFfmpeg._outputCount || 0;
-    oldFfmpeg._readerForFlush = oldReader;
-
-    this._transitionPendingOld.add(oldFfmpeg);
-    var self = this;
-    var drained = false;
-    var onDrainOnce = function () {
-      if (drained) return;
-      drained = true;
-      // Final reader flush in case there's a tail AU. Synchronous —
-      // any 'video' events emitted during flush propagate through
-      // the reader handler. The flush itself can produce more output
-      // counts; if the count crosses _drainTarget mid-flush, no harm:
-      // we're already declaring drained.
-      if (oldReader && typeof oldReader.flush === 'function') {
-        try { oldReader.flush(); } catch (e) {}
-      }
-      self._onOldDrained(oldFfmpeg);
-    };
-    oldFfmpeg._onDrainHook = onDrainOnce;   // called from reader callback
-
-    // We deliberately do NOT attach output_end / close listeners as
-    // drain triggers — they fire BEFORE the reader has processed all
-    // buffered data (Node's event ordering). Relying on them caused
-    // out-of-order outputs (transition closed prematurely while
-    // OLD's reader was still emitting frames). The 250ms _flushTransition
-    // timeout is the only fallback for liveness if the count never
-    // reaches its target.
-
-    // Activate transition: from now until all olds drain, the
-    // NEW reader's outputs are buffered, not emitted live.
-    this._transitionBuffer = [];
-
-    // Watchdog timer: if no OLD output arrives for MAX_IDLE_MS, force
-    // the transition to flush. This prevents indefinite buffering if
-    // OLD subprocess hung or the count-based detection fails.
-    //
-    // The timer is RESET each time an OLD frame arrives — so a slowly-
-    // draining OLD can take many seconds to drain as long as it makes
-    // progress. Only true silence triggers the timeout.
-    //
-    // Was: fixed 250ms (caused premature flush on real workloads
-    //   where libx264 ultrafast encode of 30 frames takes >250ms).
-    var MAX_IDLE_MS = 1000;
-    if (this._transitionTimer) clearTimeout(this._transitionTimer);
-    this._transitionTimer = setTimeout(function () {
-      self._flushTransition('timeout');
-    }, MAX_IDLE_MS);
-    this._transitionTimerDuration = MAX_IDLE_MS;
-
-    // MP-14 BAND-AID: cap pending old processes. Without this, a
-    // PLI/FIR storm accumulates FFmpeg subprocesses unboundedly.
-    // Each is ~30-50 MB RSS + a few file descriptors. Test
-    // test_ffmpeg_restart_behavior.js measured 101 active
-    // subprocesses after 100 keyframe requests with no cap.
-    //
-    // Frames buffered in evicted FFmpegs are lost — but losing a few
-    // P-frames is far better than OOM/FD exhaustion. The proper fix
-    // (cheap keyframe-on-demand without restart) is tracked in MP-14
-    // root cause; needs FFmpeg ZMQ/sendcmd integration or libav
-    // bindings. Both are days of architectural work.
-    var MAX_PENDING_RESTARTS = 4;
-    while (this._oldProcesses.length > MAX_PENDING_RESTARTS) {
-      var victim = this._oldProcesses.shift();
-      // Eviction = keyframe requests faster than old FFmpegs can drain;
-      // their buffered P-frames are lost to keep memory bounded.
-      this._stats.evictedProcesses++;
-      // Also remove from pending-old set (won't get its output_end now)
-      this._transitionPendingOld.delete(victim);
-      try { victim.stop(); } catch (e) {}
-    }
+    // Let the running FFmpeg finish what it has and drain (its outputs
+    // come first); the new process's outputs wait in the transition.
+    // A mandatory keyframe (bypassThrottle: an HLS segment boundary)
+    // never evicts a draining process — see the cap in _retireFFmpeg.
+    this._retireFFmpeg(!_kfMandatory);
 
     // Take a pre-warmed FFmpeg from the pool if available — saves the
     // ~50-100ms spawn + ~200ms FFmpeg startup window. If the pool is
@@ -1095,7 +1167,10 @@ VideoEncoder.prototype.encode = function (frame, options) {
     this._ffmpeg._inputPtsQueue = [];
     this._ffmpeg._totalInputs = 0;     // monotonic counter, never decreases
   }
-  this._ffmpeg._inputPtsQueue.push(frame.timestamp);
+  // {timestamp, duration}: W3C copies the frame's duration to its chunk;
+  // the chunk's was always null.
+  this._ffmpeg._inputPtsQueue.push({ timestamp: frame.timestamp,
+    duration: (typeof frame.duration === 'number') ? frame.duration : null });
   this._ffmpeg._totalInputs++;
 
   this._queueSize++;
@@ -1108,6 +1183,157 @@ VideoEncoder.prototype.encode = function (frame, options) {
   }
 
   return ok;  // false = backpressure hint, caller may also wait for onDrain
+};
+
+// Retire the running FFmpeg without losing its frames in flight: end its
+// input, keep its reader wired so every frame it still has comes out
+// (stamped from ITS timestamp queue, with ITS config), and hold the next
+// process's outputs in the transition buffer until it has drained — so
+// output order is input order. Used by a keyframe restart and by a
+// configure() on a running encoder. The caller puts the next process in
+// this._ffmpeg.
+VideoEncoder.prototype._retireFFmpeg = function (allowEvict) {
+  var oldFfmpeg = this._ffmpeg;
+
+  // Let old FFmpeg finish processing — DON'T stop/kill yet.
+  // Capture the reader BEFORE replacing self._reader; we need it
+  // to flush trailing AUs after FFmpeg's stdio drains. Without this
+  // flush, the last AU(s) buffered in the reader (no following AUD
+  // start-code to terminate them) never get emitted — visible as
+  // frame loss + out-of-order outputs in real-world FFmpeg tests.
+  var oldReader = this._reader;
+  oldFfmpeg.endInput();
+  oldFfmpeg._oldReader = oldReader;   // keep reader reachable for flush
+  this._oldProcesses.push(oldFfmpeg);
+
+  // Track this old process as one we wait on before flushing.
+  //
+  // Drain detection: COUNT-BASED (race-free).
+  //
+  // Earlier event-based approach (waiting for stdio[3] 'end') was
+  // racey with Node's event loop:
+  //   - OLD subprocess might exit and emit 'end' BEFORE we attach
+  //     the listener (if endInput → exit → end happens fast).
+  //   - 'end' fires after all data events queued, but data events
+  //     can still be PENDING in the JS event queue when 'end' fires
+  //     synchronously.
+  //   - Result: transition releases before OLD's last frames have
+  //     been emitted, causing out-of-order outputs in real tests.
+  //
+  // Count approach: each FFmpeg instance tracks input frames
+  // pushed (_inputPtsQueue.length when restarted) vs output frames
+  // emitted (_outputCount). Drain is reached when output reaches
+  // input. This is checked from the reader callback (synchronous,
+  // race-free) AND from a fallback timer.
+  //
+  // Assumption: 1 input frame = 1 output frame. True for B-frame=0
+  // encoders (our WebRTC default). For codecs that reorder or
+  // produce multiple outputs per input, this would need adjustment.
+  oldFfmpeg._drainTarget = oldFfmpeg._totalInputs || 0;
+  oldFfmpeg._outputCount = oldFfmpeg._outputCount || 0;
+  oldFfmpeg._readerForFlush = oldReader;
+
+  this._transitionPendingOld.add(oldFfmpeg);
+  this._chain.push(oldFfmpeg);
+  var self = this;
+  var drained = false;
+  var onDrainOnce = function () {
+    if (drained) return;
+    drained = true;
+    // Final reader flush in case there's a tail AU. Synchronous —
+    // any 'video' events emitted during flush propagate through
+    // the reader handler. The flush itself can produce more output
+    // counts; if the count crosses _drainTarget mid-flush, no harm:
+    // we're already declaring drained.
+    if (oldReader && typeof oldReader.flush === 'function') {
+      try { oldReader.flush(); } catch (e) {}
+    }
+    self._onOldDrained(oldFfmpeg);
+  };
+  oldFfmpeg._onDrainHook = onDrainOnce;   // called from reader callback
+
+  // ALSO drained when the old FFmpeg exits. The count check above fires
+  // only from an output the old process emits AFTER this point — and
+  // usually there is none: VP8/VP9/AV1 have emitted everything already,
+  // and the H.264/H.265 reader held the last access unit until it was
+  // flushed (it ended at the next AUD, which never comes — the encoder
+  // reads FLV now, see reader_flv.js, but a reader may still hold a
+  // tail). So every
+  // forced keyframe waited for the 1 s watchdog below: the keyframe and
+  // every frame after it reached the caller ~1000 ms late — a one-second
+  // freeze per PLI. 'close' is emitted after the process's stdio has
+  // closed, i.e. after every 'data' event has been delivered and read,
+  // so nothing of the old stream is still in flight (onDrainOnce flushes
+  // the reader's tail first).
+  oldFfmpeg.on('close', function () { onDrainOnce(); });
+
+  // We deliberately do NOT attach output_end / close listeners as
+  // drain triggers — they fire BEFORE the reader has processed all
+  // buffered data (Node's event ordering). Relying on them caused
+  // out-of-order outputs (transition closed prematurely while
+  // OLD's reader was still emitting frames). The 250ms _flushTransition
+  // timeout is the only fallback for liveness if the count never
+  // reaches its target.
+
+  // Activate transition: from now until all olds drain, the
+  // NEW reader's outputs are buffered, not emitted live.
+  // (Kept when one is already active: this process's held outputs, and
+  // those of every process before it, are released in chain order.)
+  if (this._transitionBuffer === null) this._transitionBuffer = [];
+
+  // Watchdog timer: if no OLD output arrives for MAX_IDLE_MS, force
+  // the transition to flush. This prevents indefinite buffering if
+  // OLD subprocess hung or the count-based detection fails.
+  //
+  // The timer is RESET each time an OLD frame arrives — so a slowly-
+  // draining OLD can take many seconds to drain as long as it makes
+  // progress. Only true silence triggers the timeout.
+  //
+  // Was: fixed 250ms (caused premature flush on real workloads
+  //   where libx264 ultrafast encode of 30 frames takes >250ms).
+  var MAX_IDLE_MS = 1000;
+  if (this._transitionTimer) clearTimeout(this._transitionTimer);
+  this._transitionTimer = setTimeout(function () {
+    self._flushTransition('timeout');
+  }, MAX_IDLE_MS);
+  this._transitionTimerDuration = MAX_IDLE_MS;
+
+  // Already drained (every input has come out): nothing to wait for.
+  if (oldFfmpeg._outputCount >= oldFfmpeg._drainTarget) onDrainOnce();
+
+  // MP-14 BAND-AID: cap pending old processes. Without this, a
+  // PLI/FIR storm accumulates FFmpeg subprocesses unboundedly.
+  // Each is ~30-50 MB RSS + a few file descriptors. Test
+  // test_ffmpeg_restart_behavior.js measured 101 active
+  // subprocesses after 100 keyframe requests with no cap.
+  //
+  // Frames buffered in evicted FFmpegs are lost — but losing a few
+  // P-frames is far better than OOM/FD exhaustion. The proper fix
+  // (cheap keyframe-on-demand without restart) is tracked in MP-14
+  // root cause; needs FFmpeg ZMQ/sendcmd integration or libav
+  // bindings. Both are days of architectural work.
+  //
+  // Only for restarts the caller can live without (a PLI, throttled to
+  // one per second anyway). A mandatory one — an HLS segment boundary,
+  // a configure() — must not cost frames: fed faster than real time, an
+  // HLSEncoder forced a boundary every 2 s of media, i.e. many per
+  // second of wall clock, the cap killed processes still draining, and
+  // 35 of 600 frames were lost with the IDRs landing at 6.4 / 12.5 s
+  // instead of 6 / 8 / 10 s. Those processes each end their input and
+  // exit once drained, so the count stays bounded by the input rate.
+  var MAX_PENDING_RESTARTS = 4;
+  while (allowEvict && this._oldProcesses.length > MAX_PENDING_RESTARTS) {
+    var victim = this._oldProcesses.shift();
+    // Eviction = keyframe requests faster than old FFmpegs can drain;
+    // their buffered P-frames are lost to keep memory bounded.
+    this._stats.evictedProcesses++;
+    // Also remove from pending-old set (won't get its output_end now)
+    this._transitionPendingOld.delete(victim);
+    var vi = this._chain.indexOf(victim);
+    if (vi >= 0) this._chain.splice(vi, 1);
+    try { victim.stop(); } catch (e) {}
+  }
+  this._advanceChain();
 };
 
 // ── Start FFmpeg ──
@@ -1124,6 +1350,16 @@ VideoEncoder.prototype._startFFmpeg = function () {
 };
 
 VideoEncoder.prototype._launchFFmpeg = function (codecDef) {
+  // The same FFmpegProcess object hosts the next run after a flush():
+  // drop the previous run's 'data' listener and reader. They stayed, so
+  // after a flush the old reader parsed the new stream too — H.264/H.265
+  // emitted duplicates and garbage (29 chunks for 20 frames), and an IVF
+  // reader buffered the whole stream forever. Its timestamp queue
+  // belongs to the old run as well.
+  detachCoderListeners(this._ffmpeg);
+  this._ffmpeg._inputPtsQueue = [];
+  this._ffmpeg._totalInputs = 0;
+  this._ffmpeg._outputCount = 0;
   var args = this._buildFFmpegArgs(codecDef);
   this._ffmpeg.start(args, ['pipe', 'ignore', 'pipe', 'pipe']);
   this._wireReader(codecDef);
@@ -1146,7 +1382,7 @@ VideoEncoder.prototype._buildFFmpegArgs = function (codecDef) {
   var self = this;
   var cfg = this._config;
 
-  var containerName = getDefaultContainer(cfg.codec);
+  var containerName = getEncoderContainer(cfg.codec);
   var containerDef = getContainer(containerName);
   if (!containerDef) {
     self._error(new Error('No container for: ' + cfg.codec));
@@ -1264,11 +1500,12 @@ VideoEncoder.prototype._buildFFmpegArgs = function (codecDef) {
 VideoEncoder.prototype._wireReader = function (codecDef) {
   var self = this;
   var cfg = this._config;
-  var containerName = getDefaultContainer(cfg.codec);
+  var containerName = getEncoderContainer(cfg.codec);
   var containerDef = getContainer(containerName);
 
   var gotOutput = false;
   var svcPat = self._svcPattern;
+  var epoch = self._configEpoch;
 
   if (containerDef.createReader) {
     var reader = containerDef.createReader({ codec: cfg.codec, fps: cfg.framerate });
@@ -1299,9 +1536,11 @@ VideoEncoder.prototype._wireReader = function (codecDef) {
       // Fallback: if the queue is empty (rare — possible if FFmpeg
       // emits more frames than were fed, e.g. duplicates), fall back
       // to reader's counter-based PTS so we don't crash.
-      var realPts;
+      var realPts, realDur = null;
       if (producingFfmpeg._inputPtsQueue && producingFfmpeg._inputPtsQueue.length > 0) {
-        realPts = producingFfmpeg._inputPtsQueue.shift();
+        var _in = producingFfmpeg._inputPtsQueue.shift();
+        realPts = _in.timestamp;
+        realDur = _in.duration;
       } else {
         realPts = f.ptsUs;
       }
@@ -1316,6 +1555,7 @@ VideoEncoder.prototype._wireReader = function (codecDef) {
       var chunk = new EncodedVideoChunk({
         type: f.isKeyframe ? 'key' : 'delta',
         timestamp: realPts,
+        duration: realDur,
         data: lengthPrefixed ? annexbToAvccSample(f.payload, isH265) : f.payload,
       });
 
@@ -1368,6 +1608,7 @@ VideoEncoder.prototype._wireReader = function (codecDef) {
         // config on the wrong keyframe — the first one went out without it.
         metadata._outputConfig = outputConfig;
       }
+      metadata._epoch = epoch;
 
       self._emitEncoded(chunk, metadata, producingFfmpeg);
     });
@@ -1383,13 +1624,21 @@ VideoEncoder.prototype._wireReader = function (codecDef) {
     self._error(e);
   });
 
-  // Handle close — fallback if HW failed
-  self._ffmpeg.on('close', function () {
+  // Handle close — fallback if HW failed; otherwise a failed exit closes
+  // the encoder with an EncodingError (base_coder failCoder). It was
+  // ignored: the next encode() respawned the same failing FFmpeg, once
+  // per frame, and neither error() nor a rejected flush() ever told the
+  // caller (libx265 at -threads > 16 produced no chunk and no error).
+  var thisFfmpeg = self._ffmpeg;
+  self._ffmpeg.on('close', function (code, signal) {
     if (self._hwProbing && !gotOutput) {
       self._hwProbing = false;
       self._fallbackToSoftware();
       return;
     }
+    if (thisFfmpeg !== self._ffmpeg) return;   // a process we already replaced
+    var err = exitError(code, signal, thisFfmpeg);
+    if (err) failCoder(self, err);
   });
 };
 
@@ -1564,27 +1813,48 @@ VideoEncoder.prototype._drainWarmPool = function () {
 };
 
 /**
- * Hardware failed → restart with software, replay buffered frames.
- * If flush() was deferred, flush the software encoder after replay.
+ * Hardware failed → restart with the next working hardware encoder, or
+ * software; replay buffered frames. If flush() was deferred, flush the
+ * replacement after replay.
+ *
+ * The failed encoder is remembered (hw_accel markEncoderFailed). Before,
+ * nothing was: the keyframe-restart path and the warm pool call
+ * getVideoCodec again, got the same dead h264_nvenc, and every keyframe
+ * restart re-ran the probe-fail-fallback cycle (measured: nvenc → libx264
+ * at frames 0, 20 and 53 of a 60-frame run) (C11).
  */
 VideoEncoder.prototype._fallbackToSoftware = function () {
   var self = this;
   var cfg = this._config;
 
-  var swConfig = {};
-  for (var k in cfg) {
-    if (Object.prototype.hasOwnProperty.call(cfg, k)) swConfig[k] = cfg[k];
-  }
-  swConfig.hardwareAcceleration = 'prefer-software';
+  var failed = self.context.encoder;
+  if (self.context.isHardware && failed) markEncoderFailed(failed, cfg.ffmpegPath);
 
-  var swCodecDef = getVideoCodec(cfg.codec, swConfig);
-  if (!swCodecDef) {
+  // The same preference again: picks the next verified hardware encoder
+  // (prefer-hardware), else software. Not when a flush is already
+  // waiting — that one must complete, so go straight to software.
+  var nextDef = self._deferredFlush ? null : getVideoCodec(cfg.codec, cfg);
+  if (!nextDef || nextDef.encoder === failed) {
+    var swConfig = {};
+    for (var k in cfg) {
+      if (Object.prototype.hasOwnProperty.call(cfg, k)) swConfig[k] = cfg[k];
+    }
+    swConfig.hardwareAcceleration = 'prefer-software';
+    nextDef = getVideoCodec(cfg.codec, swConfig);
+  }
+  if (!nextDef) {
     self._error(new Error('Fallback failed: no software encoder for ' + cfg.codec));
     return;
   }
 
-  self.context.encoder = swCodecDef.encoder;
-  self.context.isHardware = false;
+  self.context.encoder = nextDef.encoder;
+  self.context.isHardware = nextDef.isHardware;
+  // Another hardware encoder is probed the same way (no output before
+  // exit → this function again).
+  self._hwProbing = nextDef.isHardware;
+
+  // Warm-pool processes were pre-spawned with the failed encoder's argv.
+  self._drainWarmPool();
 
   // Clean up old listeners
   self._ffmpeg.removeAllListeners('data');
@@ -1592,12 +1862,12 @@ VideoEncoder.prototype._fallbackToSoftware = function () {
   self._ffmpeg.removeAllListeners('close');
   self._reader = null;
 
-  // Launch software encoder
-  self._launchFFmpeg(swCodecDef);
+  // Launch the replacement encoder
+  self._launchFFmpeg(nextDef);
 
-  // Replay buffered frames
+  // Replay buffered frames; keep them while still probing hardware.
   var pending = self._pendingWrites;
-  self._pendingWrites = [];
+  self._pendingWrites = nextDef.isHardware ? pending.slice() : [];
   for (var i = 0; i < pending.length; i++) {
     self._ffmpeg.write(pending[i]);
   }
@@ -1621,8 +1891,17 @@ VideoEncoder.isConfigSupported = function (config) {
   // VideoEncoderSupport carries `config` alongside `supported`, and it
   // is the caller's only way to learn which config members this
   // implementation recognised.
+  //
+  // The codec STRING is normalized first, as configure() does:
+  // getVideoCodec knows only short names ('h264', 'vp9'), so every real
+  // WebCodecs string — 'avc1.42001f', 'vp09.00.10.08', 'av01.0.04M.08',
+  // 'hvc1.1.6.L93.B0' — reported supported:false although configure()
+  // accepted it (C5).
+  var supported;
+  try { supported = !!(config && getVideoCodec(normalizeCodec(config.codec), config)); }
+  catch (e) { supported = false; }
   return Promise.resolve({
-    supported: !!getVideoCodec(config.codec, config),
+    supported: supported,
     config: _cloneEncoderConfig(config),
   });
 };

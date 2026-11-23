@@ -35,6 +35,11 @@ IVFReader.prototype.feed = function (chunk) {
     var b = this._buf;
     var s = this._start;
     if (b[s] !== 0x44 || b[s+1] !== 0x4B || b[s+2] !== 0x49 || b[s+3] !== 0x46) return; // 'DKIF'
+    // The header says its own length (bytes 6-7). It is 32 in every file
+    // written today, but a longer one was read as frames from byte 32 on.
+    var hdrLen = readU16LE(b, s + 6);
+    if (hdrLen < 32) hdrLen = 32;
+    if (avail < hdrLen) return;
 
     this._fourcc = toAscii(b, s + 8, s + 12);
     this._width = readU16LE(b, s + 12);
@@ -43,7 +48,7 @@ IVFReader.prototype.feed = function (chunk) {
     this._timebaseNum = readU32LE(b, s + 20);
 
     var ivfHeader = b.slice(s, s + 32);
-    this._start += 32;
+    this._start += hdrLen;
 
     this._ee.emit('init', {
       ivfHeader: ivfHeader,
@@ -137,7 +142,12 @@ function _keyAV1(buf) {
     p += s.bytes;
     var end = p + s.value;
     if (end > buf.length) return false;
-    if (h.type === 6 || h.type === 7) {
+    // OBU_FRAME (6) and OBU_FRAME_HEADER (3, the header sent apart from
+    // its tile groups — what libaom writes with several tile groups) both
+    // begin with the uncompressed frame header (AV1 spec §5.9.1). Only 6
+    // and 7 were read, so the keyframes of a tile-group stream were all
+    // reported as delta frames (0 of 2 in the probe file).
+    if (h.type === 3 || h.type === 6 || h.type === 7) {
       var r = _mkBitReader(buf.subarray(p, end));
       var show = r.rb(1); if (show === null) return false;
       if (show === 1) return false;

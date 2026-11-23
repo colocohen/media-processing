@@ -9,6 +9,9 @@
 import EventEmitter from './core/events.js';
 import { randomBytes } from 'node:crypto';
 import { domException as _domex } from './core/dom_exception.js';
+import { resolveConstraint, overconstrainedError } from './core/constraints.js';
+import VideoFrame from './video_frame.js';
+import AudioData from './audio_data.js';
 
 // ── MediaStreamTrack ──
 
@@ -29,37 +32,187 @@ function MediaStreamTrack(opts) {
   this.readyState = 'live';
   this.muted = false;
   this.contentHint = opts.contentHint || '';  // '', 'motion', 'detail', 'text'
-  Object.defineProperty(this, '_onStop', {
+  // The source this track draws from — its own, or the one of the track
+  // it was cloned from (see TrackSource).
+  Object.defineProperty(this, '_source', {
     value: null, writable: true, enumerable: false, configurable: true });
+  if (opts._source) opts._source.attach(this);
+  else new TrackSource(this.kind).attach(this);
   // capture-time settings (width, height, frameRate, sampleRate, …)
   Object.defineProperty(this, '_settings', {
     value: opts.settings || {}, writable: true, enumerable: false, configurable: true });
 }
 
-MediaStreamTrack.prototype.on = function (ev, fn) { this._ee.on(ev, fn); };
-MediaStreamTrack.prototype.off = function (ev, fn) { this._ee.off(ev, fn); };
-MediaStreamTrack.prototype.addEventListener = function (ev, fn) { this._ee.on(ev, fn); };
-MediaStreamTrack.prototype.removeEventListener = function (ev, fn) { this._ee.off(ev, fn); };
+// Adding or removing a frame / audio listener changes how many consumers
+// the SOURCE has (see TrackSource.consumerCount).
+function _touched(track, ev) {
+  if ((ev === 'frame' || ev === 'data') && track._source) track._source._consumersChanged();
+}
+MediaStreamTrack.prototype.on = function (ev, fn) { this._ee.on(ev, fn); _touched(this, ev); };
+MediaStreamTrack.prototype.off = function (ev, fn) { this._ee.off(ev, fn); _touched(this, ev); };
+MediaStreamTrack.prototype.addEventListener = function (ev, fn) { this._ee.on(ev, fn); _touched(this, ev); };
+MediaStreamTrack.prototype.removeEventListener = function (ev, fn) { this._ee.off(ev, fn); _touched(this, ev); };
 // prependListener exposes the EE method of the same name. Required so a
 // consumer that needs first-call ordering (e.g. MediaStreamTrackProcessor,
 // which must clone the VideoFrame before any sibling listener calls
 // close() on it) can register itself ahead of pre-existing on() listeners.
 // Without this, processor.handler runs after a diag listener that closes
 // the frame, and processor.clone() throws "VideoFrame is detached".
-MediaStreamTrack.prototype.prependListener = function (ev, fn) { this._ee.prependListener(ev, fn); };
-MediaStreamTrack.prototype.once           = function (ev, fn) { this._ee.once(ev, fn); };
+MediaStreamTrack.prototype.prependListener = function (ev, fn) { this._ee.prependListener(ev, fn); _touched(this, ev); };
+MediaStreamTrack.prototype.once           = function (ev, fn) { this._ee.once(ev, fn); _touched(this, ev); };
+
+// ── Source sharing, stop() and 'ended' (W3C mediacapture-main) ──
+//
+// A track is a consumer of a SOURCE (a camera, a microphone, a remote
+// peer's stream, a VideoSource). clone() makes another track of the SAME
+// source, with its own state (enabled, constraints), and:
+//
+//   - stop() ends THIS track only. The source stops — its capture
+//     process is killed (_onStop) — when no track of it is live any more.
+//     stop() does NOT fire 'ended': the spec fires 'ended' only when the
+//     track ends for another reason (the source ended: the camera was
+//     unplugged, the capture process exited, the remote peer stopped).
+//   - muted belongs to the source, so it changes on all of its tracks.
+//
+// Before: stop() killed the capture process of every clone and fired
+// 'ended' on a stop() the application itself made, and a clone got no
+// frames at all — it had no source.
+//
+// Internal events (code here and in webrtc-server, not applications):
+//   '_stopped'        this track stopped delivering, by stop() or because
+//                     the source ended. What a CONSUMER of the track (a
+//                     sink, a sender, a processor) listens to.
+//   '_sourceStopped'  the source has no live track left — on every track
+//                     of it. What a PRODUCER feeding the track (a receive
+//                     pipeline) listens to, to stop producing.
+
+function TrackSource(kind) {
+  this.kind = kind;
+  this.tracks = [];
+  this.stopped = false;
+  this.onStop = null;   // cleanup, e.g. kill the capture process
+}
+
+TrackSource.prototype.attach = function (track) {
+  track._source = this;
+  this.tracks.push(track);
+};
+
+/** See TrackSource.consumerCount. */
+MediaStreamTrack.prototype._consumerCount = function () {
+  return this._source ? this._source.consumerCount()
+    : this._ee.listenerCount(this.kind === 'video' ? 'frame' : 'data');
+};
+
+TrackSource.prototype._live = function () {
+  return this.tracks.filter(function (t) { return t.readyState === 'live'; });
+};
+
+/**
+ * Deliver one VideoFrame / AudioData to every live track. Each track gets
+ * its own reference (clone() shares the buffer), because each track's
+ * consumers close() what they receive. Returns the number of tracks it
+ * reached; with none, the data is released.
+ */
+TrackSource.prototype.push = function (data) {
+  var live = this._live();
+  if (!live.length) {
+    try { if (data && typeof data.close === 'function') data.close(); } catch (e) {}
+    return 0;
+  }
+  var copies = [];
+  for (var i = 0; i < live.length - 1; i++) {
+    copies.push((data && typeof data.clone === 'function') ? data.clone() : data);
+  }
+  copies.push(data);
+  for (var j = 0; j < live.length; j++) live[j]._deliver(copies[j]);
+  return live.length;
+};
+
+/**
+ * How many listeners receive this source's frames ('frame') or audio
+ * ('data'), over all of its live tracks. A producer that does work only
+ * for a consumer (webrtc-server decodes a remote track only while
+ * something listens) must count a clone's listeners too: it counted the
+ * original track's alone, so once the application stopped the original
+ * and kept a clone, decoding stopped and the clone got nothing.
+ */
+TrackSource.prototype.consumerCount = function () {
+  var ev = this.kind === 'video' ? 'frame' : 'data';
+  var live = this._live(), n = 0;
+  for (var i = 0; i < live.length; i++) n += live[i]._ee.listenerCount(ev);
+  return n;
+};
+
+// '_consumers' (count, previous) on every track of the source when the
+// consumer count changes — a listener added or removed on any of them,
+// or a track with listeners ending.
+TrackSource.prototype._consumersChanged = function () {
+  var n = this.consumerCount();
+  var prev = this._consumers || 0;
+  if (n === prev) return;
+  this._consumers = n;
+  var all = this.tracks.slice();
+  for (var i = 0; i < all.length; i++) all[i]._ee.emit('_consumers', n, prev);
+};
+
+TrackSource.prototype.setMuted = function (muted) {
+  var live = this._live();
+  for (var i = 0; i < live.length; i++) live[i]._applyMuted(muted);
+};
+
+/** The source ended by itself: end every live track, with 'ended'. */
+TrackSource.prototype.end = function () {
+  var live = this._live();
+  for (var i = 0; i < live.length; i++) live[i]._end();
+  this._trackStopped();
+};
+
+/** A track of this source stopped; the last one stops the source. */
+TrackSource.prototype._trackStopped = function () {
+  this._consumersChanged();
+  if (this.stopped || this._live().length) return;
+  this.stopped = true;
+  var fn = this.onStop;
+  this.onStop = null;
+  if (typeof fn === 'function') { try { fn(); } catch (e) {} }
+  var all = this.tracks.slice();
+  for (var i = 0; i < all.length; i++) {
+    all[i]._ee.emit('_sourceStopped', _event('_sourceStopped', all[i]));
+  }
+};
+
+// The source's cleanup, set by whoever starts the capture
+// (getUserMedia: kill the GStreamer / FFmpeg process). Shared with clones.
+Object.defineProperty(MediaStreamTrack.prototype, '_onStop', {
+  get: function () { return this._source ? this._source.onStop : null; },
+  set: function (fn) { if (this._source) this._source.onStop = fn; },
+});
 
 MediaStreamTrack.prototype.stop = function () {
   if (this.readyState === 'ended') return;
   this.readyState = 'ended';
-  // Call cleanup callback (e.g., kill GStreamer process)
-  if (typeof this._onStop === 'function') {
-    this._onStop();
-    this._onStop = null;
-  }
-  // Same reasoning as addtrack: `ended` is a W3C event, so the handler
-  // is entitled to read `e.type`. It carried no argument at all.
+  this._ee.emit('_stopped', _event('_stopped', this));
+  if (this._source) this._source._trackStopped();
+};
+
+// The track ends for a reason other than stop(): fires 'ended'.
+MediaStreamTrack.prototype._end = function () {
+  if (this.readyState === 'ended') return;
+  this.readyState = 'ended';
+  this._ee.emit('_stopped', _event('_stopped', this));
+  // `ended` is a W3C event, so the handler is entitled to read `e.type`.
   this._ee.emit('ended', _event('ended', this));
+};
+
+/**
+ * The source ended (capture process exited, remote track ended, ...):
+ * every track of it ends and fires 'ended'. For producers; an
+ * application ends its own tracks with stop().
+ */
+MediaStreamTrack.prototype._endSource = function () {
+  if (this._source) this._source.end();
+  else this._end();
 };
 
 /**
@@ -72,8 +225,9 @@ MediaStreamTrack.prototype.stop = function () {
  *   - constraints                  — copied (current applied)
  *   - settings                     — copied (current effective)
  *   - id                           — newly generated
- * Source-only data (the underlying media source binding, _onStop, the
- * EventEmitter listeners) is NOT copied — the clone has its own pipeline.
+ * The clone is attached to the SAME source: it receives the same frames,
+ * and the source stops only when both are stopped. Listeners are not
+ * copied.
  *
  * This was previously copying only kind/label/settings, which meant
  * disabled/muted state was lost across clone() and contentHint and
@@ -89,15 +243,20 @@ MediaStreamTrack.prototype.clone = function () {
     }
   }
 
+  // An ended track's clone is ended and needs no source of its own
+  // feeding it; it gets a detached, already stopped one.
+  var ended = this.readyState === 'ended';
+  var detached = null;
+  if (ended) { detached = new TrackSource(this.kind); detached.stopped = true; }
   var cloned = new MediaStreamTrack({
     kind: this.kind,
     label: this.label,
     contentHint: this.contentHint,
     settings: settingsCopy,
+    _source: ended ? detached : this._source,
   });
   cloned.enabled = this.enabled;
-  // muted is a "live" state set by the source; for a clone created
-  // mid-stream it should mirror current value.
+  // muted is the source's state.
   cloned.muted = this.muted;
   // readyState: 'ended' source → 'ended' clone (per spec).
   cloned.readyState = this.readyState;
@@ -115,10 +274,62 @@ MediaStreamTrack.prototype.clone = function () {
   return cloned;
 };
 
+// A producer hands the source's next frame / audio buffer to the track it
+// holds; it reaches that track and all its clones. Returns how many.
 MediaStreamTrack.prototype._push = function (data) {
-  if (this.readyState === 'ended' || !this.enabled) return;
+  if (this._source) return this._source.push(data);
+  this._deliver(data);
+  return 1;
+};
+
+MediaStreamTrack.prototype._deliver = function (data) {
+  if (this.readyState === 'ended') {
+    try { if (data && typeof data.close === 'function') data.close(); } catch (e) {}
+    return;
+  }
+  // W3C mediacapture-main: a disabled track renders BLACK frames (video)
+  // or SILENCE (audio) — it does not stop. It dropped the frames instead,
+  // so every consumer simply starved: a WebRTC sender stopped sending (the
+  // peer froze on the last picture, where Chrome shows black), a
+  // MediaStreamTrackProcessor's reader stalled. The replacement keeps the
+  // frame's geometry and timing; the original is released here.
+  if (!this.enabled) {
+    var blank = _blankLike(this.kind, data);
+    if (!blank) return;
+    try { if (data && typeof data.close === 'function') data.close(); } catch (e) {}
+    data = blank;
+  }
   this._ee.emit(this.kind === 'video' ? 'frame' : 'data', data);
 };
+
+// A black I420 VideoFrame (Y 0, U/V 128 — what Chrome renders for a
+// disabled track) or a silent AudioData with the same size and timing as
+// `src`. null when `src` is not something to imitate.
+function _blankLike(kind, src) {
+  if (!src) return null;
+  try {
+    if (kind === 'video') {
+      var w = src.codedWidth, h = src.codedHeight;
+      if (!w || !h) return null;
+      var ySize = w * h, cSize = Math.ceil(w / 2) * Math.ceil(h / 2);
+      var buf = new Uint8Array(ySize + 2 * cSize);
+      buf.fill(128, ySize);
+      var init = { format: 'I420', codedWidth: w, codedHeight: h, timestamp: src.timestamp || 0 };
+      if (typeof src.duration === 'number') init.duration = src.duration;
+      if (src.displayWidth) init.displayWidth = src.displayWidth;
+      if (src.displayHeight) init.displayHeight = src.displayHeight;
+      return new VideoFrame(buf, init);
+    }
+    var fmt = src.format || 's16';
+    var frames = src.numberOfFrames, ch = src.numberOfChannels;
+    if (!frames || !ch) return null;
+    var bps = { u8: 1, s16: 2, s32: 4, f32: 4 }[String(fmt).replace('-planar', '')] || 2;
+    var pcm = new Uint8Array(frames * ch * bps);
+    if (String(fmt).indexOf('u8') === 0) pcm.fill(128);   // u8 silence is the midpoint
+    return new AudioData({ data: pcm, format: fmt, sampleRate: src.sampleRate,
+      numberOfChannels: ch, numberOfFrames: frames, timestamp: src.timestamp || 0 });
+  } catch (e) { return null; }
+}
 
 MediaStreamTrack.prototype.getSettings = function () {
   var s = { kind: this.kind, label: this.label, enabled: this.enabled };
@@ -128,12 +339,19 @@ MediaStreamTrack.prototype.getSettings = function () {
   return s;
 };
 
+// What the source can do — getUserMedia fills _capabilities from the
+// device probe (GStreamer modes). It returned {} regardless.
 MediaStreamTrack.prototype.getCapabilities = function () {
-  return {};  // platform-specific, not applicable for FFmpeg/GStreamer
+  var c = this._capabilities || {}, out = {};
+  for (var k in c) if (Object.prototype.hasOwnProperty.call(c, k)) out[k] = c[k];
+  return out;
 };
 
+// A copy: the caller's edits must not reach the track's constraints.
 MediaStreamTrack.prototype.getConstraints = function () {
-  return this._constraints || {};
+  var c = this._constraints || {}, out = {};
+  for (var k in c) if (Object.prototype.hasOwnProperty.call(c, k)) out[k] = c[k];
+  return out;
 };
 
 /**
@@ -146,14 +364,58 @@ MediaStreamTrack.prototype.applyConstraints = function (constraints) {
   if (this.readyState === 'ended') {
     return Promise.reject(_domex('Track is ended', 'InvalidStateError'));
   }
-  if (!constraints) return Promise.resolve();
-  this._constraints = constraints;
-  // Merge into settings
-  for (var k in constraints) {
-    if (Object.prototype.hasOwnProperty.call(constraints, k)) {
-      this._settings[k] = constraints[k];
+  // W3C: applyConstraints() with no argument removes every constraint.
+  if (!constraints) { this._constraints = {}; return Promise.resolve(); }
+  // W3C (apply constraints algorithm): a REQUIRED constraint — exact,
+  // min, max — that the source cannot satisfy rejects with
+  // OverconstrainedError naming it, and the track keeps its previous
+  // constraints and settings. Every request was accepted and echoed into
+  // getSettings(), so width:{exact:3840} on a source that only does
+  // 1280x720 reported 3840. Checked against getCapabilities(); a
+  // property with no known capability is not constrained here.
+  var caps = this._capabilities || {};
+  for (var ck in constraints) {
+    if (!Object.prototype.hasOwnProperty.call(constraints, ck) || ck === 'advanced') continue;
+    var c = constraints[ck], cap = caps[ck];
+    if (!c || typeof c !== 'object' || Array.isArray(c) || cap === undefined) continue;
+    if (cap && typeof cap === 'object' && !Array.isArray(cap) &&
+        (typeof cap.min === 'number' || typeof cap.max === 'number')) {
+      var lo = typeof cap.min === 'number' ? cap.min : -Infinity;
+      var hi = typeof cap.max === 'number' ? cap.max : Infinity;
+      if ((typeof c.exact === 'number' && (c.exact < lo || c.exact > hi)) ||
+          (typeof c.min === 'number' && c.min > hi) ||
+          (typeof c.max === 'number' && c.max < lo) ||
+          (typeof c.min === 'number' && typeof c.max === 'number' && c.min > c.max)) {
+        return Promise.reject(overconstrainedError(ck));
+      }
+    } else if (c.exact !== undefined) {
+      var allowed = Array.isArray(cap) ? cap : [cap];
+      var want = Array.isArray(c.exact) ? c.exact : [c.exact];
+      if (!want.some(function (w) { return allowed.indexOf(w) >= 0; })) {
+        return Promise.reject(overconstrainedError(ck));
+      }
     }
   }
+  // Settings are VALUES. The constraint objects were merged in as they
+  // were, so after applyConstraints({width: {ideal: 1280}}) getSettings()
+  // .width was {ideal: 1280} — any consumer reading width/height as a
+  // number broke. Each is resolved to the value it asks for.
+  var copy = {};
+  for (var k in constraints) {
+    if (!Object.prototype.hasOwnProperty.call(constraints, k)) continue;
+    copy[k] = constraints[k];
+    if (k === 'advanced') continue;
+    var v = resolveConstraint(constraints[k]);
+    // An ideal / bare value is the closest the source can do (fitness
+    // distance): clamped into its capability range, not echoed beyond it.
+    var kc = caps[k];
+    if (typeof v === 'number' && kc && typeof kc === 'object' && !Array.isArray(kc)) {
+      if (typeof kc.max === 'number' && v > kc.max) v = kc.max;
+      if (typeof kc.min === 'number' && v < kc.min) v = kc.min;
+    }
+    if (v !== undefined) this._settings[k] = v;
+  }
+  this._constraints = copy;
   return Promise.resolve();
 };
 
@@ -228,9 +490,16 @@ Object.defineProperty(MediaStreamTrack.prototype, 'onunmute', {
  * Sets muted state and fires mute/unmute events.
  */
 MediaStreamTrack.prototype._setMuted = function (muted) {
+  // muted is the source's state: it changes on every track of it.
+  if (this._source) { this._source.setMuted(muted); return; }
+  this._applyMuted(muted);
+};
+
+MediaStreamTrack.prototype._applyMuted = function (muted) {
   if (this.muted === muted) return;
   this.muted = muted;
-  this._ee.emit(muted ? 'mute' : 'unmute');
+  // An Event, like 'ended' — a handler reading e.type got undefined.
+  this._ee.emit(muted ? 'mute' : 'unmute', _event(muted ? 'mute' : 'unmute', this));
 };
 
 // _domex now imported from dom_exception.js (top of file).
@@ -298,8 +567,19 @@ function MediaStream(arg) {
   // not only one built up through addTrack().
   Object.defineProperty(this, '_trackWatchers', {
     value: [], writable: true, enumerable: false, configurable: true });
+  // A track appears once in a stream's track set (W3C: a set) —
+  // new MediaStream([t, t]) kept both.
+  var _seen = {};
+  this._tracks = this._tracks.filter(function (t) {
+    if (!t || _seen[t.id]) return false;
+    _seen[t.id] = true;
+    return true;
+  });
+  // active = some track not ended. It was "has tracks", so a stream of
+  // ended tracks started out 'active' and addTrack(live) fired nothing.
   Object.defineProperty(this, '_lastActive', {
-    value: this._tracks.length > 0, writable: true, enumerable: false, configurable: true });
+    value: this._tracks.some(function (t) { return t.readyState !== 'ended'; }),
+    writable: true, enumerable: false, configurable: true });
   for (var w = 0; w < this._tracks.length; w++) this._watchTrack(this._tracks[w]);
 }
 
@@ -459,7 +739,9 @@ MediaStream.prototype._watchTrack = function (track) {
   var self = this;
   var fn = function () { self._syncActive(); };
   this._trackWatchers.push({ track: track, fn: fn });
-  track.on('ended', fn);
+  // '_stopped', not 'ended': a stop() ends the track too (and fires no
+  // 'ended'), and the stream's active state follows its tracks.
+  track.on('_stopped', fn);
 };
 
 MediaStream.prototype._unwatchTrack = function (track) {
@@ -467,7 +749,7 @@ MediaStream.prototype._unwatchTrack = function (track) {
   for (var i = 0; i < this._trackWatchers.length; i++) {
     if (this._trackWatchers[i].track === track) {
       if (typeof track.off === 'function') {
-        track.off('ended', this._trackWatchers[i].fn);
+        track.off('_stopped', this._trackWatchers[i].fn);
       }
       this._trackWatchers.splice(i, 1);
       return;

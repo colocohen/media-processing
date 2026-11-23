@@ -119,141 +119,118 @@ function _pacForRow(row, channel) {
   return [_withParity(b1), _withParity(entry[1])];
 }
 
-// CEA-608 Extended Character Set (CEA-608-E Annex F).
+// ── Character mapping (CEA-608-E §6.4 / Annex F; FFmpeg ccaption_dec) ──
 //
-// Non-ASCII characters require 2-byte escape sequences. Each extended
-// char is encoded as THREE bytes total:
-//   1. A fallback ASCII byte — the visually-closest non-extended char,
-//      shown by decoders that don't understand the extended codes
-//   2. Extended escape byte 1 (0x11/0x12/0x13 for the 3 char tables;
-//      0x19/0x1A/0x1B for channel 2)
-//   3. Extended escape byte 2 (0x20..0x3F)
+// Three kinds of character on the wire:
 //
-// When a player receives the escape sequence, it BACKSPACES over the
-// fallback char and renders the extended one in its place. Older
-// players that ignore the escape simply show the fallback.
+//   1. BASIC (one byte, 0x20..0x7F). Mostly ASCII, but NOT entirely:
+//      ten code points are accented letters / symbols instead —
+//        0x2A á   0x5C é   0x5E í   0x5F ó   0x60 ú
+//        0x7B ç   0x7C ÷   0x7D Ñ   0x7E ñ   0x7F █
+//      (and 0x27 is the apostrophe, which decoders draw as ’).
+//      The old encoder sent every ASCII byte as is, so '*' showed as
+//      "á" ("5*3" → "5á3"), and é á í ó ú ñ Ñ ç — the most common
+//      accented letters in Spanish — had no entry at all and became '?'.
 //
-// Tables here cover the Latin sets most useful for HLS captions:
-// Spanish, French, Portuguese, German. Cyrillic, Greek, etc. are
-// not included — they're rare in CEA-608 streams (those usually use
-// CEA-708 or out-of-band subtitles).
+//   2. SPECIAL (two bytes 0x11 0x30..0x3F; CC2: 0x19): ® ° ½ ¿ ™ ¢ £ ♪
+//      à (transparent space) è â ê î ô û. These do NOT backspace — the
+//      decoder just writes them at the cursor — so they take no fallback
+//      byte. The old encoder sent one anyway: "x®" → "xR®".
 //
-// The map keys are character codepoints (charCodeAt result). Values
-// are 3-byte arrays [fallback, ext1, ext2] (BEFORE parity is added).
+//   3. EXTENDED (two bytes 0x12/0x13 0x20..0x3F; CC2: 0x1A/0x1B). The
+//      decoder BACKSPACES one column and draws the char over it, so the
+//      escape is preceded by a basic "fallback" char that older decoders
+//      leave on screen. The escape must be a whole byte PAIR: the old
+//      encoder packed [fallback, esc1, esc2] into the text stream two
+//      bytes at a time, so "Ü" went out as [U, 0x12] [0x24, NUL] — the
+//      escape split across pairs and the decoder showed "U$".
 //
-// Special characters (0x11 table — channel 1):
-var _EXTENDED_CHARS = {
-  // Special punctuation / symbols (0x11 0x30..0x3F)
-  0x00AE: [0x52, 0x11, 0x30],   // ® (R)
-  0x00B0: [0x6F, 0x11, 0x31],   // ° (o)
-  0x00BD: [0x32, 0x11, 0x32],   // ½ (2)
-  0x00BF: [0x3F, 0x11, 0x33],   // ¿ (?)
-  0x2122: [0x54, 0x11, 0x34],   // ™ (T)
-  0x00A2: [0x63, 0x11, 0x35],   // ¢ (c)
-  0x00A3: [0x4C, 0x11, 0x36],   // £ (L)
-  0x266A: [0x4E, 0x11, 0x37],   // ♪ (N)
-  0x00E0: [0x61, 0x11, 0x38],   // à (a)
-  0x00E8: [0x65, 0x11, 0x3A],   // è (e)
-  0x00E2: [0x61, 0x11, 0x3B],   // â (a)
-  0x00EA: [0x65, 0x11, 0x3C],   // ê (e)
-  0x00EE: [0x69, 0x11, 0x3D],   // î (i)
-  0x00F4: [0x6F, 0x11, 0x3E],   // ô (o)
-  0x00FB: [0x75, 0x11, 0x3F],   // û (u)
+// Each value: [table, code, fallback] — table 0 = basic (code is the
+// byte), 0x11 special, 0x12 / 0x13 extended (fallback = basic byte).
+// Tables 0x12 0x26/0x29 follow CEA-608 (‘ and ’); FFmpeg's ccaption_dec
+// decodes 0x26 as ´ and 0x29 as ‘ — a known difference in its table.
+var _CHARMAP = {};
+(function () {
+  function basic(cp, byte) { _CHARMAP[cp] = [0, byte, 0]; }
+  function special(cp, code) { _CHARMAP[cp] = [0x11, code, 0]; }
+  function ext(table, cp, code, fallback) { _CHARMAP[cp] = [table, code, fallback.charCodeAt(0)]; }
 
-  // Spanish / French extended (0x12 table)
-  0x00C1: [0x41, 0x12, 0x20],   // Á (A)
-  0x00C9: [0x45, 0x12, 0x21],   // É (E)
-  0x00D3: [0x4F, 0x12, 0x22],   // Ó (O)
-  0x00DA: [0x55, 0x12, 0x23],   // Ú (U)
-  0x00DC: [0x55, 0x12, 0x24],   // Ü (U)
-  0x00FC: [0x75, 0x12, 0x25],   // ü (u)
-  0x2018: [0x27, 0x12, 0x29],   // ' (')
-  0x00A1: [0x21, 0x12, 0x27],   // ¡ (!)
-  0x00A9: [0x43, 0x12, 0x2B],   // © (C)
-  0x2022: [0x2A, 0x12, 0x2D],   // • (*)
-  0x201C: [0x22, 0x12, 0x2E],   // " (")
-  0x201D: [0x22, 0x12, 0x2F],   // " (")
-  0x00C0: [0x41, 0x12, 0x30],   // À (A)
-  0x00C2: [0x41, 0x12, 0x31],   // Â (A)
-  0x00C7: [0x43, 0x12, 0x32],   // Ç (C)
-  0x00C8: [0x45, 0x12, 0x33],   // È (E)
-  0x00CA: [0x45, 0x12, 0x34],   // Ê (E)
-  0x00CB: [0x45, 0x12, 0x35],   // Ë (E)
-  0x00EB: [0x65, 0x12, 0x36],   // ë (e)
-  0x00CE: [0x49, 0x12, 0x37],   // Î (I)
-  0x00CF: [0x49, 0x12, 0x38],   // Ï (I)
-  0x00EF: [0x69, 0x12, 0x39],   // ï (i)
-  0x00D4: [0x4F, 0x12, 0x3A],   // Ô (O)
-  0x00D9: [0x55, 0x12, 0x3B],   // Ù (U)
-  0x00F9: [0x75, 0x12, 0x3C],   // ù (u)
-  0x00DB: [0x55, 0x12, 0x3D],   // Û (U)
-  0x00AB: [0x22, 0x12, 0x3E],   // « (")
-  0x00BB: [0x22, 0x12, 0x3F],   // » (")
+  var c;
+  for (c = 0x20; c <= 0x7E; c++) basic(c, c);
+  // ASCII the basic set does NOT have: those bytes mean something else.
+  delete _CHARMAP[0x2A]; delete _CHARMAP[0x5C]; delete _CHARMAP[0x5E];
+  delete _CHARMAP[0x5F]; delete _CHARMAP[0x60]; delete _CHARMAP[0x7B];
+  delete _CHARMAP[0x7C]; delete _CHARMAP[0x7D]; delete _CHARMAP[0x7E];
 
-  // Portuguese / German extended (0x13 table)
-  0x00C3: [0x41, 0x13, 0x20],   // Ã (A)
-  0x00E3: [0x61, 0x13, 0x21],   // ã (a)
-  0x00CD: [0x49, 0x13, 0x22],   // Í (I)
-  0x00CC: [0x49, 0x13, 0x23],   // Ì (I)
-  0x00EC: [0x69, 0x13, 0x24],   // ì (i)
-  0x00D2: [0x4F, 0x13, 0x25],   // Ò (O)
-  0x00F2: [0x6F, 0x13, 0x26],   // ò (o)
-  0x00D5: [0x4F, 0x13, 0x27],   // Õ (O)
-  0x00F5: [0x6F, 0x13, 0x28],   // õ (o)
-  0x007B: [0x28, 0x13, 0x29],   // { (()
-  0x007D: [0x29, 0x13, 0x2A],   // } ())
-  0x005C: [0x2F, 0x13, 0x2B],   // \ (/)
-  0x005E: [0x2D, 0x13, 0x2C],   // ^ (-)
-  0x005F: [0x2D, 0x13, 0x2D],   // _ (-)
-  0x007C: [0x21, 0x13, 0x2E],   // | (!)
-  0x007E: [0x2D, 0x13, 0x2F],   // ~ (-)
-  0x00C4: [0x41, 0x13, 0x30],   // Ä (A)
-  0x00E4: [0x61, 0x13, 0x31],   // ä (a)
-  0x00D6: [0x4F, 0x13, 0x32],   // Ö (O)
-  0x00F6: [0x6F, 0x13, 0x33],   // ö (o)
-  0x00DF: [0x73, 0x13, 0x34],   // ß (s)
-  0x00A5: [0x59, 0x13, 0x35],   // ¥ (Y)
-  0x00A4: [0x6F, 0x13, 0x36],   // ¤ (o)
-  0x00C5: [0x41, 0x13, 0x38],   // Å (A)
-  0x00E5: [0x61, 0x13, 0x39],   // å (a)
-  0x00D8: [0x4F, 0x13, 0x3A],   // Ø (O)
-  0x00F8: [0x6F, 0x13, 0x3B],   // ø (o)
-};
+  basic(0x00E1, 0x2A); basic(0x00E9, 0x5C); basic(0x00ED, 0x5E);   // á é í
+  basic(0x00F3, 0x5F); basic(0x00FA, 0x60); basic(0x00E7, 0x7B);   // ó ú ç
+  basic(0x00F7, 0x7C); basic(0x00D1, 0x7D); basic(0x00F1, 0x7E);   // ÷ Ñ ñ
+  basic(0x2588, 0x7F);                                             // █
+  basic(0x2019, 0x27);                                             // ’ (0x27 draws as ’)
+  basic(0x0060, 0x27);                                             // ` → ' (no grave accent in 608)
+  basic(0x2013, 0x2D);                                             // – → -
+
+  // Special characters, 0x11 0x30..0x3F.
+  special(0x00AE, 0x30); special(0x00B0, 0x31); special(0x00BD, 0x32); special(0x00BF, 0x33);
+  special(0x2122, 0x34); special(0x00A2, 0x35); special(0x00A3, 0x36); special(0x266A, 0x37);
+  special(0x00E0, 0x38); special(0x00A0, 0x39); special(0x00E8, 0x3A); special(0x00E2, 0x3B);
+  special(0x00EA, 0x3C); special(0x00EE, 0x3D); special(0x00F4, 0x3E); special(0x00FB, 0x3F);
+
+  // Extended Spanish / French / misc, 0x12 0x20..0x3F.
+  var e12 = [
+    [0x00C1, 'A'], [0x00C9, 'E'], [0x00D3, 'O'], [0x00DA, 'U'], [0x00DC, 'U'], [0x00FC, 'u'],
+    [0x2018, "'"], [0x00A1, '!'], [0x002A, ' '], [0x2019, "'"], [0x2014, '-'], [0x00A9, 'c'],
+    [0x2120, ' '], [0x2022, '.'], [0x201C, '"'], [0x201D, '"'],
+    [0x00C0, 'A'], [0x00C2, 'A'], [0x00C7, 'C'], [0x00C8, 'E'], [0x00CA, 'E'], [0x00CB, 'E'],
+    [0x00EB, 'e'], [0x00CE, 'I'], [0x00CF, 'I'], [0x00EF, 'i'], [0x00D4, 'O'], [0x00D9, 'U'],
+    [0x00F9, 'u'], [0x00DB, 'U'], [0x00AB, '"'], [0x00BB, '"'],
+  ];
+  // Extended Portuguese / German / Danish, 0x13 0x20..0x3F. Also holds
+  // the ASCII { } \ ^ _ | ~ that the basic set gave away (fallbacks are
+  // the closest basic glyph for decoders without the extended sets).
+  var e13 = [
+    [0x00C3, 'A'], [0x00E3, 'a'], [0x00CD, 'I'], [0x00CC, 'I'], [0x00EC, 'i'], [0x00D2, 'O'],
+    [0x00F2, 'o'], [0x00D5, 'O'], [0x00F5, 'o'], [0x007B, '('], [0x007D, ')'], [0x005C, '/'],
+    [0x005E, "'"], [0x005F, '-'], [0x007C, '!'], [0x007E, '-'],
+    [0x00C4, 'A'], [0x00E4, 'a'], [0x00D6, 'O'], [0x00F6, 'o'], [0x00DF, 's'], [0x00A5, 'Y'],
+    [0x00A4, 'c'], [0x00A6, '!'], [0x00C5, 'A'], [0x00E5, 'a'], [0x00D8, 'O'], [0x00F8, 'o'],
+    [0x250C, '+'], [0x2510, '+'], [0x2514, '+'], [0x2518, '+'],
+  ];
+  for (c = 0; c < 32; c++) {
+    // ’ stays basic 0x27 (one byte, no backspace) — skip its 0x12 entry.
+    if (e12[c][0] !== 0x2019) ext(0x12, e12[c][0], 0x20 + c, e12[c][1]);
+    ext(0x13, e13[c][0], 0x20 + c, e13[c][1]);
+  }
+})();
 
 /**
- * Encode a single character into one or more CEA-608 bytes (with
- * parity). Returns an array of bytes:
- *   - 1 byte for printable ASCII not in the extended remap table
- *   - 3 bytes for extended chars (fallback ASCII + 2-byte escape)
- *   - 1 byte (0x3F = '?') as the safe fallback for unmapped chars
+ * Map one character (a full code point) to its CEA-608 form:
+ *   { basic: byte }                       — one byte in the text stream
+ *   { code: [b1, b2] }                    — special char: own pair
+ *   { fallback: byte, code: [b1, b2] }    — extended: basic fallback
+ *                                           byte, then its own pair
+ * all with parity, b1 already shifted to the channel. A character with
+ * no 608 form is tried without its accents (NFD: ő → o), else '?'.
  *
- * The 3-byte extended sequence works because CEA-608 decoders that
- * understand the escape codes will BACKSPACE over the fallback and
- * render the extended char in its place. Older decoders simply
- * display the fallback. Either way the caption is readable.
- *
- * Ref: CEA-608-E Annex F, Tables F.1, F.2, F.3.
+ * Ref: CEA-608-E §6.4.1, Annex F; FFmpeg libavcodec/ccaption_dec.c.
  */
 function _encodeChar(ch, channel) {
-  var code = ch.charCodeAt(0);
-  // Extended Latin lookup first — covers both extended chars (à, Ç,
-  // etc.) AND certain ASCII codepoints we remap (curly braces, etc.).
-  var ext = _EXTENDED_CHARS[code];
-  if (ext) {
-    // The escape byte is channel-scoped: 0x11/0x12/0x13 for channel 1,
-    // 0x19/0x1A/0x1B for channel 2 — as the table's own header note
-    // says. The table stores the channel-1 form; shift it for channel 2.
-    // Without this, an accented character inside a CC2 caption emitted a
-    // channel-1 escape and dragged the rest of the line onto CC1.
-    var esc = (channel === 2) ? (ext[1] + 0x08) : ext[1];
-    return [_withParity(ext[0]), _withParity(esc), _withParity(ext[2])];
+  var m = _CHARMAP[ch.codePointAt(0)];
+  if (!m) {
+    // Combining marks as \u escapes, not the literal characters: the
+    // browser bundle kept them as raw UTF-8 inside this regex, and a
+    // page without <meta charset="utf-8"> reads the script as
+    // windows-1252 — "Range out of order in character class", and the
+    // whole library failed to load.
+    var base = ch.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+    m = (base.length === 1 && _CHARMAP[base.charCodeAt(0)]) || _CHARMAP[0x3F];
   }
-  // Plain printable ASCII.
-  if (code >= 0x20 && code <= 0x7E) {
-    return [_withParity(code)];
-  }
-  // Out-of-range / unmapped: replace with '?'.
-  return [_withParity(0x3F)];
+  if (m[0] === 0) return { basic: _withParity(m[1]) };
+  // The table byte is channel-scoped: 0x11/0x12/0x13 on CC1,
+  // 0x19/0x1A/0x1B on CC2 (an unshifted code drags the line onto CC1).
+  var code = [_withParity(channel === 2 ? m[0] + 0x08 : m[0]), _withParity(m[1])];
+  if (m[0] === 0x11) return { code: code };
+  return { fallback: _withParity(m[2]), code: code };
 }
 
 // Pre-compute parity-encoded control bytes. These are referenced
@@ -265,38 +242,41 @@ var _RCL_P      = _withParity(RCL);
 var _ENM_P      = _withParity(ENM);
 var _EOC_P      = _withParity(EOC);
 var _EDM_P      = _withParity(EDM);
-var _NUL_P      = _withParity(0x00);     // padding byte for odd-length text
+var _NUL_P      = _withParity(0x00);     // pads an odd basic byte to a full pair
 
 /**
- * Pad a byte sequence to even length with a parity-encoded NUL.
- * CEA-608 byte pairs are always 2 bytes, so an odd-count text run
- * needs trailing padding.
- */
-function _padToEven(bytes) {
-  if (bytes.length & 1) bytes.push(_NUL_P);
-}
-
-/**
- * Decompose a caption cue into a queue of byte-pairs ([byte1, byte2])
- * that the encoder will emit one pair per video frame. Order:
+ * Decompose a caption cue into "units" — each unit is the list of byte
+ * pairs ([byte1, byte2]) that must go out back to back. Order:
  *
  *   1. RCL  — switch to pop-on mode
  *   2. ENM  — clear non-displayed buffer
  *   3. PAC  — position cursor at row N (multi-row captions stack up)
- *   4. text bytes (1 or 3 bytes per char, 2 per pair)
+ *   4. text — basic bytes two per pair; special / extended chars as
+ *             their own pair (an odd basic byte before one is padded
+ *             with NUL, so the 2-byte code never straddles pairs)
  *   5. EOC  — flip memories: caption becomes visible
  *
  * For the cue's end time:
  *   1. EDM — erase displayed memory (caption disappears)
  *
- * Returns { startPairs, endPairs } — arrays of [byte1, byte2] pairs.
+ * Every control code, PAC and special/extended char is sent TWICE in
+ * consecutive pairs (CEA-608-E §8 / 47 CFR 15.119 practice): decoders
+ * drop the immediate repeat, and a pair lost to a transmission error is
+ * covered by its copy. Doubling also makes two identical consecutive
+ * specials ("♪♪") decodable on spec decoders: [♪][♪][♪][♪] = two ♪,
+ * where [♪][♪] is one ♪ plus its ignored repeat. (FFmpeg's
+ * ccaption_dec drops every consecutive repeat, so it shows one ♪
+ * either way.)
+ *
+ * Returns { startUnits, endUnits }.
  */
 function _buildCuePairs(text, channel) {
   var ctrlP = channel === 2 ? _CTRL_CH2_P : _CTRL_P;
+  function twice(pair) { return [pair, pair.slice()]; }
 
-  var startPairs = [];
-  startPairs.push([ctrlP, _RCL_P]);     // Resume Caption Loading
-  startPairs.push([ctrlP, _ENM_P]);     // Erase Non-displayed Memory
+  var startUnits = [];
+  startUnits.push(twice([ctrlP, _RCL_P]));     // Resume Caption Loading
+  startUnits.push(twice([ctrlP, _ENM_P]));     // Erase Non-displayed Memory
 
   // Wrap text to lines of 32 chars max, up to 4 rows.
   var lines = _wrapText(text, 32, 4);
@@ -306,31 +286,31 @@ function _buildCuePairs(text, channel) {
   if (startRow < 1) startRow = 1;
 
   for (var li = 0; li < lines.length; li++) {
-    startPairs.push(_pacForRow(startRow + li, channel));
+    startUnits.push(twice(_pacForRow(startRow + li, channel)));
 
-    // Encode line characters. _encodeChar may return 1 byte (ASCII)
-    // or 3 bytes (extended Latin: ASCII fallback + 2-byte escape).
-    // Push them all into one flat array, then chunk into 2-byte pairs.
-    var bytes = [];
-    var line = lines[li];
-    for (var ci = 0; ci < line.length; ci++) {
-      var encoded = _encodeChar(line.charAt(ci), channel);
-      for (var ei = 0; ei < encoded.length; ei++) {
-        bytes.push(encoded[ei]);
+    var pending = null;                        // odd basic byte waiting for a partner
+    var chars = Array.from(lines[li]);         // code points, not UTF-16 halves
+    for (var ci = 0; ci < chars.length; ci++) {
+      var enc = _encodeChar(chars[ci], channel);
+      var b = enc.code ? enc.fallback : enc.basic;
+      if (b !== undefined) {
+        if (pending === null) pending = b;
+        else { startUnits.push([[pending, b]]); pending = null; }
+      }
+      if (enc.code) {
+        if (pending !== null) { startUnits.push([[pending, _NUL_P]]); pending = null; }
+        startUnits.push(twice(enc.code));
       }
     }
-    _padToEven(bytes);
-    for (var bi = 0; bi < bytes.length; bi += 2) {
-      startPairs.push([bytes[bi], bytes[bi + 1]]);
-    }
+    if (pending !== null) startUnits.push([[pending, _NUL_P]]);
   }
-  startPairs.push([ctrlP, _EOC_P]);    // End Of Caption (display)
+  startUnits.push(twice([ctrlP, _EOC_P]));     // End Of Caption (display)
 
-  var endPairs = [
-    [ctrlP, _EDM_P],                   // Erase Displayed Memory
+  var endUnits = [
+    twice([ctrlP, _EDM_P]),                    // Erase Displayed Memory
   ];
 
-  return { startPairs: startPairs, endPairs: endPairs };
+  return { startUnits: startUnits, endUnits: endUnits };
 }
 
 /**
@@ -401,17 +381,39 @@ function CEA608Encoder(opts) {
     throw new TypeError('CEA608Encoder: channel must be 1 or 2');
   }
 
-  // Schedule of byte pairs to emit, sorted by ptsUs. Each entry is
-  // { ptsUs, pair: [byte1, byte2] }. Drained on demand by getCcData-
-  // ForFrame, which pops every entry whose ptsUs falls in the
-  // requested frame window.
+  // Cues not yet fully sent: { id, startUs, endUs, startUnits, endUnits,
+  // sent: Set of unit keys already emitted }. The pair schedule is
+  // derived from ALL of them together (see _rebuild) — it used to be
+  // built cue by cue, which is what let two cues' load sequences
+  // interleave.
+  this._cues = [];
+  this._nextId = 0;
+  // Pending pairs in emission order: { ptsUs, pair, cue, key, last }.
+  // null = cues changed, rebuild before the next drain.
   this._scheduled = [];
+  this._dirty = false;
+  this._nowUs = -Infinity;     // start of the last frame drained
 }
 
 /**
- * Schedule a caption cue. Decomposes into byte pairs and queues them
- * relative to the cue's start and end times. Caller can add cues out
- * of order; the encoder sorts internally by ptsUs.
+ * Schedule a caption cue. Cues may be added in any order (and while
+ * frames are being drained); the schedule is rebuilt from all pending
+ * cues on the next getCcDataForFrame().
+ *
+ * Pop-on captions show one caption at a time, so cues are serialized:
+ *   - A cue's load sequence (RCL … EOC) is paced so that EOC lands at
+ *     cue.start, but never starts before the previous cue's EOC has
+ *     gone out — the later cue is delayed instead. Before, two cues
+ *     whose load sequences overlapped (start 2.0 s and 2.3 s) had their
+ *     pairs merged by time, writing both texts into the same hidden
+ *     buffer: FFmpeg showed "deEclthoa f" then "oxtrot golf hotel".
+ *   - A cue's EDM (at cue.end) is dropped when the next cue is shown
+ *     at or before that time: EOC already replaces it, and an EDM after
+ *     that EOC would erase the NEW caption. Before, with back-to-back
+ *     cues (end of one == start of the next) the order of the two pairs
+ *     at the same pts depended on which cue was added first; added in
+ *     reverse order, EOC went first and the EDM blanked the next cue
+ *     (FFmpeg: one 0-length cue "First cueSecond cue" at 4.000).
  *
  * @param {object} cue
  * @param {number} cue.start      Start time in seconds (>= 0).
@@ -430,39 +432,78 @@ CEA608Encoder.prototype.addCue = function (cue) {
     throw new RangeError('CEA608Encoder.addCue: cue.end must be > cue.start');
   }
 
-  var pairs = _buildCuePairs(cue.text, this._channel);
-
-  // Schedule the START sequence so the LAST pair (EOC — the one that
-  // flips the caption to visible) lands at cue.start. Each pair is
-  // separated by _FRAME_GAP_US (NTSC pacing). If cue.start is so
-  // close to t=0 that the start sequence can't be paced before then,
-  // we clamp the first pair to t=0 and let the front pairs queue up
-  // — the caption will appear a frame or two late, which is
-  // imperceptible.
-  var nPairs = pairs.startPairs.length;
-  var firstStartUs = Math.round(cue.start * 1_000_000) -
-                     (nPairs - 1) * _FRAME_GAP_US;
-  if (firstStartUs < 0) firstStartUs = 0;
-
-  for (var i = 0; i < pairs.startPairs.length; i++) {
-    this._scheduled.push({
-      ptsUs: firstStartUs + i * _FRAME_GAP_US,
-      pair:  pairs.startPairs[i],
-    });
-  }
-  // End pair (EDM) at cue.end
-  for (var j = 0; j < pairs.endPairs.length; j++) {
-    this._scheduled.push({
-      ptsUs: Math.round(cue.end * 1_000_000) + j * _FRAME_GAP_US,
-      pair:  pairs.endPairs[j],
-    });
-  }
-
-  // Keep schedule sorted for efficient drain.
-  this._scheduled.sort(_compareByPts);
+  var units = _buildCuePairs(cue.text, this._channel);
+  this._cues.push({
+    id: this._nextId++,
+    startUs: Math.round(cue.start * 1_000_000),
+    endUs: Math.round(cue.end * 1_000_000),
+    startUnits: units.startUnits,
+    endUnits: units.endUnits,
+    sent: new Set(),
+  });
+  this._dirty = true;
 };
 
-function _compareByPts(a, b) { return a.ptsUs - b.ptsUs; }
+/**
+ * Recompute the pair schedule from the pending cues.
+ *
+ * Cues whose load sequence has already begun keep their place (their
+ * remaining pairs must not be split by another cue's); the rest follow
+ * in start order. A cue that has not started and whose end is already
+ * past is dropped — it can no longer be shown.
+ */
+CEA608Encoder.prototype._rebuild = function () {
+  var self = this;
+  var started = [], waiting = [];
+  this._cues.forEach(function (c) {
+    if (c.sent.size > 0) started.push(c);
+    else if (c.endUs > self._nowUs) waiting.push(c);
+  });
+  var byStart = function (a, b) { return (a.startUs - b.startUs) || (a.id - b.id); };
+  started.sort(byStart);
+  waiting.sort(byStart);
+  var order = started.concat(waiting);
+  this._cues = order;
+
+  // Pass 1: when each cue's EOC goes out.
+  var loadFreeUs = -Infinity;
+  var firstUs = [];
+  for (var i = 0; i < order.length; i++) {
+    var n = order[i].startUnits.length;
+    var first = order[i].startUs - (n - 1) * _FRAME_GAP_US;
+    if (first < 0) first = 0;
+    if (first < loadFreeUs) first = loadFreeUs;
+    firstUs.push(first);
+    order[i].eocUs = first + (n - 1) * _FRAME_GAP_US;
+    loadFreeUs = order[i].eocUs + _FRAME_GAP_US;
+  }
+
+  // Pass 2: the pairs. seq keeps units of one cue in order and both
+  // copies of a doubled code adjacent; at equal pts an EDM sorts first.
+  var entries = [];
+  var seq = 0;
+  function add(cue, units, kind, t0, prio) {
+    for (var u = 0; u < units.length; u++) {
+      var key = kind + u;
+      if (cue.sent.has(key)) continue;
+      for (var p = 0; p < units[u].length; p++) {
+        entries.push({ ptsUs: t0 + u * _FRAME_GAP_US, prio: prio, seq: seq++,
+          pair: units[u][p], cue: cue, key: key, last: p === units[u].length - 1 });
+      }
+    }
+  }
+  for (var j = 0; j < order.length; j++) {
+    var c = order[j];
+    add(c, c.startUnits, 's', firstUs[j], 1);
+    var next = order[j + 1];
+    // EOC of the next cue replaces this one at/before its end: no EDM.
+    c.needsEdm = !(next && next.eocUs <= c.endUs);
+    if (c.needsEdm) add(c, c.endUnits, 'e', Math.max(c.endUs, c.eocUs + _FRAME_GAP_US), 0);
+  }
+  entries.sort(function (a, b) { return (a.ptsUs - b.ptsUs) || (a.prio - b.prio) || (a.seq - b.seq); });
+  this._scheduled = entries;
+  this._dirty = false;
+};
 
 /**
  * Pull cc_data triples that should be emitted at the given frame PTS.
@@ -481,6 +522,8 @@ function _compareByPts(a, b) { return a.ptsUs - b.ptsUs; }
  * @param {number} frameEndUs     Exclusive upper bound (= start of next frame)
  */
 CEA608Encoder.prototype.getCcDataForFrame = function (frameStartUs, frameEndUs) {
+  if (this._dirty) this._rebuild();
+  if (frameStartUs > this._nowUs) this._nowUs = frameStartUs;
   var triples = [];
 
   // Take any scheduled pairs whose ptsUs falls into this frame.
@@ -494,9 +537,21 @@ CEA608Encoder.prototype.getCcDataForFrame = function (frameStartUs, frameEndUs) 
       b1: entry.pair[0],
       b2: entry.pair[1],
     });
+    if (entry.last) this._markSent(entry.cue, entry.key);
   }
 
   return triples;
+};
+
+// Record a fully emitted unit; forget a cue once nothing of it is left.
+CEA608Encoder.prototype._markSent = function (cue, key) {
+  cue.sent.add(key);
+  var done = cue.sent.size >= cue.startUnits.length &&
+    (!cue.needsEdm || cue.sent.size >= cue.startUnits.length + cue.endUnits.length);
+  if (done) {
+    var i = this._cues.indexOf(cue);
+    if (i !== -1) this._cues.splice(i, 1);
+  }
 };
 
 /**

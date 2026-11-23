@@ -10,23 +10,28 @@
  */
 
 /**
- * Escape backslashes and double-quotes for the quoted-string subset of
- * HLS attribute values. Per RFC 8216 §4.2 quoted-string is "any number
- * of characters except double-quote and CR/LF" — the spec is silent on
- * escaping. Real-world parsers (hls.js, AVPlayer, FFmpeg) accept
- * backslash-escaped quotes, so we use that convention.
+ * Check a value for use as an HLS quoted-string and return it as a
+ * string, ready to put between double quotes.
  *
- * URIs and most strings won't need escaping in practice; this exists
- * for pathological filenames and human-supplied display names.
+ * RFC 8216 §4.2: a quoted-string is any characters except double-quote
+ * and CR/LF, and there is NO escape mechanism. This used to emit `\"`
+ * and `\\` escapes, which is not HLS syntax: NAME="Director \"cut\", EN"
+ * was read back (by our own parser too) as NAME="Director \" — the value
+ * ends at the first '"'. It also replaced CR/LF with spaces, silently
+ * changing the value. A value that cannot be represented is now rejected.
  *
- * @param {string} s  arbitrary string
- * @returns {string}  safe to embed between double quotes
+ * @param {string} s  the attribute value
+ * @returns {string}  the same value, as a string
+ * @throws {TypeError} if it contains '"', CR or LF
  */
 export function escapeQuoted(s) {
-  // Strip CR/LF first — these break parsers since the line ends there.
-  s = String(s).replace(/[\r\n]/g, ' ');
-  // Then escape backslash and double-quote.
-  return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  s = String(s);
+  if (/["\r\n]/.test(s)) {
+    throw new TypeError('HLS quoted-string value ' + JSON.stringify(s) +
+      ' contains a double quote or CR/LF, which RFC 8216 §4.2 does not allow ' +
+      '(the format has no escape syntax)');
+  }
+  return s;
 }
 
 /**

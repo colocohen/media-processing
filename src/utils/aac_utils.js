@@ -64,7 +64,12 @@ export function parseAdtsHeader(buf) {
     channels:         channels,
     frameLength:      frameLength,
     protectionAbsent: protectionAbsent,
-    samplesPerFrame:  1024,
+    // number_of_raw_data_blocks_in_frame (low 2 bits of byte 6): the
+    // frame holds n+1 raw_data_blocks of 1024 samples each (ISO/IEC
+    // 14496-3 §1.A.2.2.1). This was a constant 1024, so a stream packing
+    // two blocks per frame ran at half speed: ADTSReader put the last of
+    // 65 two-block frames at 1.486 s instead of 2.972 s.
+    samplesPerFrame:  1024 * ((buf[6] & 0x03) + 1),
   };
 }
 
@@ -216,7 +221,10 @@ export function buildAdtsHeader(opts) {
 export function getAdtsFrameDurationUs(buf) {
   var info = parseAdtsHeader(buf);
   if (!info || !info.sampleRate) return 0;
-  return Math.floor(info.samplesPerFrame * 1000000 / info.sampleRate);
+  // Rounded, not floored (21333.33 → 21333 either way at 48 kHz, but
+  // 23219.95 → 23220 at 44.1 kHz). A running timeline must not sum these;
+  // ADTSReader counts samples instead.
+  return Math.round(info.samplesPerFrame * 1000000 / info.sampleRate);
 }
 
 

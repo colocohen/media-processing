@@ -6,7 +6,7 @@
  *   args:     FFmpeg args AFTER -map (codec, filters, quality)
  */
 
-import { selectEncoder } from './hw_accel.js';
+import { selectEncoder, registerEncoderArgs } from './hw_accel.js';
 import { cpus } from 'node:os';
 
 /**
@@ -162,7 +162,23 @@ var ENCODER_ARGS = {
 
   libx265: function (cfg) {
     var preset = cfg.latencyMode === 'quality' ? 'medium' : 'ultrafast';
-    var threads = (typeof cfg.threads === 'number') ? cfg.threads : getCpuCount();
+    // FFmpeg passes -threads to x265 as --frame-threads, and that is NOT a
+    // thread count in the usual sense:
+    //   - x265 refuses more than 16 (X265_MAX_FRAME_THREADS). The default
+    //     was the CPU count, so on any machine with more than 16 the
+    //     encoder failed to open — H.265 did not work at all on a
+    //     32-core host.
+    //   - each frame thread is one more frame in flight: measured here,
+    //     output lags input by (frame threads + 1) frames — 17 frames,
+    //     ~570 ms at 30 fps, for -threads 16. -tune zerolatency sets
+    //     frame-threads=1 precisely for that, and the -threads we passed
+    //     overrode it.
+    // Within a frame x265 still uses every core (WPP rows on its own
+    // thread pool), so realtime takes 1 frame thread and quality — where
+    // latency does not matter — up to the 16 x265 accepts.
+    var threads = (typeof cfg.threads === 'number') ? cfg.threads
+      : (cfg.latencyMode === 'quality' ? getCpuCount() : 1);
+    if (threads > 16) threads = 16;
     var profile = _ffmpegH265Profile(cfg.profile);
     var args = [
       '-c:v', 'libx265', '-threads', String(threads),
@@ -451,11 +467,25 @@ var AUDIO_CODEC_META = {
   mp3:    { profiles: [{ profile: '', codecString: 'mp3' }] },
   flac:   { profiles: [{ profile: '', codecString: 'flac' }] },
   vorbis: { profiles: [{ profile: '', codecString: 'vorbis' }] },
+  // G.711 (RFC 3551 §4.5.14): 8 kHz mono only. These had no entry, so
+  // getAllAudioCodecCapabilities() returned null for every G.711 name.
+  'g711-alaw': { profiles: [{ profile: '', codecString: 'alaw' }], sampleRates: [8000], channels: [1] },
+  'g711-ulaw': { profiles: [{ profile: '', codecString: 'ulaw' }], sampleRates: [8000], channels: [1] },
+  alaw:        { profiles: [{ profile: '', codecString: 'alaw' }], sampleRates: [8000], channels: [1] },
+  ulaw:        { profiles: [{ profile: '', codecString: 'ulaw' }], sampleRates: [8000], channels: [1] },
+  pcm:         { profiles: [{ profile: '', codecString: 'pcm-s16' }] },
 };
 
 // ═══════════════════════════════════════════
 // Public API
 // ═══════════════════════════════════════════
+
+// hw_accel's hardware probe runs each candidate with the arguments it
+// will really get (hwupload filters, -init_hw_device, ...).
+registerEncoderArgs(function (encoder, cfg) {
+  var b = ENCODER_ARGS[encoder];
+  return b ? b(cfg) : null;
+});
 
 function getVideoCodec(name, cfg) {
   if (!cfg) cfg = {};
@@ -464,11 +494,13 @@ function getVideoCodec(name, cfg) {
   if (!meta) return null;
 
   var preference = cfg.hardwareAcceleration || 'no-preference';
-  var selected = selectEncoder(codecKey, preference);
+  // hw_accel test-encodes hardware candidates (and skips ones that
+  // failed at run time) per ffmpeg path.
+  var selected = selectEncoder(codecKey, preference, cfg.ffmpegPath);
 
   var argBuilder = ENCODER_ARGS[selected.encoder];
   if (!argBuilder) {
-    selected = selectEncoder(codecKey, 'prefer-software');
+    selected = selectEncoder(codecKey, 'prefer-software', cfg.ffmpegPath);
     argBuilder = ENCODER_ARGS[selected.encoder];
   }
   if (!argBuilder) return null;
@@ -578,7 +610,7 @@ var AUDIO_CODECS = {
     } else if (cfg.useinbandfec === 0 || cfg.useinbandfec === false) {
       args.push('-fec', '0');
     }
-    // (else: leave libopus default, which is FEC enabled)
+    // (else: leave libopus's default, FEC off)
 
     // usedtx: discontinuous transmission. libopus -dtx 1.
     if (cfg.usedtx === 1 || cfg.usedtx === true) {
@@ -587,8 +619,12 @@ var AUDIO_CODECS = {
       args.push('-dtx', '0');
     }
 
-    // cbr: force constant bitrate (vs VBR default).
-    if (cfg.cbr === 1 || cfg.cbr === true) {
+    // cbr: force constant bitrate (vs VBR default). The W3C
+    // AudioEncoderConfig.bitrateMode 'constant' means the same and was
+    // ignored (29 distinct packet sizes at 'constant', as at 'variable');
+    // an explicit cbr (SDP fmtp) still decides.
+    var wantCbr = (cfg.cbr === undefined || cfg.cbr === null) ? (cfg.bitrateMode === 'constant') : cfg.cbr;
+    if (wantCbr === 1 || wantCbr === true) {
       args.push('-vbr', 'off');
     } else if (cfg.cbr === 0 || cfg.cbr === false) {
       args.push('-vbr', 'on');

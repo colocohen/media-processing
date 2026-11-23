@@ -53,7 +53,15 @@ function AudioData(init) {
     throw new TypeError('AudioData: timestamp (microseconds) is required');
   }
 
-  this.data = _toBuffer(init.data);
+  // W3C: the AudioData's resource holds "a copy of init.data". This kept a
+  // view on the caller's memory instead — and the encoder writes exactly
+  // that memory to FFmpeg's stdin, where Node holds on to it until it is
+  // flushed. A capture loop that reuses one buffer (allowed: the browser
+  // copies) rewrote audio already handed to encode(): 86 of 100 sine
+  // frames came out as the silence written after them.
+  var _src = _toBuffer(init.data);
+  this.data = new Uint8Array(_src.length);
+  this.data.set(_src);
   this.format = init.format || 's16';
   if (!FORMAT_BYTES[this.format]) {
     throw new TypeError(
@@ -69,6 +77,14 @@ function AudioData(init) {
   var bps = FORMAT_BYTES[this.format];
   this.numberOfFrames = init.numberOfFrames ||
     Math.floor(this.data.length / (this.numberOfChannels * bps));
+  // W3C: init.data smaller than numberOfFrames × numberOfChannels × bytes
+  // per sample is a TypeError. It was accepted, and every later read ran
+  // past the end of the data.
+  if (this.data.length < this.numberOfFrames * this.numberOfChannels * bps) {
+    throw new TypeError('AudioData: data is ' + this.data.length + ' bytes, ' +
+      this.numberOfFrames + ' frames x ' + this.numberOfChannels + ' channels of ' +
+      this.format + ' need ' + (this.numberOfFrames * this.numberOfChannels * bps));
+  }
 
   // Default duration: derived from frames + sampleRate
   this.duration = (typeof init.duration === 'number')
@@ -113,6 +129,17 @@ AudioData.prototype.allocationSize = function (options) {
     );
   }
 
+  // W3C: an interleaved format has a single plane — planeIndex > 0 is a
+  // RangeError (it was accepted, and sized as if it were plane 0).
+  if (!targetPlanar && options.planeIndex != null && options.planeIndex !== 0) {
+    throw new RangeError('AudioData: planeIndex ' + options.planeIndex +
+      ' out of range for interleaved format "' + targetFmt + '" (one plane)');
+  }
+  if (targetPlanar && options.planeIndex != null &&
+      (options.planeIndex < 0 || options.planeIndex >= this.numberOfChannels)) {
+    throw new RangeError('AudioData: planeIndex ' + options.planeIndex + ' out of range');
+  }
+
   // For planar target with planeIndex set, we copy ONE plane.
   // Otherwise we copy all channels (interleaved or all planes).
   if (targetPlanar && options.planeIndex != null) {
@@ -135,14 +162,12 @@ AudioData.prototype.allocationSize = function (options) {
  * the whole raw .data buffer. This produced garbage when the caller
  * asked for a different format, a frame range, or a specific plane (MP-1).
  */
+// W3C IDL: `undefined copyTo(...)` — synchronous; errors THROW. It
+// returned a Promise and turned errors into rejections, so a caller's
+// try/catch caught nothing: computeAudioDbov on a closed AudioData left
+// an unhandled rejection that killed the process.
 AudioData.prototype.copyTo = function (destination, options) {
-  if (this._closed) return Promise.reject(_domex('AudioData is closed', 'InvalidStateError'));
-  try {
-    this._copyToSync(destination, options);
-    return Promise.resolve();
-  } catch (e) {
-    return Promise.reject(e);
-  }
+  this._copyToSync(destination, options);
 };
 
 AudioData.prototype._copyToSync = function (destination, options) {
@@ -331,10 +356,18 @@ AudioData.prototype.clone = function () {
   });
 };
 
+// W3C "close AudioData": the resource is released and format becomes
+// null, sampleRate / numberOfFrames / numberOfChannels 0 (so duration 0).
+// They kept their values, so a closed AudioData still looked usable.
 AudioData.prototype.close = function () {
   this._closed = true;
   this.data = null;
   this.byteLength = 0;
+  this.format = null;
+  this.sampleRate = 0;
+  this.numberOfFrames = 0;
+  this.numberOfChannels = 0;
+  this.duration = 0;
 };
 
 export default AudioData;
