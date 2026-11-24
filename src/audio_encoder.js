@@ -688,7 +688,7 @@ AudioEncoder.prototype._takeFirstChunkMetadata = function (firstFrame) {
 function _outputCodecString(cfg, firstFrame) {
   if (cfg.codec !== 'aac' || cfg.codecString.indexOf('.') >= 0) return cfg.codecString;
   var h = firstFrame ? parseAdtsHeader(firstFrame) : null;
-  var objectType = { main: 1, lc: 2, ssr: 3 }[h && h.profile] || 2;
+  var objectType = { main: 1, lc: 2, ssr: 3, ltp: 4 }[h && h.profile] || 2;
   return 'mp4a.40.' + objectType;
 }
 

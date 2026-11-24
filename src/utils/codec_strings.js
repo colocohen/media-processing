@@ -20,6 +20,10 @@ var CODEC_MAP = [
   { pattern: /^vp0?8\b/i,        name: 'vp8' },
   { pattern: /^vp0?9\b/i,        name: 'vp9' },
   { pattern: /^av0?1\b/i,        name: 'av1' },
+  // MP3 in MP4 (WebCodecs codec registry: 'mp3', 'mp4a.69', 'mp4a.6B';
+  // RFC 6381: object type 0x40 with audio object type 34 = Layer III).
+  // These matched the 'mp4a' line below and were taken for AAC.
+  { pattern: /^mp4a\.(?:69|6b|40\.34)$/i, name: 'mp3' },
   { pattern: /^mp4a\b/i,         name: 'aac' },
   { pattern: /^aac\b/i,          name: 'aac' },
   { pattern: /^opus\b/i,         name: 'opus' },
@@ -158,7 +162,9 @@ function parseCodecDetails(str) {
       var pn = parseInt(mh[1], 10);
       result.profile = pn === 1 ? 'main' : pn === 2 ? 'main10' : String(pn);
     }
-    var ml = s.match(/\.L(\d+)/);
+    // The tier letter is L (Main) or H (High) — ISO/IEC 14496-15 E.3.
+    // Only L was matched, so a High-tier string had no level.
+    var ml = s.match(/\.[LH](\d+)/);
     if (ml) {
       var lv = parseInt(ml[1], 10);
       // HEVC: level_idc = level × 30, where level = major + minor/10.
@@ -253,9 +259,15 @@ function buildCodecString(info) {
     else if (info.profile === 'main10') p = '2';
     else if (info.profile == null) p = '1';
     else p = String(info.profile);
+    // general_profile_compatibility_flags, bit-reversed in hex (ISO/IEC
+    // 14496-15 E.3): a stream conforms to its own profile (flag[p]);
+    // Main also to Main 10 (flags 1 and 2 → 6). This was '6' for every
+    // profile, so a Main 10 string claimed a Main decoder could play it.
+    var compat = '6';
+    if (/^\d+$/.test(p) && +p !== 1 && +p < 32) compat = (Math.pow(2, +p)).toString(16).toUpperCase();
     // level_idc = level * 30 (so 3.1 → 93)
     var lvl = _parseLevelToIdc(info.level, 90, 30);
-    return 'hev1.' + p + '.6.L' + lvl + '.B0';
+    return 'hev1.' + p + '.' + compat + '.L' + lvl + '.B0';
   }
 
   if (name === 'av1') {

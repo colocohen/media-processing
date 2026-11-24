@@ -439,7 +439,9 @@ var VIDEO_CODEC_META = {
     profiles: [
       { profile: 'main',   level: '3.1', codecString: 'hev1.1.6.L93.B0' },
       { profile: 'main',   level: '4.0', codecString: 'hev1.1.6.L120.B0' },
-      { profile: 'main10', level: '4.0', codecString: 'hev1.2.6.L120.B0' },
+      // Main 10's compatibility flags are flag[2] only (reversed: 4); '6'
+      // (flags 1 and 2) claimed a Main 10 stream decodes as Main.
+      { profile: 'main10', level: '4.0', codecString: 'hev1.2.4.L120.B0' },
     ],
   },
 };

@@ -130,8 +130,13 @@ export function parseTrun(buf, box) {
   if (f & 0x000001) { out.dataOffset = readS32BE(buf, p); p += 4; }
   if (f & 0x000004) { out.firstSampleFlags = readU32BE(buf, p); p += 4; }
   var hasDur = f & 0x000100, hasSize = f & 0x000200, hasFlags = f & 0x000400, hasCto = f & 0x000800;
+  // Bytes each sample's fields take. The check was `p > box.end`: a sample
+  // starting AT the end was still read, from the bytes of the box after
+  // this one (or past the buffer, as zeros), so a trun whose sample_count
+  // overstates its fields got one invented sample.
+  var per = (hasDur ? 4 : 0) + (hasSize ? 4 : 0) + (hasFlags ? 4 : 0) + (hasCto ? 4 : 0);
   for (var i = 0; i < count; i++) {
-    if (p > box.end) break;
+    if (p + per > box.end) break;
     var s = { duration: null, size: null, flags: null, compositionOffset: 0 };
     if (hasDur)   { s.duration = readU32BE(buf, p); p += 4; }
     if (hasSize)  { s.size = readU32BE(buf, p); p += 4; }

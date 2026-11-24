@@ -20,6 +20,7 @@
 
 import { isBufferSource, toUint8Array as toBuffer, requireBufferSource } from './core/buffer_source.js';
 import { takeBufferSource } from './core/take_buffer.js';
+import { enforceRange } from './core/webidl.js';
 
 function _initChunk(name, self, init) {
   if (!init) throw new TypeError(name + ': init required');
@@ -30,9 +31,15 @@ function _initChunk(name, self, init) {
   // accepted undefined (defaulted to 0), which silently swallowed bugs
   // when callers forgot to pass it. We now require an explicit number,
   // including the value 0 (start of stream).
-  if (typeof init.timestamp !== 'number' || !Number.isFinite(init.timestamp)) {
+  if (init.timestamp === undefined || init.timestamp === null) {
     throw new TypeError(name + ': timestamp (microseconds) is required and must be a finite number');
   }
+  // IDL: `required [EnforceRange] long long timestamp` and
+  // `[EnforceRange] unsigned long long duration`. A fractional timestamp
+  // was kept as is (1.5 µs), and a non-finite duration became null while
+  // a negative or fractional one was kept — where WebIDL truncates the
+  // fraction and throws a TypeError for NaN, ±Infinity and out of range.
+  var timestamp = enforceRange(init.timestamp, 'long long', name + ': timestamp');
 
   // Compute final values before defining read-only properties.
   //
@@ -42,9 +49,11 @@ function _initChunk(name, self, init) {
   // `if (chunk.duration)` behave identically for "unknown" and "zero
   // length", so the same consumer code took different branches in Node
   // and in the browser with nothing to indicate why.
-  var duration = (typeof init.duration === 'number' && Number.isFinite(init.duration))
-    ? init.duration
-    : null;
+  // (null is taken as "not given", like undefined — internal producers
+  // pass null for an unknown duration.)
+  var duration = (init.duration === undefined || init.duration === null)
+    ? null
+    : enforceRange(init.duration, 'unsigned long long', name + ': duration');
 
   // W3C §5.2 / §4.2: `data` is a required BufferSource, and the chunk
   // owns a COPY of it unless its ArrayBuffer is listed in init.transfer.
@@ -91,7 +100,7 @@ function _initChunk(name, self, init) {
     });
   };
   ro('type',        init.type);
-  ro('timestamp',   init.timestamp);
+  ro('timestamp',   timestamp);
   ro('duration',    duration);
   ro('data',        data);
   ro('byteLength',  byteLength);

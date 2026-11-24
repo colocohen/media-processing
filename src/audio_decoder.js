@@ -358,21 +358,25 @@ AudioDecoder.prototype._emitPcm = function (pcmBuf) {
   var ad = new AudioData({
     data: pcmBuf, format: base, sampleRate: cfg.sampleRate,
     numberOfChannels: cfg.numberOfChannels, numberOfFrames: frames,
-    timestamp: ts, duration: Math.round(frames * 1e6 / cfg.sampleRate),
+    timestamp: ts,
   });
   // A planar outputFormat: FFmpeg writes interleaved, so de-interleave.
   // The AudioData used to be LABELLED planar over interleaved bytes —
   // left and right read as one smeared signal.
   if (base !== cfg.outputFormat) {
-    var opt = { format: cfg.outputFormat };
-    var planes = new Uint8Array(ad.allocationSize(opt));
-    ad.copyTo(planes, opt);
-    var timestamp = ad.timestamp, duration = ad.duration;
+    // One plane per channel: copyTo copies ONE plane of a planar format
+    // (W3C planeIndex is required).
+    var planeBytes = ad.allocationSize({ format: cfg.outputFormat, planeIndex: 0 });
+    var planes = new Uint8Array(planeBytes * cfg.numberOfChannels);
+    for (var pc = 0; pc < cfg.numberOfChannels; pc++) {
+      ad.copyTo(planes.subarray(pc * planeBytes), { format: cfg.outputFormat, planeIndex: pc });
+    }
+    var timestamp = ad.timestamp;
     ad.close();
     ad = new AudioData({
       data: planes, format: cfg.outputFormat, sampleRate: cfg.sampleRate,
       numberOfChannels: cfg.numberOfChannels, numberOfFrames: frames,
-      timestamp: timestamp, duration: duration,
+      timestamp: timestamp,
     });
   }
   this._output(ad);

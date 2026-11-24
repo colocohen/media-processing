@@ -35,10 +35,14 @@ export var ADTS_SAMPLE_RATES = [
 // ADTS profile field (2 bits) → MPEG-4 audio object type (= profile + 1).
 // HE-AAC is signaled implicitly via SBR within an LC stream — it doesn't
 // have its own ADTS profile value, and AudioEncoder produces LC by default.
+// Field 3 is AAC LTP (object type 4) in an MPEG-4 ADTS header (ID = 0) and
+// reserved in an MPEG-2 one (ISO/IEC 14496-3 §1.A.2.2.1 profile_ObjectType;
+// 13818-7 Table 31). It was null for both, so an MPEG-4 LTP stream was
+// described as LC (mp4a.40.2, an AudioSpecificConfig with object type 2).
 var ADTS_PROFILES = ['main', 'lc', 'ssr', null];
 
 // Reverse map: profile string → 2-bit ADTS field
-var PROFILE_TO_FIELD = { main: 0, lc: 1, ssr: 2 };
+var PROFILE_TO_FIELD = { main: 0, lc: 1, ssr: 2, ltp: 3 };
 
 
 /**
@@ -60,7 +64,7 @@ export function parseAdtsHeader(buf) {
   return {
     sampleRate:       ADTS_SAMPLE_RATES[sampleFreqIndex] || 0,
     sampleFreqIndex:  sampleFreqIndex,
-    profile:          ADTS_PROFILES[profile] || null,
+    profile:          (profile === 3 && !(buf[1] & 0x08)) ? 'ltp' : (ADTS_PROFILES[profile] || null),
     channels:         channels,
     frameLength:      frameLength,
     protectionAbsent: protectionAbsent,
@@ -80,6 +84,10 @@ export function parseAdtsHeader(buf) {
  * decide whether to throw or fall back to a default.
  */
 export function sampleRateToIndex(sampleRate) {
+  // The table's 0s are the reserved indices 13-15, not a rate: a sample
+  // rate of 0 matched index 13, and buildAdtsHeader / buildAudioSpecificConfig
+  // wrote that reserved index instead of refusing the rate.
+  if (!(sampleRate > 0)) return -1;
   for (var i = 0; i < ADTS_SAMPLE_RATES.length; i++) {
     if (ADTS_SAMPLE_RATES[i] === sampleRate) return i;
   }
@@ -106,7 +114,7 @@ export function sampleRateToIndex(sampleRate) {
  *   extensionFlag          1 bit   (0)
  *
  * @param {object} opts
- * @param {string|number} [opts.profile='lc']  'main'|'lc'|'ssr' or 0..2
+ * @param {string|number} [opts.profile='lc']  'main'|'lc'|'ssr'|'ltp' or 0..3
  * @param {number} opts.sampleRate  one of the ADTS table values
  * @param {number} opts.channels    1..7
  * @returns {Uint8Array}  exactly 2 bytes
@@ -135,7 +143,7 @@ export function buildAudioSpecificConfig(opts) {
  *
  * @param {object} opts
  * @param {string|number} [opts.profile='lc']
- *   'main' | 'lc' | 'ssr', or 0..2. Defaults to LC — what AudioEncoder
+ *   'main' | 'lc' | 'ssr' | 'ltp', or 0..3. Defaults to LC — what AudioEncoder
  *   produces by default and what the vast majority of streams use.
  *
  * @param {number} opts.sampleRate

@@ -17,7 +17,7 @@
  *            — what MP4/fMP4 expects, also VideoEncoder's default
  */
 
-import { writeU32BE, readU32BE, readU16BE, concat } from '../core/bytes.js';
+import { writeU32BE, readU32BE, readU24BE, readU16BE, concat } from '../core/bytes.js';
 
 // ── H.264 NAL unit types (ISO/IEC 14496-10 §7.3.1) ─────────
 export var H264_NAL_IDR = 5;   // Coded slice of an IDR picture — keyframe
@@ -69,8 +69,16 @@ export function splitNALUs(au, isH265) {
           (au[i + 2] === 1 || (au[i + 2] === 0 && i + 3 < len && au[i + 3] === 1))) break;
       i++;
     }
-    if (naluStart < i) {
-      var naluData = au.subarray(naluStart, i);
+    // trailing_zero_8bits (H.264 / H.265 Annex B.2) belong to the byte
+    // stream, not to the NAL unit, whose last byte is never 0x00 (H.264
+    // §7.4.1, H.265 §7.4.2). The scan above stops before a 00 00 00 01,
+    // so it dropped ONE such zero; a NAL followed by more of them (zero
+    // padding, or 00 00 00 00 01) or ending the buffer with them kept
+    // the rest as payload — into the AVCC length and the avcC record.
+    var naluEnd = i;
+    while (naluEnd > naluStart && au[naluEnd - 1] === 0) naluEnd--;
+    if (naluStart < naluEnd) {
+      var naluData = au.subarray(naluStart, naluEnd);
       var type = isH265 ? ((naluData[0] >> 1) & 0x3F) : (naluData[0] & 0x1F);
       nalus.push({ type: type, data: naluData });
     }
@@ -142,11 +150,14 @@ export function hasIDR(au, isH265) {
  */
 export function avccToAnnexb(buf, lengthSize) {
   if (!lengthSize) lengthSize = 4;
+  // A 3-byte length (lengthSizeMinusOne = 2, which parseAvcC/parseHvcC
+  // pass on as read) was read as ONE byte while three were stepped over.
   var parts = [];
   var off = 0;
   while (off + lengthSize <= buf.length) {
     var len;
     if (lengthSize === 4) len = readU32BE(buf, off);
+    else if (lengthSize === 3) len = readU24BE(buf, off);
     else if (lengthSize === 2) len = readU16BE(buf, off);
     else len = buf[off];
     off += lengthSize;
@@ -496,17 +507,31 @@ BitReader.prototype.ue = function () {
   return zeros ? (Math.pow(2, zeros) - 1 + this.u(zeros)) : 0;
 };
 
-// H.264 profiles whose SPS (and avcC) carry chroma / bit-depth fields
-// (ISO/IEC 14496-10 §7.3.2.1.1, ISO/IEC 14496-15 §5.3.3.1.2).
-var H264_HIGH_PROFILES = { 100: 1, 110: 1, 122: 1, 144: 1 };
+// H.264 profiles whose SPS carries chroma_format_idc and the bit depths
+// (ISO/IEC 14496-10 §7.3.2.1.1; 144 is the withdrawn High 4:4:4, as
+// FFmpeg reads it). This list was { 100, 110, 122, 144 }: High 4:4:4
+// Predictive (244, what x264's high444 makes) and the SVC / MVC / CAVLC
+// 4:4:4 profiles were read as 4:2:0 8-bit.
+var H264_SPS_CHROMA_PROFILES = {
+  100: 1, 110: 1, 122: 1, 244: 1, 44: 1, 83: 1, 86: 1, 118: 1, 128: 1,
+  138: 1, 139: 1, 134: 1, 135: 1, 144: 1,
+};
+
+// ISO/IEC 14496-15 §5.3.3.1.2: the avcC carries the chroma / bit-depth
+// extension for every profile but Baseline, Main and Extended. It was
+// written for the four profiles above only, so a High 4:4:4 Predictive
+// stream got a record without it (FFmpeg writes it, chroma_format 3).
+function _avcCHasExt(profile) {
+  return profile !== 66 && profile !== 77 && profile !== 88;
+}
 
 /**
  * Chroma format and bit depths from an H.264 SPS (NALU incl. header).
- * Only meaningful for the High family; others are 4:2:0 / 8-bit.
+ * Profiles without those fields are 4:2:0 / 8-bit.
  */
 function _h264SpsFormat(sps) {
   var profile = sps[1];
-  if (!H264_HIGH_PROFILES[profile]) return { chroma: 1, lumaMinus8: 0, chromaMinus8: 0 };
+  if (!H264_SPS_CHROMA_PROFILES[profile]) return { chroma: 1, lumaMinus8: 0, chromaMinus8: 0 };
   var r = new BitReader(nalToRbsp(sps), 4);   // skip header, profile, constraints, level
   r.ue();                                    // seq_parameter_set_id
   var chroma = r.ue();
@@ -545,7 +570,7 @@ export function buildAvcCFromAnnexB(annexb) {
   var spsList = ps.sps, ppsList = ps.pps;
   if (spsList.length === 0) return null;
   var sps0 = spsList[0];
-  var ext = H264_HIGH_PROFILES[sps0[1]] ? _h264SpsFormat(sps0) : null;
+  var ext = _avcCHasExt(sps0[1] | 0) ? _h264SpsFormat(sps0) : null;
 
   var size = 6;                                    // version..numOfSPS (6 fixed bytes)
   for (var s = 0; s < spsList.length; s++) size += 2 + spsList[s].length;
