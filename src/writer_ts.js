@@ -134,6 +134,12 @@ function TSWriter(opts) {
   // emission carries the metadata stream entry — even if no metadata
   // is fed in a given segment, since players expect PMT consistency.
   this._metadataEnabled = false;
+  // PMT version_number (5 bits). ISO/IEC 13818-1 §2.4.4.9: it "shall be
+  // incremented by 1 modulo 32 whenever the definition of the
+  // TS_program_map_section changes". Enabling metadata adds a stream to
+  // the PMT; it kept version 0, so a demuxer already holding version 0
+  // could ignore the new section and never see the metadata stream.
+  this._pmtVersion = 0;
 
   // ── I-frame playlist support ──
   // When enabled, writeSegment computes the byte range of the first
@@ -191,6 +197,7 @@ TSWriter.prototype.enableMetadata = function () {
   // less template). Reset the CC counter as well — the template
   // build path normally bumps it.
   this._pmtTemplate = null;
+  this._pmtVersion = (this._pmtVersion + 1) & 0x1F;
   var savedCc = this._cc[PID_PMT];
   this._pmtTemplate = this._buildPMTPacket();
   this._cc[PID_PMT] = savedCc;
@@ -339,15 +346,10 @@ TSWriter.prototype.writeSegment = function (videoChunks, audioChunks, endPtsUs, 
   }
 
   // If metadata is fed but the stream wasn't pre-enabled, enable it
-  // now. The PMT in this segment will declare the metadata stream;
-  // earlier segments (without metadata) declared only a/v. Players
-  // reading mid-stream will refresh PMT on this segment via
-  // version_number bump — except we keep version_number constant for
-  // simplicity, so a player joining at this segment is fine, and
-  // players already reading just see a new stream appear (which is
-  // valid per ISO 13818-1 if PMT version doesn't change but PCR/
-  // section-CRC reflect the new layout). For the cleanest behavior,
-  // callers should enableMetadata() upfront before writing any segment.
+  // now. The PMT in this segment declares the metadata stream with a new
+  // version_number (see enableMetadata); earlier segments declared only
+  // a/v. For the cleanest behavior, callers should enableMetadata()
+  // upfront before writing any segment.
   if (metadataChunks.length > 0 && !this._metadataEnabled) {
     this.enableMetadata();
   }
@@ -642,7 +644,7 @@ TSWriter.prototype._writePMTPacketInto = function (buf, base) {
   buf[off++] = sectionLength & 0xFF;
   buf[off++] = 0x00;
   buf[off++] = 0x01;            // program_number = 1
-  buf[off++] = 0xC1;            // reserved=11, version=0, current=1
+  buf[off++] = 0xC1 | (this._pmtVersion << 1);   // reserved=11, version, current=1
   buf[off++] = 0x00;
   buf[off++] = 0x00;
   buf[off++] = 0xE0 | ((this._pcrPid >> 8) & 0x1F);

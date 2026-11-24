@@ -40,7 +40,10 @@ export function computeAudioRms(audioData) {
  */
 export function computeAudioDbov(audioData) {
   var rms = computeAudioRms(audioData);
-  if (rms <= 0) return 127;
+  // `!(rms > 0)`, not `rms <= 0`: a NaN f32 sample makes the RMS NaN, which
+  // `<= 0` let through to Math.round → NaN, a level outside RFC 6464's
+  // 0..127 that the header-extension writer then encoded as 0 (loudest).
+  if (!(rms > 0)) return 127;
   var db = 20 * Math.log10(rms);          // ≤ 0 for rms ≤ 1
   var level = Math.round(-db);
   // `<= 0`, not `< 0`: at full scale db is 0 and Math.round(-0) is -0,

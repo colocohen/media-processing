@@ -250,7 +250,11 @@ OggWriter.prototype._buildPage = function (body, flags, granule) {
     var bytes = 0;
     for (var k = 0; k < segs.length; k++) bytes += segs[k];
     var last = s + 255 >= segments.length;
-    var f = (s > 0 ? FLAG_CONTINUATION : 0) | (last ? flags : (flags & FLAG_BOS));
+    // BOS on the first page only, EOS on the last only (RFC 3533 §6: BOS
+    // marks the first page of the bitstream). This was
+    // `last ? flags : (flags & FLAG_BOS)`, which put BOS on every page of
+    // a header packet that spans pages — continuation pages included.
+    var f = (s > 0 ? FLAG_CONTINUATION : (flags & FLAG_BOS)) | (last ? (flags & ~FLAG_BOS) : 0);
     pages.push(this._buildOnePage(segs, body.subarray(off, off + bytes), f, last ? granule : -1));
     off += bytes;
   }

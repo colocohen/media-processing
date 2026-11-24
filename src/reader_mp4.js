@@ -9,6 +9,7 @@
  *   r.on('info',  function (info) { … });        // the tracks and their decoder configs
  *   r.on('video', function (s) { … });           // a sample — see below
  *   r.on('audio', function (s) { … });
+ *   r.on('other', function (s) { … });        // a selected track neither video nor audio
  *   r.on('need',  function (n) { … });           // { offset, length }: feed from there
  *   r.on('end',   function () { … });
  *   r.on('error', function (err) { … });         // err.code
@@ -53,9 +54,11 @@
  *     sampleCount, bitrate, startUs,
  *     video: codedWidth, codedHeight, displayWidth, displayHeight,
  *            rotation (0|90|180|270 — clockwise, to show it upright),
+ *            flip (then mirrored left-right: WebCodecs' rotation + flip),
  *            colorSpace ({ primaries, transfer, matrix, fullRange } |
  *            null), frameRate
- *     audio: sampleRate, numberOfChannels, bigEndian (PCM 'twos')
+ *     audio: sampleRate, numberOfChannels, bigEndian (PCM: the samples'
+ *            byte order — 'twos', 'in24', … unless an 'enda' says little)
  *     config: a VideoDecoderConfig / AudioDecoderConfig to configure()
  *             with (null when codec is null) }
  * In a fragmented file 'info' comes with the first fragment, and
@@ -63,9 +66,10 @@
  *
  * Codecs: H.264 (avc1/avc3), H.265 (hvc1/hev1 — an iPhone's), AV1, VP8,
  * VP9; AAC (any profile), MP3, Opus, FLAC, ALAC, PCM (sowt/twos/raw/
- * in24/in32/fl32), µ-law / A-law. QuickTime sound sample descriptions
- * v0/v1/v2 and an esds inside 'wave' (older iPhones) are read. Encrypted
- * tracks (encv / enca) come out with codec null.
+ * in24/in32/fl32/lpcm, ipcm/fpcm), µ-law / A-law. QuickTime sound sample
+ * descriptions v0/v1/v2 and an esds / alac / enda inside 'wave' (older
+ * iPhones) are read. Encrypted tracks (encv / enca) come out with codec
+ * null.
  *
  * Not here: a compressed moov (cmov, pre-2005 QuickTime); edit lists
  * past the first media edit (rare in camera files — the rest are
@@ -191,6 +195,10 @@ MP4Reader.prototype._run = function () {
 // One step through the top-level boxes. false: waiting for bytes.
 MP4Reader.prototype._scanTop = function () {
   var off = this._scan;
+  // After a box of size 0 (it runs to the end) in a file of unknown size:
+  // nothing follows it — the end is end(). It was taken as a box at
+  // offset Infinity, and a 'need' asked for { offset: Infinity }.
+  if (off === Infinity) return false;
   if (this._size && off >= this._size) {
     if (!this._moovSeen) { this._fail('NO_MOOV', 'no moov — not an MP4 / MOV file, or truncated'); return false; }
     if (!this._infoSent) this._sendInfo();
@@ -211,7 +219,14 @@ MP4Reader.prototype._scanTop = function () {
     var bytes = this._win.view(off, b.size);
     try {
       if (b.type === 'ftyp') this._ftyp = bytes;
-      else if (b.type === 'moov') this._parseMoov(bytes);
+      else if (b.type === 'moov') {
+        // A compressed movie is a 'cmov' INSIDE the moov (QTFF): the check
+        // was for a top-level one, which no file has — such a moov was
+        // read as one with no tracks.
+        var mh = readBoxHeader(bytes, 0, bytes.length, true);
+        if (findBox(bytes, mh.dataStart, mh.end, 'cmov')) { this._fail('CMOV', 'compressed moov (cmov) not supported'); return false; }
+        this._parseMoov(bytes);
+      }
       else this._addMoof(b, bytes);
     } catch (e) {
       this._fail('BAD_' + b.type.toUpperCase(), e.message);
@@ -225,7 +240,7 @@ MP4Reader.prototype._scanTop = function () {
   // mdat (and the rest: free, skip, wide, uuid, …). Before the moov — or
   // while a fragmented file seeks — its data isn't wanted yet: jump it.
   this._scan = b.end;
-  if (!this._moovSeen || this._seekTarget != null) {
+  if ((!this._moovSeen || this._seekTarget != null) && b.end !== Infinity) {
     this._win.trim(b.end);
     if (!this._size || b.end < this._size) this._want(b.end, HEAD, true);
   }
@@ -238,7 +253,7 @@ MP4Reader.prototype._parseMoov = function (bytes) {
                durationUs: 0, startUs: 0, tracks: [] };
   var f = this._ftyp;
   if (f) {
-    var fb = readBoxHeader(f, 0, f.length, false);
+    var fb = readBoxHeader(f, 0, f.length, true);
     if (fb) {
       info.brand = toAscii(f, fb.dataStart, fb.dataStart + 4);
       for (var c = fb.dataStart + 8; c + 4 <= fb.end; c += 4) info.compatibleBrands.push(toAscii(f, c, c + 4));
@@ -246,15 +261,20 @@ MP4Reader.prototype._parseMoov = function (bytes) {
   }
   info.quicktime = info.brand === 'qt  ' || !f;
   if (info.quicktime) info.container = 'mov';
+  // QuickTime's sound sample description v1 / v2 layout (QTFF) or ISO's
+  // AudioSampleEntryV1 (14496-12 §12.2.3: v0's fields, then boxes)? As
+  // FFmpeg tells them apart: QuickTime unless an ISO file (an ftyp whose
+  // major brand is not 'qt  ') without 'qt  ' among its compatible brands.
+  var qtLayout = info.quicktime || info.compatibleBrands.indexOf('qt  ') >= 0;
 
   var buf = bytes;
-  var moov = readBoxHeader(buf, 0, buf.length, false);
+  var moov = readBoxHeader(buf, 0, buf.length, true);
   var mvhd = findBox(buf, moov.dataStart, moov.end, 'mvhd');
   if (mvhd) {
     var mh = fullBoxHeader(buf, mvhd);
     this._movieTimescale = mh.version === 1 ? readU32BE(buf, mh.dataStart + 16) : readU32BE(buf, mh.dataStart + 8);
-    var md = mh.version === 1 ? readU64BE(buf, mh.dataStart + 20) : readU32BE(buf, mh.dataStart + 12);
-    if (this._movieTimescale) info.durationUs = Math.round(md * 1e6 / this._movieTimescale);
+    var md = _duration(buf, mh.dataStart + (mh.version === 1 ? 20 : 12), mh.version === 1);
+    if (this._movieTimescale && md != null) info.durationUs = Math.round(md * 1e6 / this._movieTimescale);
   }
   // Fragment defaults per track (mvex/trex).
   var trex = this._trex;
@@ -271,8 +291,8 @@ MP4Reader.prototype._parseMoov = function (bytes) {
   }
   var self = this;
   findBoxes(buf, moov.dataStart, moov.end, 'trak').forEach(function (trak) {
-    var t = _parseTrak(buf, trak, self._movieTimescale);
-    if (t) { t.cursor = 0; _finishTrack(t); self._tracks.push(t); }
+    var t = _parseTrak(buf, trak, self._movieTimescale, qtLayout);
+    if (t) { t.cursor = 0; _finishTrack(t, false); self._tracks.push(t); }
   });
   this._info = info;
   // A whole index: say what it is now. A fragmented one: once the first
@@ -284,7 +304,7 @@ MP4Reader.prototype._addMoof = function (box, bytes) {
   if (!this._moovSeen) throw new Error('a moof before the moov');
   this._fragmented = this._info.fragmented = true;
   _addFragments(this._tracks, [{ box: box, bytes: bytes }], this._trex);
-  this._tracks.forEach(_finishTrack);
+  this._tracks.forEach(function (t) { _finishTrack(t, true); });
   if (!this._infoSent) this._sendInfo();
   if (this._seekTarget != null) {
     var v = this._seekVideo();
@@ -379,7 +399,10 @@ MP4Reader.prototype._emitSamples = function () {
     var t = this._nextTrack();
     if (!t) { this._keep(); return 'done'; }
     var i = t.cursor, o = t.off[i], sz = t.size[i];
-    if (!this._win.has(o, sz)) {
+    // (An empty sample needs no bytes: it goes out now. It went out only
+    // once _keep had trimmed the window up to its offset — on a second
+    // pass, so whether it came before the next feed depended on that.)
+    if (sz > 0 && !this._win.has(o, sz)) {
       this._keep();
       this._want(o, sz);
       return 'wait';
@@ -387,7 +410,7 @@ MP4Reader.prototype._emitSamples = function () {
     t.cursor++;
     this._ee.emit(t.type, {
       trackId: t.id,
-      payload: this._win.view(o, sz),
+      payload: sz > 0 ? this._win.view(o, sz) : new Uint8Array(0),
       isKeyframe: !!t.sync[i],
       ptsUs: this._ptsUs(t, i),
       dtsUs: Math.round((t.dts[i] - _dtsShift(t) - t.mediaStart) * 1e6 / t.timescale) + t.leadUs,
@@ -422,7 +445,8 @@ MP4Reader.prototype.seek = function (timeUs) {
   this._askedAt = -1;
   var v = this._seekVideo();
   var known = !v || (v.sampleCount && this._ptsUs(v, v.sampleCount - 1) >= timeUs);
-  if (this._fragmented && !known && !(this._size && this._scan >= this._size)) {
+  var atEnd = this._scan === Infinity || (this._size && this._scan >= this._size);
+  if (this._fragmented && !known && !atEnd) {
     this._seekTarget = timeUs;
     this._win.trim(this._scan);
     this._want(this._scan, HEAD);
@@ -492,10 +516,10 @@ function _headerAt(h, off, fileSize) {
 // Parsing the moov
 // =========================================================================
 
-function _parseTrak(buf, trak, movieTimescale) {
+function _parseTrak(buf, trak, movieTimescale, qtLayout) {
   var t = {
     id: 0, type: 'other', handler: '', entry: '', codec: null, description: null,
-    timescale: 0, durationUs: 0, rotation: 0, displayWidth: 0, displayHeight: 0,
+    timescale: 0, durationUs: 0, rotation: 0, flip: false, displayWidth: 0, displayHeight: 0,
     codedWidth: 0, codedHeight: 0, colorSpace: null,
     sampleRate: 0, numberOfChannels: 0, bigEndian: false, pcm: false, pcmFrameBytes: 0,
     // edit list → presentation time: pts = (t - mediaStart) / timescale + leadUs
@@ -510,9 +534,17 @@ function _parseTrak(buf, trak, movieTimescale) {
     t.id = readU32BE(buf, p + (th.version === 1 ? 16 : 8));
     var mx = p + (th.version === 1 ? 48 : 36);
     var a = readS32BE(buf, mx) / 65536, b = readS32BE(buf, mx + 4) / 65536;
-    var deg = Math.round(Math.atan2(b, a) * 180 / Math.PI);
+    var c = readS32BE(buf, mx + 12) / 65536, d = readS32BE(buf, mx + 16) / 65536;
+    // A mirrored matrix (determinant < 0: FFmpeg's -display_hflip, a
+    // selfie camera's) is a rotation then a left-right flip — WebCodecs'
+    // rotation + flip, x' = -(x cos r - y sin r), y' = x sin r + y cos r,
+    // so r = atan2(b, d). It was read as a rotation alone: atan2(b, a) of
+    // the plain hflip [-1 0; 0 1] is 180, and the picture was shown
+    // upside down where FFmpeg's autorotate only mirrors it.
+    t.flip = a * d - b * c < 0;
+    var deg = Math.round(Math.atan2(b, t.flip ? d : a) * 180 / Math.PI);
     t.rotation = ((deg % 360) + 360) % 360;
-    if (t.rotation % 90) t.rotation = 0;   // a shear / odd matrix: shown as is
+    if (t.rotation % 90) { t.rotation = 0; t.flip = false; }   // a shear / odd matrix: shown as is
     t.displayWidth  = readU32BE(buf, mx + 36) / 65536;
     t.displayHeight = readU32BE(buf, mx + 40) / 65536;
   }
@@ -523,8 +555,8 @@ function _parseTrak(buf, trak, movieTimescale) {
   if (mdhd) {
     var mh = fullBoxHeader(buf, mdhd);
     t.timescale = mh.version === 1 ? readU32BE(buf, mh.dataStart + 16) : readU32BE(buf, mh.dataStart + 8);
-    var d = mh.version === 1 ? readU64BE(buf, mh.dataStart + 20) : readU32BE(buf, mh.dataStart + 12);
-    if (t.timescale && d !== 0xFFFFFFFF) t.durationUs = Math.round(d * 1e6 / t.timescale);
+    var d = _duration(buf, mh.dataStart + (mh.version === 1 ? 20 : 12), mh.version === 1);
+    if (t.timescale && d != null) t.durationUs = Math.round(d * 1e6 / t.timescale);
   }
   if (!t.timescale) return null;
   var hdlr = findBox(buf, mdia.dataStart, mdia.end, 'hdlr');
@@ -533,26 +565,33 @@ function _parseTrak(buf, trak, movieTimescale) {
 
   // Edit list: a leading empty edit delays the track; the first media
   // edit says where in the media the presentation starts.
+  // Entries past the box's end are not read (see _entries); a
+  // media_time below -1 is not one (§8.6.6.3: -1 is an empty edit, the
+  // rest are media times): it was taken as the media start, which moved
+  // the track later by that many ticks — now the edit list is not
+  // applied, as reader_fmp4 does.
   var elst = findPath(buf, trak, 'edts/elst');
   if (elst) {
-    var eh = fullBoxHeader(buf, elst), ep = eh.dataStart;
-    var count = readU32BE(buf, ep); ep += 4;
-    var lead = 0;
+    var eh = fullBoxHeader(buf, elst), ep = eh.dataStart, esz = eh.version === 1 ? 20 : 12;
+    var count = _entries(readU32BE(buf, ep), ep + 4, elst.end, esz); ep += 4;
+    var lead = 0, valid = true;
     for (var i = 0; i < count; i++) {
       var segDur, mediaTime;
-      if (eh.version === 1) { segDur = readU64BE(buf, ep); mediaTime = readS32BE(buf, ep + 8) * 0x100000000 + readU32BE(buf, ep + 12); ep += 20; }
-      else { segDur = readU32BE(buf, ep); mediaTime = readS32BE(buf, ep + 4); ep += 12; }
+      if (eh.version === 1) { segDur = readU64BE(buf, ep); mediaTime = readS32BE(buf, ep + 8) * 0x100000000 + readU32BE(buf, ep + 12); }
+      else { segDur = readU32BE(buf, ep); mediaTime = readS32BE(buf, ep + 4); }
+      ep += esz;
       if (mediaTime === -1) { lead += segDur; continue; }
-      t.mediaStart = mediaTime;
+      if (mediaTime < 0) valid = false;
+      else t.mediaStart = mediaTime;
       break;
     }
-    if (movieTimescale) t.leadUs = Math.round(lead * 1e6 / movieTimescale);
+    if (valid && movieTimescale) t.leadUs = Math.round(lead * 1e6 / movieTimescale);
   }
 
   var stbl = findPath(buf, mdia, 'minf/stbl');
   if (!stbl) return t;
   var stsd = findBox(buf, stbl.dataStart, stbl.end, 'stsd');
-  if (stsd) _parseSampleEntry(buf, stsd, t);
+  if (stsd) _parseSampleEntry(buf, stsd, t, qtLayout);
   _parseSampleTables(buf, stbl, t);
   return t;
 }
@@ -560,10 +599,16 @@ function _parseTrak(buf, trak, movieTimescale) {
 
 // ── Sample entries → codec, description, sizes ──
 
-function _parseSampleEntry(buf, stsd, t) {
+function _parseSampleEntry(buf, stsd, t, qtLayout) {
+  var stsdVersion = buf[stsd.dataStart];
   var entry = readBoxHeader(buf, stsd.dataStart + 8, stsd.end, false);   // the first entry
   if (!entry) return;
   t.entry = entry.type;
+  // The entry's own fields are read within it: a short entry's were read
+  // from the boxes after it (and v2's rate through a DataView on the
+  // fed buffer itself — past the moov, or a RangeError that failed the
+  // file as BAD_MOOV). Past the entry they are 0 now.
+  buf = buf.subarray(0, entry.end);
   var E = entry.dataStart;   // past the box header: 6 reserved + 2 data_reference_index
 
   if (t.type === 'video') {
@@ -571,8 +616,11 @@ function _parseSampleEntry(buf, stsd, t) {
     t.codedHeight = readU16BE(buf, E + 26);
     var kids = { start: E + 78, end: entry.end };
     _videoCodec(buf, entry.type, kids, t);
-    var colr = findBox(buf, kids.start, kids.end, 'colr');
-    if (colr) t.colorSpace = _colr(buf, colr);
+    // Colour information may come in several colr boxes, the most
+    // accurate first (14496-12 §12.1.5: an ICC profile, then nclx): only
+    // the first was looked at, so an nclx after a 'prof' was not seen.
+    var colrs = findBoxes(buf, kids.start, kids.end, 'colr');
+    for (var ci = 0; ci < colrs.length && !t.colorSpace; ci++) t.colorSpace = _colr(buf, colrs[ci]);
     if (!t.displayWidth) { t.displayWidth = t.codedWidth; t.displayHeight = t.codedHeight; }
     return;
   }
@@ -583,22 +631,43 @@ function _parseSampleEntry(buf, stsd, t) {
     var bits = readU16BE(buf, E + 18);
     t.sampleRate = readU32BE(buf, E + 24) >>> 16;
     var kidsStart = E + 28;
-    var bytesPerFrame = 0;
-    if (ver === 1) {
-      // QuickTime v1: samplesPerPacket, bytesPerPacket, bytesPerFrame, bytesPerSample
-      bytesPerFrame = readU32BE(buf, E + 36);
-      kidsStart = E + 44;
-    } else if (ver === 2) {
-      var dv = new DataView(buf.buffer, buf.byteOffset + E + 32, 8);
-      t.sampleRate = Math.round(dv.getFloat64(0));
-      t.numberOfChannels = readU32BE(buf, E + 40);
-      bits = readU32BE(buf, E + 48);
-      bytesPerFrame = readU32BE(buf, E + 56);
-      kidsStart = E + 64;
+    var bytesPerFrame = 0, lpcmFlags = 0;
+    // QuickTime's v1 / v2 (QTFF) — or ISO's AudioSampleEntryV1, which is
+    // v0's layout (§12.2.3) in an stsd of version 1: it was read as
+    // QuickTime's, its boxes looked for 16 bytes too far.
+    if (qtLayout || stsdVersion === 0) {
+      if (ver === 1) {
+        // QuickTime v1: samplesPerPacket, bytesPerPacket, bytesPerFrame, bytesPerSample
+        bytesPerFrame = readU32BE(buf, E + 36);
+        kidsStart = E + 44;
+      } else if (ver === 2) {
+        var rate = _f64(buf, E + 32);
+        t.sampleRate = rate >= 1 && rate < 0xFFFFFFFF ? Math.round(rate) : 0;   // (NaN, ≤ 0, huge: none)
+        t.numberOfChannels = readU32BE(buf, E + 40);
+        bits = readU32BE(buf, E + 48);
+        lpcmFlags = readU32BE(buf, E + 52);
+        bytesPerFrame = readU32BE(buf, E + 56);
+        kidsStart = E + 64;
+      }
     }
-    _audioCodec(buf, entry.type, { start: kidsStart, end: entry.end }, t, bits, bytesPerFrame);
+    var kids2 = { start: kidsStart, end: entry.end };
+    // A rate of 2^16 or more does not fit the 16.16 field: ISO's 'srat'
+    // gives it (§12.2.3), else (FFmpeg writes 0 there) the media
+    // timescale, as FFmpeg reads it. A 96 kHz FLAC / ALAC / PCM .mp4
+    // came out with sampleRate 0.
+    var srat = findBox(buf, kids2.start, kids2.end, 'srat');
+    if (srat) t.sampleRate = readU32BE(buf, srat.dataStart + 4);
+    _audioCodec(buf, entry.type, kids2, t, bits, bytesPerFrame, lpcmFlags);
+    if (!t.sampleRate && t.timescale > 1) t.sampleRate = t.timescale;
     return;
   }
+}
+
+// A big-endian IEEE double at o (0 past the end of buf).
+function _f64(buf, o) {
+  var dv = new DataView(new ArrayBuffer(8));
+  dv.setUint32(0, readU32BE(buf, o)); dv.setUint32(4, readU32BE(buf, o + 4));
+  return dv.getFloat64(0);
 }
 
 function _videoCodec(buf, type, kids, t) {
@@ -607,8 +676,10 @@ function _videoCodec(buf, type, kids, t) {
     b = findBox(buf, kids.start, kids.end, 'avcC');
     if (!b) return;
     t.description = buf.slice(b.dataStart, b.end);
-    t.codec = codecStringFromAvcC(t.description, type) ||
-              (type + '.' + _hex2(t.description[1]) + _hex2(t.description[2]) + _hex2(t.description[3]));
+    // (An avcC of under 4 bytes has no profile / level to name: the
+    // fallback read past it — a TypeError that failed the file.)
+    t.codec = codecStringFromAvcC(t.description, type) || (t.description.length < 4 ? null :
+              (type + '.' + _hex2(t.description[1]) + _hex2(t.description[2]) + _hex2(t.description[3])));
     return;
   }
   if (type === 'hvc1' || type === 'hev1') {
@@ -628,25 +699,33 @@ function _videoCodec(buf, type, kids, t) {
   if (type === 'vp09' || type === 'vp08') {
     b = findBox(buf, kids.start, kids.end, 'vpcC');
     if (type === 'vp08') { t.codec = 'vp8'; return; }
-    if (!b) { t.codec = 'vp09.00.10.08'; return; }
-    var v = fullBoxHeader(buf, b).dataStart;
+    var v = b ? fullBoxHeader(buf, b).dataStart : 0;
+    // (A vpcC too short for profile / level / bit depth: as none — it
+    // gave 'vp09.undefined.undefined.00'.)
+    if (!b || v + 3 > b.end) { t.codec = 'vp09.00.10.08'; return; }
     t.codec = 'vp09.' + _pad2(buf[v]) + '.' + _pad2(buf[v + 1]) + '.' + _pad2(buf[v + 2] >> 4);
     return;
   }
   // mp4v, encv (encrypted), jpeg, … — not a WebCodecs video codec.
 }
 
-function _audioCodec(buf, type, kids, t, bits, bytesPerFrame) {
+// A box among the entry's boxes, or inside its QuickTime 'wave'.
+function _kidOrWave(buf, kids, type) {
+  var b = findBox(buf, kids.start, kids.end, type);
+  if (b) return b;
+  var wave = findBox(buf, kids.start, kids.end, 'wave');
+  return wave ? findBox(buf, wave.dataStart, wave.end, type) : null;
+}
+
+function _audioCodec(buf, type, kids, t, bits, bytesPerFrame, lpcmFlags) {
   if (type === 'mp4a') {
     // The esds may be inside a 'wave' (QuickTime).
-    var esds = findBox(buf, kids.start, kids.end, 'esds');
-    if (!esds) {
-      var wave = findBox(buf, kids.start, kids.end, 'wave');
-      if (wave) esds = findBox(buf, wave.dataStart, wave.end, 'esds');
-    }
+    var esds = _kidOrWave(buf, kids, 'esds');
     if (esds) _esds(buf, esds, t);
     return;
   }
+  // QuickTime's MP3 entries ('.mp3', 'ms\0U' — QTFF): codec null before.
+  if (type === '.mp3' || type === 'ms\u0000U') { t.codec = 'mp3'; return; }
   if (type === 'Opus') {
     var dops = findBox(buf, kids.start, kids.end, 'dOps');
     t.codec = 'opus';
@@ -660,18 +739,55 @@ function _audioCodec(buf, type, kids, t, bits, bytesPerFrame) {
     return;
   }
   if (type === 'alac') {
-    var alac = findBox(buf, kids.start, kids.end, 'alac');
+    // In a .mov the 'alac' box is inside 'wave' (what FFmpeg and Apple
+    // write): it was looked for among the entry's boxes only, so a .mov's
+    // ALAC track had no description.
+    var alac = _kidOrWave(buf, kids, 'alac');
     t.codec = 'alac';
     if (alac) t.description = buf.slice(alac.dataStart + 4, alac.end);
     return;
   }
-  if (type === 'ulaw' || type === 'alaw') { t.codec = type; return; }
-  if (type === 'sowt' || type === 'twos' || type === 'raw ' || type === 'in24' || type === 'in32' || type === 'fl32') {
-    var width = type === 'raw ' ? 8 : type === 'in24' ? 24 : (type === 'in32' || type === 'fl32') ? 32 : (bits || 16);
-    t.codec = type === 'raw ' ? 'pcm-u8' : type === 'fl32' ? 'pcm-f32' : 'pcm-s' + width;
-    t.bigEndian = type !== 'sowt' && type !== 'raw ';
+  // PCM: a QuickTime "sample" is one audio frame (a few bytes): they are
+  // grouped by chunk (_pcmChunks). µ-law / A-law are such a format too
+  // (one byte per channel): they went out one frame per sample — 48 000
+  // samples a second, each with a duration rounded to 21 µs.
+  if (type === 'ulaw' || type === 'alaw') {
+    t.codec = type;
     t.pcm = true;
-    t.pcmFrameBytes = bytesPerFrame || (width / 8) * (t.numberOfChannels || 1);
+    t.pcmFrameBytes = bytesPerFrame || (t.numberOfChannels || 1);
+    return;
+  }
+  if (type === 'sowt' || type === 'twos' || type === 'raw ' || type === 'in24' || type === 'in32' || type === 'fl32' || type === 'lpcm') {
+    var width = type === 'raw ' ? 8 : type === 'in24' ? 24 : (type === 'in32' || type === 'fl32') ? 32 : (bits || 16);
+    if (type === 'lpcm') {
+      // QuickTime v2 LPCM (what FFmpeg writes for PCM above 65535 Hz):
+      // formatSpecificFlags (kAudioFormatFlagIsFloat 1, IsBigEndian 2,
+      // IsSignedInteger 4) say what it is. Not recognised before — no
+      // codec, and one sample per frame.
+      var fl = lpcmFlags & 1, signed = lpcmFlags & 4;
+      t.codec = fl ? (width === 32 ? 'pcm-f32' : null)
+        : signed ? ([16, 24, 32].indexOf(width) >= 0 ? 'pcm-s' + width : null)
+        : width === 8 ? 'pcm-u8' : null;
+      t.bigEndian = !!(lpcmFlags & 2);
+    } else {
+      // 'twos' / 'sowt' of 8 bits is signed — 'pcm-s8', which WebCodecs
+      // does not name (its PCM codecs: pcm-u8, -s16, -s24, -s32, -f32);
+      // of 12, 'pcm-s12'. Those went out as codec strings.
+      t.codec = type === 'raw ' ? 'pcm-u8' : type === 'fl32' ? 'pcm-f32'
+        : [16, 24, 32].indexOf(width) >= 0 ? 'pcm-s' + width : null;
+      t.bigEndian = type !== 'sowt' && type !== 'raw ';
+      // An 'enda' (in 'wave') of 1 makes in24 / in32 / fl32 little-endian
+      // (QTFF; FFmpeg writes it for pcm_s24le / s32le / f32le in .mov):
+      // it was ignored, and such a track was read as big-endian.
+      if (type === 'in24' || type === 'in32' || type === 'fl32') {
+        var enda = _kidOrWave(buf, kids, 'enda');
+        if (enda && (readU16BE(buf, enda.dataStart) & 0xFF)) t.bigEndian = false;
+      }
+    }
+    t.pcm = true;
+    // (whole bytes: 12-bit samples take 2 — a fractional frame size put
+    // samples at fractional offsets)
+    t.pcmFrameBytes = bytesPerFrame || Math.ceil(width / 8) * (t.numberOfChannels || 1);
     return;
   }
   // ISO/IEC 23003-5 PCM in ISO BMFF ('ipcm' integer, 'fpcm' float — what
@@ -724,10 +840,41 @@ function _esds(buf, esds, t) {
     t.description = asc;
     t.codec = oti === 0x40 ? 'mp4a.40.' + ((a && a.objectType) || 2) : 'mp4a.' + oti.toString(16);
     if (a) {
-      if (a.sampleRate) t.sampleRate = a.sampleRate;
+      if (a.sampleRate) t.sampleRate = _sbrRate(asc) || a.sampleRate;
       if (a.channels) t.numberOfChannels = a.channels;
     }
   }
+}
+
+var AAC_RATES = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350];
+
+// HE-AAC: the decoder's output rate is SBR's extension sampling frequency
+// (14496-3 §1.6.2.1 / §1.6.5), not the core's. The core's was taken —
+// half the rate (24000 for 48 kHz HE-AAC; FFmpeg: 48000). Explicit
+// signalling (audioObjectType 5 / 29, then the extension rate) and the
+// backward-compatible kind (an AAC config, then syncExtensionType 0x2B7,
+// SBR, sbrPresentFlag 1) are read; 0 when there is no SBR (or a PCE — a
+// channelConfiguration of 0 — stands in the way).
+function _sbrRate(asc) {
+  var pos = 0, n = asc.length * 8;
+  function bits(k) {
+    var v = 0;
+    for (var i = 0; i < k; i++, pos++) v = v * 2 + (pos < n ? (asc[pos >> 3] >> (7 - (pos & 7))) & 1 : 0);
+    return v;
+  }
+  function rate() { var i = bits(4); return i === 15 ? bits(24) : (AAC_RATES[i] || 0); }
+  function aot() { var o = bits(5); return o === 31 ? 32 + bits(6) : o; }
+  var type = aot();
+  rate();
+  var channels = bits(4);
+  if (type === 5 || type === 29) return pos + 4 <= n ? rate() : 0;
+  if (type < 1 || type > 4 || !channels) return 0;
+  // GASpecificConfig (§4.4.1) of AAC Main / LC / SSR / LTP
+  bits(1);                                   // frameLengthFlag
+  if (bits(1)) bits(14);                     // dependsOnCoreCoder → coreCoderDelay
+  if (bits(1)) bits(1);                      // extensionFlag → extensionFlag3
+  if (n - pos < 16 || bits(11) !== 0x2B7 || aot() !== 5 || !bits(1)) return 0;
+  return pos + 4 <= n ? rate() : 0;
 }
 
 // dOps (big-endian) → OpusHead (Ogg identification header, little-endian):
@@ -758,6 +905,25 @@ function _colr(buf, colr) {
 
 // ── Sample tables (stts, ctts, stss, stsz / stz2, stsc, stco / co64) ──
 
+// How many of a table's `count` entries of `size` bytes, from p, fit in
+// the box (ending at end). The counts were taken as written: a count
+// past the box read its entries from the boxes after it (an elst whose
+// count said 2 for 1 entry took the next box's header as a media_time,
+// and every pts came out −143 382 s; FFmpeg reads within the box).
+function _entries(count, p, end, size) {
+  return Math.min(count, Math.max(0, Math.floor((end - p) / size)));
+}
+
+// An mvhd / mdhd duration; null when all ones — "cannot be determined"
+// (14496-12 §8.2.2.3, §8.4.2.3). mvhd's was taken as 2^32 − 1 ticks (an
+// info.durationUs of 4 294 967 295 000 for a 1 s file), mdhd v1's as
+// 2^64 − 1.
+function _duration(buf, p, v1) {
+  if (v1) return readU32BE(buf, p) === 0xFFFFFFFF && readU32BE(buf, p + 4) === 0xFFFFFFFF ? null : readU64BE(buf, p);
+  var d = readU32BE(buf, p);
+  return d === 0xFFFFFFFF ? null : d;
+}
+
 function _parseSampleTables(buf, stbl, t) {
   var F = function (type) { return findBox(buf, stbl.dataStart, stbl.end, type); };
   var stsz = F('stsz'), stz2 = F('stz2'), stsc = F('stsc'), stco = F('stco') || F('co64');
@@ -769,10 +935,12 @@ function _parseSampleTables(buf, stbl, t) {
   if (stsz) {
     p = fullBoxHeader(buf, stsz).dataStart;
     var fixed = readU32BE(buf, p); n = readU32BE(buf, p + 4); p += 8;
+    if (!fixed) n = _entries(n, p, stsz.end, 4);
     for (i = 0; i < n; i++) { sizes.push(fixed || readU32BE(buf, p)); if (!fixed) p += 4; }
   } else {
     p = fullBoxHeader(buf, stz2).dataStart;
     var field = buf[p + 3]; n = readU32BE(buf, p + 4); p += 8;
+    n = Math.min(n, Math.max(0, Math.floor((stz2.end - p) * 8 / (field === 4 ? 4 : field === 8 ? 8 : 16))));
     for (i = 0; i < n; i++) {
       if (field === 4) sizes.push((i & 1) ? (buf[p + (i >> 1)] & 0x0F) : (buf[p + (i >> 1)] >> 4));
       else if (field === 8) sizes.push(buf[p + i]);
@@ -784,16 +952,19 @@ function _parseSampleTables(buf, stbl, t) {
   var chunks = [];
   var ch = fullBoxHeader(buf, stco), cp = ch.dataStart, cn = readU32BE(buf, cp); cp += 4;
   var wide = stco.type === 'co64';
+  cn = _entries(cn, cp, stco.end, wide ? 8 : 4);
   for (i = 0; i < cn; i++) { chunks.push(wide ? readU64BE(buf, cp) : readU32BE(buf, cp)); cp += wide ? 8 : 4; }
 
   // samples per chunk
   var sc = fullBoxHeader(buf, stsc), sp = sc.dataStart, sn = readU32BE(buf, sp); sp += 4;
+  sn = _entries(sn, sp, stsc.end, 12);
   var runs = [];
   for (i = 0; i < sn; i++) { runs.push({ first: readU32BE(buf, sp), per: readU32BE(buf, sp + 4) }); sp += 12; }
 
   // durations / decode times
   var deltas = [];
   var tt = fullBoxHeader(buf, stts), tp = tt.dataStart, tn = readU32BE(buf, tp); tp += 4;
+  tn = _entries(tn, tp, stts.end, 8);
   for (i = 0; i < tn; i++) {
     var cnt = readU32BE(buf, tp), dl = readU32BE(buf, tp + 4); tp += 8;
     for (var k = 0; k < cnt && deltas.length < n; k++) deltas.push(dl);
@@ -815,6 +986,7 @@ function _parseSampleTables(buf, stbl, t) {
   if (ctts) {
     ctos = [];
     var ct = fullBoxHeader(buf, ctts), op = ct.dataStart, on = readU32BE(buf, op); op += 4;
+    on = _entries(on, op, ctts.end, 8);
     for (i = 0; i < on; i++) {
       var oc = readU32BE(buf, op), ov = readS32BE(buf, op + 4); op += 8;
       for (var m = 0; m < oc && ctos.length < n; m++) ctos.push(ov);
@@ -826,6 +998,7 @@ function _parseSampleTables(buf, stbl, t) {
   if (stss) {
     sync = new Uint8Array(n);
     var ss = fullBoxHeader(buf, stss), xp = ss.dataStart, xn = readU32BE(buf, xp); xp += 4;
+    xn = _entries(xn, xp, stss.end, 4);
     for (i = 0; i < xn; i++) { var num = readU32BE(buf, xp) - 1; xp += 4; if (num >= 0 && num < n) sync[num] = 1; }
   }
 
@@ -879,7 +1052,7 @@ function _addFragments(tracks, moofs, trex) {
   var byId = {};
   tracks.forEach(function (t) { byId[t.id] = t; t._fragDts = t.dts.length ? t.dts[t.dts.length - 1] + t.dur[t.dur.length - 1] : 0; });
   moofs.forEach(function (m) {
-    var buf = m.bytes, moof = readBoxHeader(buf, 0, buf.length, false);
+    var buf = m.bytes, moof = readBoxHeader(buf, 0, buf.length, true);
     if (!moof) return;
     var prevEnd = m.box.start;   // no base offset, not the first traf: after the previous one's data
     findBoxes(buf, moof.dataStart, moof.end, 'traf').forEach(function (traf, ti) {
@@ -918,14 +1091,18 @@ function _addFragments(tracks, moofs, trex) {
 
 // ── The track as the caller sees it ──
 
-function _finishTrack(t) {
-  var n = t.off.length, bytes = 0;
-  for (var i = 0; i < n; i++) bytes += t.size[i];
+function _finishTrack(t, fragmented) {
+  var n = t.off.length, bytes = 0, ticks = 0;
+  for (var i = 0; i < n; i++) { bytes += t.size[i]; ticks += t.dur[i]; }
   t.sampleCount = n;
+  t.sampleTicks = ticks;
   if (n) {
     var last = t.dts[n - 1] + t.dur[n - 1];
     var us = Math.round((last - t.mediaStart) * 1e6 / t.timescale) + t.leadUs;
-    if (us > 0 && (!t.durationUs || t.durationUs < us / 2)) t.durationUs = us;
+    // A fragmented file's mdhd covers the moov's samples only (§8.8.1):
+    // once fragments go past it, what's indexed is the duration. It kept
+    // the mdhd's (400 ms for 20 samples of 40 ms).
+    if (us > 0 && (!t.durationUs || t.durationUs < us / 2 || (fragmented && us > t.durationUs))) t.durationUs = us;
   }
   t.bitrate = t.durationUs ? Math.round(bytes * 8 * 1e6 / t.durationUs) : 0;
   // The first shown time: the smallest pts of the first samples (B-frames
@@ -950,8 +1127,11 @@ function _publicTrack(t) {
   if (t.type === 'video') {
     p.codedWidth = t.codedWidth; p.codedHeight = t.codedHeight;
     p.displayWidth = t.displayWidth; p.displayHeight = t.displayHeight;
-    p.rotation = t.rotation; p.colorSpace = t.colorSpace;
-    p.frameRate = t.durationUs ? Math.round(t.sampleCount * 1e6 / t.durationUs * 100) / 100 : 0;
+    p.rotation = t.rotation; p.flip = t.flip; p.colorSpace = t.colorSpace;
+    // Samples per second of their own durations (FFmpeg's avg_frame_rate).
+    // It was sampleCount / durationUs — the mdhd duration, which FFmpeg
+    // makes include the B-frame delay: 24.04 for a 25 fps file.
+    p.frameRate = t.sampleTicks ? Math.round(t.sampleCount * t.timescale / t.sampleTicks * 100) / 100 : 0;
     if (t.codec) {
       p.config = { codec: t.codec, codedWidth: t.codedWidth, codedHeight: t.codedHeight };
       if (t.description) p.config.description = t.description;

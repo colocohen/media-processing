@@ -15,7 +15,7 @@ import {
   exitError, failCoder, notConfiguredError, detachCoderListeners, addPendingFlush, removePendingFlush, rejectPendingFlushes,
 } from './base_coder.js';
 import FFmpegProcess from './ffmpeg_process.js';
-import { frameByteSize } from './core/frame_size.js';
+import { frameByteSize, formatPlanes } from './core/frame_size.js';
 import { EncodedVideoChunk } from './encoded_chunk.js';
 import { getVideoCodec } from './codecs.js';
 import { markEncoderFailed } from './hw_accel.js';
@@ -65,31 +65,40 @@ var SVC_PATTERNS = {
   'L1T3': { tid: [0, 2, 1, 2], keyExpr: 'eq(mod(n,2),0)', layers: 3 },
 };
 
-// Bytes per pixel for format validation.
+// VideoFrame format → FFmpeg -pixel_format. The frame's byte size comes
+// from core/frame_size.js (one table for VideoFrame, encoder, decoder); a
+// format with no entry here is not encodable. There used to be a second
+// table, _FORMAT_BPP, kept "in sync" with VideoFrame by hand — it already
+// drifted once (I422/I444) and again when VideoFrame gained the W3C P10 /
+// P12 formats, which encode() then rejected as "unsupported format".
 //
-// MUST stay in sync with FORMAT_BPP in video_frame.js. They diverged
-// once already: MP-34 added I422/I422A/I444/I444A to the VideoFrame
-// constructor but not here, so a perfectly valid I444 frame would
-// construct fine and then be rejected by encode() as "unsupported
-// format". Both tables now list the same keys.
-var _FORMAT_BPP = {
-  // 4:2:0
-  'I420': 1.5, 'YUV420P': 1.5, 'NV12': 1.5, 'I420A': 2.5,
-  // 4:2:2
-  'I422': 2.0, 'I422A': 3.0,
-  // 4:4:4
-  'I444': 3.0, 'I444A': 4.0,
-  // Packed RGB
-  'RGBA': 4, 'RGBX': 4, 'BGRA': 4, 'BGRX': 4, 'RGB24': 3,
-};
-
-// Map VideoFrame format → FFmpeg -pixel_format value
+// The X byte of RGBX / BGRX is padding, not alpha: rgb0 / bgr0 (it was
+// passed as rgba / bgra, so an alpha-capable encoder read it as alpha).
+// FFmpeg has no 12-bit 4:2:0 with alpha: I420AP12 goes in as
+// yuva420p16le, its samples scaled up to 16 bits (_to16bit).
 var _FORMAT_TO_FFMPEG = {
   'I420': 'yuv420p', 'YUV420P': 'yuv420p', 'NV12': 'nv12', 'I420A': 'yuva420p',
   'I422': 'yuv422p', 'I422A': 'yuva422p',
   'I444': 'yuv444p', 'I444A': 'yuva444p',
-  'RGBA': 'rgba', 'RGBX': 'rgba', 'BGRA': 'bgra', 'BGRX': 'bgra', 'RGB24': 'rgb24',
+  'I420P10': 'yuv420p10le', 'I420AP10': 'yuva420p10le',
+  'I422P10': 'yuv422p10le', 'I422AP10': 'yuva422p10le',
+  'I444P10': 'yuv444p10le', 'I444AP10': 'yuva444p10le',
+  'I420P12': 'yuv420p12le', 'I420AP12': 'yuva420p16le',
+  'I422P12': 'yuv422p12le', 'I422AP12': 'yuva422p12le',
+  'I444P12': 'yuv444p12le', 'I444AP12': 'yuva444p12le',
+  'RGBA': 'rgba', 'RGBX': 'rgb0', 'BGRA': 'bgra', 'BGRX': 'bgr0', 'RGB24': 'rgb24',
 };
+
+// 12-bit little-endian samples → 16-bit (v << 4 | v >> 8: 4095 → 65535).
+function _to16bit(data) {
+  var out = new Uint8Array(data.length);
+  for (var i = 0; i + 1 < data.length; i += 2) {
+    var v = (data[i] | (data[i + 1] << 8)) & 0x0FFF;
+    v = (v << 4) | (v >> 8);
+    out[i] = v & 0xFF; out[i + 1] = v >> 8;
+  }
+  return out;
+}
 
 /**
  * Merge our own video filters into whatever -vf the codec definition
@@ -882,8 +891,7 @@ VideoEncoder.prototype.encode = function (frame, options) {
 
   // Auto-detect pixel format from frame (browser compat: accept any format)
   var fmt = (frame.format || 'I420').toUpperCase();
-  var bpp = _FORMAT_BPP[fmt];
-  if (!bpp) {
+  if (!_FORMAT_TO_FFMPEG[fmt] || !formatPlanes(fmt)) {
     this._error(new Error('VideoEncoder.encode: unsupported format "' + fmt + '"'));
     return;
   }
@@ -976,7 +984,7 @@ VideoEncoder.prototype.encode = function (frame, options) {
   // later frame in another format of the same size (I420 then RGBA) was
   // read with the old layout — 5 RGBA frames came out as 13 chunks of
   // garbage with invented timestamps. A change restarts, like a resize.
-  var _pix = _FORMAT_TO_FFMPEG[fmt] || 'yuv420p';
+  var _pix = _FORMAT_TO_FFMPEG[fmt];
   if (this._inputPixelFormat && _pix !== this._inputPixelFormat) geometryChanged = true;
   this._inputPixelFormat = _pix;
 
@@ -1129,9 +1137,10 @@ VideoEncoder.prototype.encode = function (frame, options) {
   if (!this._ffmpeg.running) this._startFFmpeg();
 
   // Buffer frames during HW probe for potential replay
+  var pixels = fmt === 'I420AP12' ? _to16bit(frame.data) : frame.data;
   if (this._hwProbing) {
-    var copy = new Uint8Array(frame.data.length);
-    copy.set(frame.data);
+    var copy = new Uint8Array(pixels.length);
+    copy.set(pixels);
     this._pendingWrites.push(copy);
   }
 
@@ -1174,7 +1183,7 @@ VideoEncoder.prototype.encode = function (frame, options) {
   this._ffmpeg._totalInputs++;
 
   this._queueSize++;
-  var ok = this._ffmpeg.write(frame.data);
+  var ok = this._ffmpeg.write(pixels);
   this._encodeCount++;
   this.context.frameCount = this._encodeCount;
 

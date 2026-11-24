@@ -96,6 +96,11 @@ TSReader.prototype._handlePacket = function (pkt) {
   var pid = ((pkt[1] & 0x1F) << 8) | pkt[2];
   var pusi = !!(pkt[1] & 0x40);
   var afl = (pkt[3] >> 4) & 0x03;
+  // adaptation_field_control 00 is reserved — "decoders shall discard"
+  // such packets (§2.4.3.3) — and 10 is an adaptation field with no
+  // payload. Both used to go on as payload: a reserved packet's 184
+  // bytes were appended to the PES in progress.
+  if (!(afl & 1)) return;
   var off = 4;
   if (afl === 2 || afl === 3) {
     off += 1 + pkt[off];
@@ -109,11 +114,9 @@ TSReader.prototype._handlePacket = function (pkt) {
   // access unit of the probe stream (3531 → 3715 bytes, a corrupt frame).
   // Only an identical repeat counts: a muxer that gets the counter wrong
   // (all zeros) must not lose real packets.
-  if (afl & 1) {
-    var cc = pkt[3] & 0x0F, prev = this._lastCC[pid];
-    if (prev && prev[0] === cc && _same(prev[1], pkt)) return;
-    this._lastCC[pid] = [cc, pkt];
-  }
+  var cc = pkt[3] & 0x0F, prev = this._lastCC[pid];
+  if (prev && prev[0] === cc && _same(prev[1], pkt)) return;
+  this._lastCC[pid] = [cc, pkt];
 
   if (pid === 0x0000) { this._parsePSI(payload, pusi, 'pat'); return; }
   if (this._pmtPid !== null && pid === this._pmtPid) { this._parsePSI(payload, pusi, 'pmt'); return; }
@@ -156,6 +159,9 @@ TSReader.prototype._sectionReady = function (type) {
   var total = 3 + (((sec[1] & 0x0F) << 8) | sec[2]);
   if (sec.length < total) return;
   this._psi[type] = null;
+  // current_next_indicator 0: a table sent ahead, "not yet applicable"
+  // (§2.4.4.5) — it was applied at once, PIDs and all.
+  if (total < 6 || !(sec[5] & 0x01)) return;
   if (type === 'pat') this._parsePATSection(sec.subarray(0, total));
   else this._parsePMTSection(sec.subarray(0, total));
 };
@@ -196,8 +202,11 @@ TSReader.prototype._parsePMTSection = function (sec) {
     var esInfoLen = ((sec[i + 3] & 0x0F) << 8) | sec[i + 4];
     // Video: H.264=0x1B, H.265=0x24
     if ((streamType === 0x1B || streamType === 0x24) && this._videoPid === null) { this._videoPid = elemPid; this._videoType = streamType; }
-    // Audio: AAC=0x0F, AAC-LATM=0x11
-    if ((streamType === 0x0F || streamType === 0x11) && this._audioPid === null) this._audioPid = elemPid;
+    // Audio: AAC in ADTS (0x0F). 0x11 is AAC in LATM/LOAS, which this
+    // reader cannot parse (no ADTS sync word): it used to be taken as the
+    // audio PID too, so its stream gave no frames and an ADTS track listed
+    // after it was never read.
+    if (streamType === 0x0F && this._audioPid === null) this._audioPid = elemPid;
     i += 5 + esInfoLen;
   }
 };
@@ -314,6 +323,8 @@ TSReader.prototype._processVideoES = function (es, pts) {
   // For now we treat the whole PES as one AU; if we ever encounter
   // such streams we can add a secondary AUD-based split as a
   // refinement. Empirically WebRTC-style streams are 1:1.
+  // A PES with no payload is no access unit (it went out as a 0-byte frame).
+  if (!es.length) return;
   var au = es.slice();
   // The PMT's stream_type says which codec this is. Every PES used to go
   // through the H.264 IDR test, which reads an H.265 NAL header wrong
@@ -361,7 +372,10 @@ TSReader.prototype._processAudioES = function (es, pts) {
     // PTS drift when the stream rate differs from this._sampleRate
     // (e.g. caller passed 48000 but stream is 44100) — see MP-32.
     var info = parseAdtsHeader(es.subarray(pos, pos + 9));
-    if (!info || !info.frameLength) { pos++; continue; }
+    // frame_length counts the header (7 bytes, 9 with a CRC): one shorter
+    // is no frame (ISO/IEC 14496-3 §1.A.2.2.1). It was taken as one — a
+    // 3-byte 'frame' — and the scan went on inside the header.
+    if (!info || info.frameLength < (info.protectionAbsent ? 7 : 9)) { pos++; continue; }
     if (pos + info.frameLength > es.length) break;
 
     var frame = es.slice(pos, pos + info.frameLength);

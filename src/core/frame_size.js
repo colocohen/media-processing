@@ -12,50 +12,49 @@
  * a decoder at 321x241 cut FFmpeg's 116323-byte frames every 116041
  * bytes, so from the second frame on each one was shifted.
  *
- * Plane spec: { offset, stride, pixBytes, subX, subY, rows }.
+ * Plane spec: { offset, stride, pixBytes, subX, subY, rows } — pixBytes is
+ * the bytes per sample position (2 for NV12's UV pair and for the 16-bit
+ * P10 / P12 samples).
  */
 
+// Per format, the planes as [subX, subY, sampleBytes]: the horizontal and
+// vertical sub-sampling factors and the bytes per sample position (2 for
+// NV12's interleaved UV pair, 4 for RGBA). The P10 / P12 formats store
+// each sample as a 16-bit little-endian integer (W3C VideoPixelFormat).
+// RGB24 and YUV420P are this library's non-W3C extensions.
+var FORMAT_PLANES = {};
+(function () {
+  var families = { I420: [2, 2], I422: [2, 1], I444: [1, 1] };
+  Object.keys(families).forEach(function (fam) {
+    var sx = families[fam][0], sy = families[fam][1];
+    [['', 1], ['P10', 2], ['P12', 2]].forEach(function (d) {
+      var b = d[1];
+      FORMAT_PLANES[fam + d[0]] = [[1, 1, b], [sx, sy, b], [sx, sy, b]];
+      FORMAT_PLANES[fam + 'A' + d[0]] = [[1, 1, b], [sx, sy, b], [sx, sy, b], [1, 1, b]];
+    });
+  });
+  FORMAT_PLANES.YUV420P = FORMAT_PLANES.I420;
+  FORMAT_PLANES.NV12 = [[1, 1, 1], [2, 2, 2]];
+  FORMAT_PLANES.RGBA = FORMAT_PLANES.RGBX = FORMAT_PLANES.BGRA = FORMAT_PLANES.BGRX = [[1, 1, 4]];
+  FORMAT_PLANES.RGB24 = [[1, 1, 3]];
+})();
+
+/** The [subX, subY, sampleBytes] of each plane of `fmt`, or null. */
+function formatPlanes(fmt) {
+  return Object.prototype.hasOwnProperty.call(FORMAT_PLANES, fmt) ? FORMAT_PLANES[fmt] : null;
+}
+
 function planeSpecs(fmt, w, h) {
-  var cw = Math.ceil(w / 2), ch = Math.ceil(h / 2), y = w * h;
-  var Y = { offset: 0, stride: w, pixBytes: 1, subX: 1, subY: 1, rows: h };
-  switch (fmt) {
-    case 'I420': case 'YUV420P':
-      return [Y,
-        { offset: y,           stride: cw, pixBytes: 1, subX: 2, subY: 2, rows: ch },
-        { offset: y + cw * ch, stride: cw, pixBytes: 1, subX: 2, subY: 2, rows: ch }];
-    case 'I420A':
-      return [Y,
-        { offset: y,               stride: cw, pixBytes: 1, subX: 2, subY: 2, rows: ch },
-        { offset: y + cw * ch,     stride: cw, pixBytes: 1, subX: 2, subY: 2, rows: ch },
-        { offset: y + 2 * cw * ch, stride: w,  pixBytes: 1, subX: 1, subY: 1, rows: h }];
-    case 'NV12':
-      // Interleaved UV: one plane, two bytes per chroma sample pair.
-      return [Y, { offset: y, stride: 2 * cw, pixBytes: 2, subX: 2, subY: 2, rows: ch }];
-    case 'I422':
-      return [Y,
-        { offset: y,          stride: cw, pixBytes: 1, subX: 2, subY: 1, rows: h },
-        { offset: y + cw * h, stride: cw, pixBytes: 1, subX: 2, subY: 1, rows: h }];
-    case 'I422A':
-      return [Y,
-        { offset: y,              stride: cw, pixBytes: 1, subX: 2, subY: 1, rows: h },
-        { offset: y + cw * h,     stride: cw, pixBytes: 1, subX: 2, subY: 1, rows: h },
-        { offset: y + 2 * cw * h, stride: w,  pixBytes: 1, subX: 1, subY: 1, rows: h }];
-    case 'I444':
-      return [Y,
-        { offset: y,     stride: w, pixBytes: 1, subX: 1, subY: 1, rows: h },
-        { offset: 2 * y, stride: w, pixBytes: 1, subX: 1, subY: 1, rows: h }];
-    case 'I444A':
-      return [Y,
-        { offset: y,     stride: w, pixBytes: 1, subX: 1, subY: 1, rows: h },
-        { offset: 2 * y, stride: w, pixBytes: 1, subX: 1, subY: 1, rows: h },
-        { offset: 3 * y, stride: w, pixBytes: 1, subX: 1, subY: 1, rows: h }];
-    case 'RGBA': case 'RGBX': case 'BGRA': case 'BGRX':
-      return [{ offset: 0, stride: w * 4, pixBytes: 4, subX: 1, subY: 1, rows: h }];
-    case 'RGB24':
-      return [{ offset: 0, stride: w * 3, pixBytes: 3, subX: 1, subY: 1, rows: h }];
-    default:
-      return null;
+  var planes = formatPlanes(fmt);
+  if (!planes) return null;
+  var out = [], offset = 0;
+  for (var i = 0; i < planes.length; i++) {
+    var sx = planes[i][0], sy = planes[i][1], b = planes[i][2];
+    var stride = Math.ceil(w / sx) * b, rows = Math.ceil(h / sy);
+    out.push({ offset: offset, stride: stride, pixBytes: b, subX: sx, subY: sy, rows: rows });
+    offset += stride * rows;
   }
+  return out;
 }
 
 /** Bytes of a tightly packed w x h frame in `fmt`, or 0 for an unknown format. */
@@ -73,4 +72,4 @@ function planeLayout(fmt, w, h) {
   return planes.map(function (p) { return { offset: p.offset, stride: p.stride }; });
 }
 
-export { planeSpecs, frameByteSize, planeLayout };
+export { planeSpecs, frameByteSize, planeLayout, formatPlanes };

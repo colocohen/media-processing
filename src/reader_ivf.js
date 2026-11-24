@@ -152,7 +152,12 @@ function _keyAV1(buf) {
       var show = r.rb(1); if (show === null) return false;
       if (show === 1) return false;
       var ft = r.rb(2); if (ft === null) return false;
-      return (ft === 0 || ft === 2);
+      // KEY_FRAME (0) only. INTRA_ONLY_FRAME (2) was counted too, but it
+      // does not reset the reference frames and a stream cannot start on
+      // it (AV1 §7.5: the first frame must be a KEY_FRAME) — a 'key' chunk
+      // a decoder could not begin with. FFmpeg's av1_parser marks only
+      // KEY_FRAME as a keyframe.
+      return ft === 0;
     }
     p = end;
   }
@@ -194,14 +199,21 @@ function _parseObu(buf, off) {
   return { type: type, hdrBytes: hdrBytes, temporalId: temporalId, spatialId: spatialId };
 }
 
+// leb128 (AV1 §4.10.5): at most 8 bytes, and a value over 2^32 - 1 is
+// not conformant. The value was assembled with `|=` / `<<`, i.e. in 32
+// signed bits: a size of 2^31 or more came out negative, and the callers
+// then walked backwards through the buffer (a negative end passed their
+// `end > length` check); a 9-byte encoding was accepted, and a truncated
+// one returned a partial value. Now null for all three.
 function _leb128(buf, off) {
-  var val = 0, shift = 0, bytes = 0;
-  while (off + bytes < buf.length) {
-    var b = buf[off + bytes]; val |= ((b & 0x7F) << shift); bytes++;
-    if (!(b & 0x80)) break;
-    shift += 7; if (bytes > 8) return null;
+  var val = 0;
+  for (var i = 0; i < 8; i++) {
+    if (off + i >= buf.length) return null;
+    var b = buf[off + i];
+    val += (b & 0x7F) * Math.pow(2, 7 * i);
+    if (!(b & 0x80)) return val > 0xFFFFFFFF ? null : { value: val, bytes: i + 1 };
   }
-  return { value: val, bytes: bytes };
+  return null;
 }
 
 /**

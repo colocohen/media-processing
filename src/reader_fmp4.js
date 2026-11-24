@@ -20,7 +20,7 @@
  */
 
 import EventEmitter from './core/events.js';
-import { readU32BE, readU64BE, toAscii, concat } from './core/bytes.js';
+import { readU32BE, readS32BE, readU64BE, toAscii, concat } from './core/bytes.js';
 import { findBox, findBoxes, findPath, parseTfhd, parseTfdt, parseTrun, isSyncSampleFlags } from './utils/iso_bmff.js';
 import ByteQueue from './core/byte_queue.js';
 
@@ -121,13 +121,15 @@ FMP4Reader.prototype._parseInitSegment = function (buf) {
   if (readU32BE(buf, 0) === 1) moov.dataStart = 16;
   var mvhd = findBox(buf, moov.dataStart, moov.end, 'mvhd');
   if (mvhd) {
-    var ver = buf[mvhd.dataStart];
-    if (ver === 0 && mvhd.dataStart + 20 <= buf.length) {
-      this._timescale = readU32BE(buf, mvhd.dataStart + 12);
-    } else if (ver === 1 && mvhd.dataStart + 28 <= buf.length) {
-      this._timescale = readU32BE(buf, mvhd.dataStart + 20);
-    }
+    // A timescale of 0 is not one (§8.2.2.3: "the number of time units
+    // that pass in one second"): it was taken, and every time divided by
+    // it came out NaN.
+    var ver = buf[mvhd.dataStart], mts = 0;
+    if (ver === 0 && mvhd.dataStart + 20 <= buf.length) mts = readU32BE(buf, mvhd.dataStart + 12);
+    else if (ver === 1 && mvhd.dataStart + 28 <= buf.length) mts = readU32BE(buf, mvhd.dataStart + 20);
+    if (mts) this._timescale = mts;
   }
+  var movieTimescale = this._timescale;   // elst segment_duration is in it
   // Every trak, by track_ID. Only the first trak's mdhd was read, and
   // every sample was timed with it and emitted as 'video': with the audio
   // track first (track 1, 48 kHz) the 142 AAC frames came out as 'video'
@@ -145,7 +147,10 @@ FMP4Reader.prototype._parseInitSegment = function (buf) {
       id: id, timescale: ts || self._timescale,
       type: handler === 'vide' ? 'video' : handler === 'soun' ? 'audio' : 'other',
       defaultDuration: null, defaultSize: null, defaultFlags: null, nextDts: 0,
+      editTicks: 0,
     };
+    var elst = findPath(buf, trak, 'edts/elst');
+    if (elst) t.editTicks = _editShift(buf, elst, t.timescale, movieTimescale);
     self._tracks[id] = t;
     if (!first) first = t;
     if (!firstVideo && t.type === 'video') firstVideo = t;
@@ -189,7 +194,7 @@ FMP4Reader.prototype._parseMediaSegment = function (moofBuf, moofStart, mdat, md
       // No moov seen (fed from a segment on): one video track, as before.
       track = this._tracks[tfhd.trackId] = {
         id: tfhd.trackId, type: 'video', timescale: this._timescale,
-        defaultDuration: null, defaultSize: null, defaultFlags: null, nextDts: 0,
+        defaultDuration: null, defaultSize: null, defaultFlags: null, nextDts: 0, editTicks: 0,
       };
     }
     var defaultDur   = _first(tfhd.defaultSampleDuration, track.defaultDuration, this._defaultSampleDuration);
@@ -217,9 +222,11 @@ FMP4Reader.prototype._parseMediaSegment = function (moofBuf, moofStart, mdat, md
         var size = t.size != null ? t.size : defaultSize;
         var at = dataPos - mdatStart;
         dataPos += size;
-        var ptsUs = Math.round((time + t.compositionOffset) * 1e6 / track.timescale);
-        var dtsUs = Math.round(time * 1e6 / track.timescale);
-        var endUs = Math.round((time + dur) * 1e6 / track.timescale);
+        // Presentation time is media time through the edit list (§8.6.6).
+        var shifted = time + track.editTicks;
+        var ptsUs = Math.round((shifted + t.compositionOffset) * 1e6 / track.timescale);
+        var dtsUs = Math.round(shifted * 1e6 / track.timescale);
+        var endUs = Math.round((shifted + dur) * 1e6 / track.timescale);
         time += dur;
         if (at < 0 || at + size > mdat.length) continue;   // not in this mdat
         any = true;
@@ -247,6 +254,37 @@ FMP4Reader.prototype._parseMediaSegment = function (moofBuf, moofStart, mdat, md
   }
   if (!any) this._ee.emit('segment', { payload: concat([moofBuf, mdat]) });
 };
+
+/**
+ * The edit list's shift from media time to presentation time, in track
+ * ticks (ISO/IEC 14496-12 §8.6.6): leading empty edits (media_time −1)
+ * delay the track by their segment_duration (movie timescale); the first
+ * edit with media then starts presentation at its media_time — the media
+ * before it (AAC / Opus priming, B-frame composition delay) comes out at
+ * negative times, as FFmpeg gives it. The edit list was ignored, so a
+ * track the writer gave an elst of 1024 priming samples started its
+ * audible audio 21 ms late. Later edits (cuts, dwells, rates) are not
+ * applied.
+ */
+function _editShift(buf, elst, trackTimescale, movieTimescale) {
+  var p = elst.dataStart;
+  if (p + 8 > elst.end) return 0;
+  var v1 = buf[p] === 1, n = readU32BE(buf, p + 4), size = v1 ? 20 : 12;
+  p += 8;
+  var empty = 0;
+  for (var i = 0; i < n && p + size <= elst.end; i++, p += size) {
+    var dur = v1 ? readU64BE(buf, p) : readU32BE(buf, p);
+    var mediaTime;
+    if (v1) {
+      var hi = readS32BE(buf, p + 8), lo = readU32BE(buf, p + 12);
+      mediaTime = hi === -1 && lo === 0xFFFFFFFF ? -1 : hi * 4294967296 + lo;
+    } else mediaTime = readS32BE(buf, p + 4);
+    if (mediaTime === -1) { empty += dur; continue; }
+    if (mediaTime < 0) return 0;             // not a valid media_time
+    return (movieTimescale ? empty * trackTimescale / movieTimescale : 0) - mediaTime;
+  }
+  return 0;
+}
 
 function _first(a, b, c) { return a != null ? a : b != null ? b : c; }
 

@@ -36,7 +36,10 @@ ADTSReader.prototype.feed = function (chunk) {
     }
 
     var info = parseAdtsHeader(hdr);
-    if (!info || !info.frameLength) {
+    // frame_length counts the header (7 bytes, 9 with a CRC): a shorter
+    // one is no frame (ISO/IEC 14496-3 §1.A.2.2.1) — it went out as a
+    // 3-byte frame, cut from the middle of its own header.
+    if (!info || info.frameLength < (info.protectionAbsent ? 7 : 9)) {
       // Malformed header — skip a byte and try again
       this._q.discard(1);
       continue;

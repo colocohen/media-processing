@@ -309,15 +309,21 @@ function _blankLike(kind, src) {
   if (!src) return null;
   try {
     if (kind === 'video') {
-      var w = src.codedWidth, h = src.codedHeight;
+      // The visible size (a decoder's frame may have a padded coded
+      // size), the orientation, and the display size only as a pair: W3C
+      // requires both or neither, and one alone made the constructor
+      // throw, so the frame went out unblanked.
+      var vr = src.visibleRect;
+      var w = (vr && vr.width) || src.codedWidth, h = (vr && vr.height) || src.codedHeight;
       if (!w || !h) return null;
       var ySize = w * h, cSize = Math.ceil(w / 2) * Math.ceil(h / 2);
       var buf = new Uint8Array(ySize + 2 * cSize);
       buf.fill(128, ySize);
       var init = { format: 'I420', codedWidth: w, codedHeight: h, timestamp: src.timestamp || 0 };
       if (typeof src.duration === 'number') init.duration = src.duration;
-      if (src.displayWidth) init.displayWidth = src.displayWidth;
-      if (src.displayHeight) init.displayHeight = src.displayHeight;
+      if (src.displayWidth && src.displayHeight) { init.displayWidth = src.displayWidth; init.displayHeight = src.displayHeight; }
+      if (typeof src.rotation === 'number') init.rotation = src.rotation;
+      if (typeof src.flip === 'boolean') init.flip = src.flip;
       return new VideoFrame(buf, init);
     }
     var fmt = src.format || 's16';

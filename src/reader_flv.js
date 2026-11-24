@@ -27,7 +27,7 @@
  * the ones from the sequence header are inserted after the AUD — what
  * h264_mp4toannexb / hevc_mp4toannexb did on the old path.
  *
- * Events: 'video' {payload, isKeyframe, ptsUs, index, groupId},
+ * Events: 'video' {payload, isKeyframe, ptsUs, dtsUs, index, groupId},
  *         'flushed' after flush().
  */
 
@@ -93,14 +93,14 @@ FLVReader.prototype.feed = function (chunk) {
 
 FLVReader.prototype._videoTag = function (body, tsMs) {
   var b0 = body[0];
-  var frameType, pktType, data;
+  var frameType, pktType, data, cts = 0;
   if (b0 & 0x80) {
     // Enhanced RTMP: [1|frameType:3|packetType:4][fourcc:4][CTS:3 if CodedFrames]
     frameType = (b0 >> 4) & 7;
     pktType = b0 & 0x0f;
     if (body.length < 5) return;
     if (pktType === PKT_SEQUENCE_START) data = body.subarray(5);
-    else if (pktType === PKT_CODED_FRAMES) data = body.subarray(8);
+    else if (pktType === PKT_CODED_FRAMES) { if (body.length < 8) return; cts = _si24(body, 5); data = body.subarray(8); }
     else if (pktType === PKT_CODED_FRAMES_X) data = body.subarray(5);
     else return;   // metadata, sequence end, ...
     if (pktType !== PKT_SEQUENCE_START) pktType = PKT_CODED_FRAMES;
@@ -112,6 +112,7 @@ FLVReader.prototype._videoTag = function (body, tsMs) {
     if (body.length < 5) return;
     pktType = body[1];          // 0 = sequence header, 1 = NALUs, 2 = end
     if (pktType !== PKT_SEQUENCE_START && pktType !== PKT_CODED_FRAMES) return;
+    cts = _si24(body, 2);
     data = body.subarray(5);
   }
 
@@ -133,10 +134,16 @@ FLVReader.prototype._videoTag = function (body, tsMs) {
   var payload = this._toAccessUnit(avccToAnnexb(data, this._lengthSize), isKey);
   if (!payload.length) return;
   if (isKey) this._groupId++;
+  // The tag timestamp is the DECODE time; the presentation time adds the
+  // packet's CompositionTime (FLV spec AVCVIDEOPACKET; Enhanced RTMP
+  // CodedFrames — CodedFramesX has none). It went out as the PTS, so with
+  // B-frames every frame was stamped in decode order (FFmpeg: 0.08, 0.2,
+  // 0.12 s; here 0, 0.04, 0.08).
   this._ee.emit('video', {
     payload: payload,
     isKeyframe: isKey,
-    ptsUs: tsMs * 1000,
+    ptsUs: (tsMs + cts) * 1000,
+    dtsUs: tsMs * 1000,
     index: this._index++,
     groupId: this._groupId,
   });
@@ -180,6 +187,12 @@ FLVReader.prototype.flush = function () {
   this._end = 0;
   this._ee.emit('flushed');
 };
+
+// A signed 24-bit big-endian integer (the CompositionTime field).
+function _si24(b, o) {
+  var v = (b[o] << 16) | (b[o + 1] << 8) | b[o + 2];
+  return v & 0x800000 ? v - 0x1000000 : v;
+}
 
 FLVReader.prototype._append = function (chunk) {
   if (this._start > (this._buf.length >> 1)) {

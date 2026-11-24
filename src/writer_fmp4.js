@@ -49,7 +49,7 @@
  */
 
 import { writeU16BE, writeU32BE, writeU64BE, concat, fromAscii } from './core/bytes.js';
-import { getOpusPacketDurationUs } from './utils/opus_utils.js';
+import { getOpusPacketDurationUs, buildOpusHead } from './utils/opus_utils.js';
 
 
 // ── Box helpers ────────────────────────────────────────────
@@ -359,38 +359,47 @@ function _visualSampleEntry(type, width, height, configBox) {
  *     SLConfigDescriptor (tag 0x06)
  *       predefined(1)=0x02
  */
+// A descriptor: tag, then its body length in the expandable form of
+// ISO/IEC 14496-1 §8.3.3 (7 bits per byte, high bit = more bytes follow).
+// The lengths were written as one plain byte, so a body of 128 bytes or
+// more (an AudioSpecificConfig over ~107 bytes, e.g. one carrying a
+// program_config_element) had its high bit read as "continued" and the
+// whole esds was misparsed.
+function _descriptor(tag, body) {
+  var len = [];
+  var n = body.length;
+  do { len.unshift(n & 0x7F); n = Math.floor(n / 128); } while (n > 0);
+  for (var i = 0; i < len.length - 1; i++) len[i] |= 0x80;
+  var out = new Uint8Array(1 + len.length + body.length);
+  out[0] = tag;
+  out.set(len, 1);
+  out.set(body, 1 + len.length);
+  return out;
+}
+
 function _esds(audioSpecificConfig) {
-  var asc = audioSpecificConfig;
-  var ascLen = asc.length;
-  // DecoderSpecificInfo: tag(1) + len(1) + asc
-  var dsi = new Uint8Array(2 + ascLen);
-  dsi[0] = 0x05; dsi[1] = ascLen;
-  dsi.set(asc, 2);
+  // DecoderSpecificInfo (tag 0x05): the AudioSpecificConfig
+  var dsi = _descriptor(0x05, audioSpecificConfig);
 
-  // DecoderConfigDescriptor: tag(1) + len(1) + 13 fixed bytes + dsi
-  var dcdLen = 13 + dsi.length;
-  var dcd = new Uint8Array(2 + dcdLen);
-  dcd[0] = 0x04; dcd[1] = dcdLen;
-  dcd[2] = 0x40;            // objectTypeIndication = MPEG-4 Audio
-  dcd[3] = 0x15;            // streamType = Audio (5) << 2 | upStream(0) | reserved(1)
-  // bufferSizeDB(3) at 4..6 = 0
-  // maxBitrate(4) at 7..10 = 0 (unknown / VBR)
-  // avgBitrate(4) at 11..14 = 0
-  dcd.set(dsi, 15);
+  // DecoderConfigDescriptor (tag 0x04): 13 fixed bytes + dsi
+  var dcdBody = new Uint8Array(13 + dsi.length);
+  dcdBody[0] = 0x40;        // objectTypeIndication = MPEG-4 Audio
+  dcdBody[1] = 0x15;        // streamType = Audio (5) << 2 | upStream(0) | reserved(1)
+  // bufferSizeDB(3) at 2..4 = 0
+  // maxBitrate(4) at 5..8 = 0 (unknown / VBR)
+  // avgBitrate(4) at 9..12 = 0
+  dcdBody.set(dsi, 13);
+  var dcd = _descriptor(0x04, dcdBody);
 
-  // SLConfigDescriptor: tag(1) + len(1) + 1 byte
-  var slc = new Uint8Array([0x06, 0x01, 0x02]);
+  // SLConfigDescriptor (tag 0x06): predefined = 2
+  var slc = _descriptor(0x06, new Uint8Array([0x02]));
 
-  // ES_Descriptor: tag(1) + len(1) + ES_ID(2) + flags(1) + dcd + slc
-  var esdLen = 3 + dcd.length + slc.length;
-  var esd = new Uint8Array(2 + esdLen);
-  esd[0] = 0x03; esd[1] = esdLen;
-  // ES_ID(2) at 2..3 = 0
-  // flags(1) at 4 = 0
-  esd.set(dcd, 5);
-  esd.set(slc, 5 + dcd.length);
+  // ES_Descriptor (tag 0x03): ES_ID(2) = 0, flags(1) = 0, dcd, slc
+  var esdBody = new Uint8Array(3 + dcd.length + slc.length);
+  esdBody.set(dcd, 3);
+  esdBody.set(slc, 3 + dcd.length);
 
-  return _fullBox('esds', 0, 0, esd);
+  return _fullBox('esds', 0, 0, _descriptor(0x03, esdBody));
 }
 
 /**
@@ -483,52 +492,24 @@ function _dOps(opusHead, fallbackChannels, fallbackSampleRate) {
       }
     }
   } else {
-    // No OpusHead: build defaults. PreSkip=312 is the standard pre-skip
-    // for libopus at 48kHz (the encoder's lookahead), used by every
-    // modern Opus encoder including Chrome's WebCodecs implementation.
+    // No OpusHead: the one the encoder would have written. PreSkip=312 is
+    // the standard pre-skip for libopus at 48kHz (the encoder's
+    // lookahead), used by every modern Opus encoder including Chrome's
+    // WebCodecs implementation. The channel mapping comes from
+    // buildOpusHead: family 0 for 1-2 channels, family 1 with libopus'
+    // surround layouts (RFC 7845 §5.1.1.2) for 3-8, family 255 above.
+    // The table here used to be its own: 5.1 as [0,4,1,5,2,3] and 7.1 as
+    // [0,6,1,2,7,3,4,5] (libopus — and FFmpeg's muxer — use
+    // [0,4,1,2,3,5] and [0,6,1,2,3,4,5,7]), all-uncoupled for 3/4/5/7
+    // channels, and family 1 for more than 8 (where it is undefined): a
+    // libopus stream of those layouts decoded with channels swapped.
     channels   = fallbackChannels   || 2;
     preSkip    = 312;
     sampleRate = fallbackSampleRate || 48000;
     outputGain = 0;
-
-    if (channels <= 2) {
-      // 1-2 channels: ChannelMappingFamily=0 is the simplest form
-      // (no mapping table). RFC 7845 §5.1.1 reserves Family=0 for
-      // exactly this — implicit Vorbis-like layout for mono/stereo.
-      family = 0;
-    } else {
-      // 3+ channels: must use Family=1 (Vorbis-style) per RFC 7845.
-      // We build the standard libopus mapping for the most common
-      // multi-channel configurations:
-      //
-      //   5.1 (6ch): streams=4, coupled=2, mapping=[0,4,1,5,2,3]
-      //   7.1 (8ch): streams=5, coupled=3, mapping=[0,6,1,2,7,3,4,5]
-      //
-      // For 3, 4, 5, 7 channels (uncommon), fall back to all-
-      // uncoupled (StreamCount=channels, CoupledCount=0,
-      // mapping=identity). Decoders accept this; producers wanting
-      // better quality should provide their own OpusHead via
-      // setAudioConfig().
-      family = 1;
-      mappingTable = new Uint8Array(2 + channels);
-      if (channels === 6) {
-        mappingTable[0] = 4; mappingTable[1] = 2;
-        mappingTable[2] = 0; mappingTable[3] = 4;
-        mappingTable[4] = 1; mappingTable[5] = 5;
-        mappingTable[6] = 2; mappingTable[7] = 3;
-      } else if (channels === 8) {
-        mappingTable[0] = 5; mappingTable[1] = 3;
-        mappingTable[2] = 0; mappingTable[3] = 6;
-        mappingTable[4] = 1; mappingTable[5] = 2;
-        mappingTable[6] = 7; mappingTable[7] = 3;
-        mappingTable[8] = 4; mappingTable[9] = 5;
-      } else {
-        // Generic: all uncoupled, identity mapping
-        mappingTable[0] = channels;  // StreamCount
-        mappingTable[1] = 0;         // CoupledCount
-        for (var i = 0; i < channels; i++) mappingTable[2 + i] = i;
-      }
-    }
+    var def = buildOpusHead({ channels: channels, preSkip: preSkip, inputSampleRate: sampleRate });
+    family = def[18];
+    if (family !== 0) mappingTable = def.subarray(19, 21 + channels);
   }
 
   var bodySize = 11 + (mappingTable ? mappingTable.length : 0);
@@ -551,6 +532,14 @@ function _dOps(opusHead, fallbackChannels, fallbackSampleRate) {
   return _box('dOps', body);
 }
 
+// The Opus sample entry's channelcount (Opus in ISOBMFF §4.3.1): the
+// stream count plus the coupled count of the mapping table (M + N), or the
+// output channel count for family 0 (no table) — read from a dOps box.
+function _opusChannelCount(dOpsBox) {
+  if (dOpsBox[18] !== 0 && dOpsBox.length >= 21) return dOpsBox[19] + dOpsBox[20];
+  return dOpsBox[9];
+}
+
 /**
  * Opus Sample Entry ('Opus'). Inherits AudioSampleEntry — same 28-byte
  * header as mp4a — but carries dOps instead of esds.
@@ -558,17 +547,16 @@ function _dOps(opusHead, fallbackChannels, fallbackSampleRate) {
  * The HLS / CMAF authoring spec requires this exact layout for Opus
  * audio in fMP4 segments. Codec string in CODECS attribute: "opus".
  */
-function _opusSampleEntry(channels, sampleRate, dOpsBox) {
+function _opusSampleEntry(dOpsBox) {
   var hdr = new Uint8Array(28);
   hdr[6] = 0; hdr[7] = 1;            // data_reference_index = 1
-  writeU16BE(hdr, 16, channels);
+  // Opus in ISOBMFF §4.3.1: channelcount = M + N of the mapping table,
+  // samplesize = 16, samplerate = 48000 << 16 — Opus always decodes at
+  // 48 kHz. Both were the configured channel count / sample rate (so an
+  // Opus track configured at 16000 Hz said 16000, and one at 96000 said 0).
+  writeU16BE(hdr, 16, _opusChannelCount(dOpsBox));
   writeU16BE(hdr, 18, 16);            // samplesize = 16
-  // sample_rate (16.16) — same constraint as _audioSampleEntry: top
-  // 16 bits hold the integer, max representable is 65535. Above that
-  // we leave it 0; dOps's InputSampleRate (32-bit) is authoritative.
-  if (sampleRate <= 0xFFFF) {
-    writeU16BE(hdr, 24, sampleRate);
-  }
+  writeU16BE(hdr, 24, 48000);
   return _box('Opus', concat([hdr, dOpsBox]));
 }
 
@@ -1145,11 +1133,8 @@ FMP4Writer.prototype.writeInit = function () {
       // For Opus the configBytes (when provided) is the OpusHead from
       // the encoder's metadata.decoderConfig.description. _dOps handles
       // both the populated case and the null case (defaults).
-      audioEntry = _opusSampleEntry(
-        audioChannels,
-        audioSampleRate,
-        _dOps(this._audioConfig, audioChannels, audioSampleRate)
-      );
+      var dOps = _dOps(this._audioConfig, audioChannels, audioSampleRate);
+      audioEntry = _opusSampleEntry(dOps);
     } else {
       // AAC: configBytes is AudioSpecificConfig, wrapped in esds.
       audioEntry = _audioSampleEntry(
@@ -1165,11 +1150,21 @@ FMP4Writer.prototype.writeInit = function () {
     // frame), 2048 for HE-AAC (SBR doubles output rate). Without an
     // elst entry telling the player to skip them, the audible audio
     // starts ~21–43 ms later than the first video frame. The caller
-    // (HLSEncoder) sets this from the codec string. Opus handles
-    // its own priming via OpusHead's pre_skip in the dOps box.
-    var encoderDelay = (this._audio.codec === 'aac')
-      ? (this._audio.encoderDelay || 1024)
-      : 0;
+    // (HLSEncoder) sets this from the codec string.
+    //
+    // Opus too: its PreSkip in dOps "is informative only", and "the Edit
+    // Box and the Edit List Box shall be present" with media_time = the
+    // priming samples (Opus in ISOBMFF §4.4). Opus was written without an
+    // edit list, so a player that follows the file format presented the
+    // 312 priming samples (6.5 ms) ahead of the audio. PreSkip counts
+    // 48 kHz samples; media_time is in the track timescale.
+    var encoderDelay;
+    if (this._audio.codec === 'aac') {
+      encoderDelay = this._audio.encoderDelay || 1024;
+    } else {
+      var preSkip48 = (dOps[10] << 8) | dOps[11];   // dOps body: PreSkip at 2..3 (BE), after the 8-byte box header
+      encoderDelay = Math.round(preSkip48 * audioSampleRate / 48000);
+    }
     traks.push(_trak(
       AUDIO_TRACK_ID,
       audioSampleRate,  // audio timescale = sample rate
@@ -1321,7 +1316,10 @@ FMP4Writer.prototype.writeSegment = function (videoChunks, audioChunks, endPtsUs
     // here because encoders occasionally report rounded values that
     // accumulate into A/V drift over long recordings.
     if (this._audioFirstChunkBaseTicks === null) {
-      this._audioFirstChunkBaseTicks = _usToTicks(a[0].ptsUs, aTimescale);
+      // tfdt.baseMediaDecodeTime is unsigned: a negative first PTS (an
+      // encoder stamping its priming frame before 0) was written as
+      // 2^64 - x. The track starts at 0 instead.
+      this._audioFirstChunkBaseTicks = Math.max(0, _usToTicks(a[0].ptsUs, aTimescale));
     }
     audioBaseDts = this._audioFirstChunkBaseTicks + this._audioCumulativeSamples;
     this._audioCumulativeSamples += a.length * samplesPerFrame;
