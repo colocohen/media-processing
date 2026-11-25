@@ -90,7 +90,7 @@ import Playlist from './playlist.js';
 import SegmentBuilder from './segment_builder.js';
 import EventEmitter from './core/events.js';
 import { isValidVideoRange } from './utils/playlist_utils.js';
-import { createEncryptor, ivFromHex, ivToHex } from './encryption.js';
+import { encryptorFromHook, ivFromHex, ivToHex } from './encryption.js';
 import CEA608Encoder, { buildCea608SeiNalu, padCcData } from './cea608_encoder.js';
 import { injectSeiIntoAU, codecStringFromAnnexB, codecStringFromAvcC,
          codecStringFromHvcC } from './utils/nalu_utils.js';
@@ -682,8 +682,9 @@ function HLSEncoder(opts) {
 
   // ── Encryption validation ──
   // Validates the encryption option shape upfront so misconfiguration
-  // surfaces at construction time. The actual key import (Web Crypto)
-  // happens lazily during _ensureConfigured because it's async.
+  // surfaces at construction time. The cipher is the caller's
+  // (encryption.encrypt, a hook: encryption.js); this library does what
+  // the spec asks of the encoder around it.
   if (opts.encryption) {
     var e = opts.encryption;
     if (typeof e !== 'object') {
@@ -692,15 +693,15 @@ function HLSEncoder(opts) {
     if (e.method !== 'AES-128') {
       // Phase 1 supports AES-128 only. SAMPLE-AES needs sample-level
       // encryption (within mdat), which requires a different writer
-      // path. AES-256-GCM is in RFC 8216bis-19 but Web Crypto for it
-      // hasn't shipped uniformly. Both can extend later.
+      // path. AES-256-GCM is in RFC 8216bis-19 and can extend later.
       throw new Error("HLSEncoder: encryption.method must be 'AES-128' " +
                       "(got '" + e.method + "'). SAMPLE-AES and " +
                       "AES-256-GCM are not yet implemented.");
     }
-    if (!(e.key instanceof Uint8Array) || e.key.length !== 16) {
-      throw new Error('HLSEncoder: encryption.key must be Uint8Array(16) ' +
-                      '(raw 128-bit AES key)');
+    if (typeof e.encrypt !== 'function') {
+      throw new Error('HLSEncoder: encryption.encrypt must be a function ' +
+                      '(plaintext, iv, callback(err, ciphertext)) that ' +
+                      'encrypts with AES-128-CBC and PKCS#7 padding');
     }
     if (typeof e.keyUri !== 'string') {
       throw new Error('HLSEncoder: encryption.keyUri (string) required — ' +
@@ -992,9 +993,9 @@ function HLSEncoder(opts) {
   }
 
   // Readiness state — a one-shot transition that completes when all
-  // async setup has finished. Currently the only async setup is
-  // Web Crypto importKey for encryption; for non-encrypted streams
-  // readiness fires as soon as _ensureConfigured runs. The state
+  // async setup has finished. There is none at the moment (the
+  // encryption hook needs no setup): readiness fires on the turn after
+  // _ensureConfigured runs. The state
   // transitions exactly once: null → 'ok' (success) or null → Error
   // (failure). After transition, ready(cb) fires the callback on
   // next tick instead of queuing.
@@ -1638,15 +1639,14 @@ HLSEncoder.prototype.getIFrameStreamInf = function (opts) {
  *
  * "Ready" means: lazy configuration has run (writer + playlist +
  * segment-builder + WebCodecs encoders constructed) AND any async
- * setup steps have completed (currently only the Web Crypto importKey
- * for encryption — for non-encrypted streams readiness fires as soon
- * as setup runs).
+ * setup steps have completed (there are none at the moment: readiness
+ * fires on the turn after setup runs).
  *
  * The callback is invoked exactly once with `(err)`:
  *   - `null` when setup succeeded
- *   - an Error when async setup failed (e.g., bad encryption key,
- *     Web Crypto unavailable). The same error is also emitted via
- *     the 'error' event for listeners using the event-stream model.
+ *   - an Error when async setup failed (none can at the moment). The
+ *     same error is also emitted via the 'error' event for listeners
+ *     using the event-stream model.
  *
  * Calling ready() multiple times registers multiple callbacks; each
  * fires once. Calling after readiness has already resolved fires
@@ -1671,9 +1671,8 @@ HLSEncoder.prototype.ready = function (callback) {
     throw new TypeError('HLSEncoder.ready: callback function required');
   }
 
-  // Trigger configuration if it hasn't run yet. The async setup
-  // inside (encryption key import or the immediate-resolve path)
-  // calls _resolveReady when it completes.
+  // Trigger configuration if it hasn't run yet; it calls
+  // _resolveReady on the next turn.
   this._ensureConfigured();
 
   // Already resolved — fire on next tick to maintain consistent
@@ -1954,11 +1953,7 @@ HLSEncoder.prototype._ensureConfigured = function () {
   }
 
   // 3. SegmentBuilder
-  // Encryption setup. createEncryptor is callback-based; the import
-  // takes negligible wall-clock but is platform-async so we wire it
-  // up declaratively. When the callback fires we attach the encryptor
-  // to the builder via setEncryptor — any segments queued in the
-  // meantime drain at that point.
+  // Encryption setup: the caller's hook, wrapped (encryption.js).
   var encryptionForBuilder = null;
   if (opts.encryption) {
     var ivBytes = null;
@@ -1966,10 +1961,7 @@ HLSEncoder.prototype._ensureConfigured = function () {
       ivBytes = (typeof opts.encryption.iv === 'string') ?
         ivFromHex(opts.encryption.iv) : opts.encryption.iv;
     }
-    // Pre-populate the slot with iv but no encryptor — segment-builder
-    // queues until we call setEncryptor below. Once Web Crypto's
-    // importKey resolves, the queue drains.
-    encryptionForBuilder = { encryptor: null, iv: ivBytes };
+    encryptionForBuilder = { encryptor: encryptorFromHook(opts.encryption.encrypt), iv: ivBytes };
 
     // Wire the EXT-X-KEY directive into the playlist immediately. The
     // tag goes at the top of every serialize() call so even the first
@@ -2002,32 +1994,9 @@ HLSEncoder.prototype._ensureConfigured = function () {
     onError:   function (e) { self._ee.emit('error', e); },
   });
 
-  // Now that the builder exists, trigger the async key import. When
-  // it completes, attach the encryptor and drain any queued work.
-  // Segments produced before this point are buffered in the queue.
-  if (opts.encryption) {
-    createEncryptor({ key: opts.encryption.key }, function (err, encryptor) {
-      if (err) {
-        self._ee.emit('error', err);
-        // Release anything waiting on the encryption queue. Without
-        // this the builder holds queued segments forever and end()
-        // never completes, even though the caller was just told about
-        // the failure.
-        if (self._segmentBuilder && self._segmentBuilder.failEncryption) {
-          self._segmentBuilder.failEncryption(err);
-        }
-        self._resolveReady(err);
-        return;
-      }
-      self._segmentBuilder.setEncryptor(encryptor);
-      self._resolveReady(null);
-    });
-  } else {
-    // No encryption — readiness is achieved as soon as setup runs.
-    // Defer to next tick so ready(cb) callers consistently see async
-    // delivery regardless of whether encryption is configured.
-    setTimeout(function () { self._resolveReady(null); }, 0);
-  }
+  // Readiness: nothing to wait for. Deferred to the next turn so
+  // ready(cb) callers consistently see async delivery.
+  setTimeout(function () { self._resolveReady(null); }, 0);
 
   // 4. WebCodecs encoders
   if (opts.video) this._configureVideoEncoder();

@@ -252,9 +252,11 @@ var ENCODER_ARGS = {
       '-deadline', cfg.latencyMode === 'quality' ? 'good' : 'realtime',
       '-cpu-used', '8', '-lag-in-frames', '0', '-auto-alt-ref', '0',
       '-g', String(cfg.gopSize || 30),
-      '-b:v', cfg.bitrate ? String(cfg.bitrate) : '0',
-      '-crf', String((typeof cfg.crf === 'number') ? cfg.crf : 10),
     ];
+    // bitrateMode as for VP9 (it was ignored here: '-b:v <bitrate> -crf
+    // 10' in every mode, so 'constant' was libvpx's constrained quality,
+    // not CBR, and 'quantizer' still capped the quality at the bitrate).
+    _addBitrateArgs(args, cfg, 10);
     if (cfg.errorResilient) args.push('-error-resilient', '1');
     return { preInput: [], args: args };
   },
@@ -614,6 +616,13 @@ var AUDIO_CODECS = {
       args.push('-fec', '0');
     }
     // (else: leave libopus's default, FEC off)
+    // packetlossperc without FEC: the encoder still uses it (the Opus
+    // registration's packetlossperc stands on its own; libopus' SILK and
+    // CELT lower their inter-frame prediction for it). It was dropped
+    // unless useinbandfec was on.
+    if (!(cfg.useinbandfec === 1 || cfg.useinbandfec === true) && typeof cfg.packetlossperc === 'number') {
+      args.push('-packet_loss', String(Math.max(0, Math.min(100, cfg.packetlossperc))));
+    }
 
     // usedtx: discontinuous transmission. libopus -dtx 1.
     if (cfg.usedtx === 1 || cfg.usedtx === true) {

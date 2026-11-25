@@ -299,7 +299,7 @@ VideoDecoder.prototype._decodeNow = function (chunk) {
     var ivfData;
     if (!this._headerSent) {
       // File header (32) + frame header (12) + payload — single write
-      var fileHdr = this._buildIvfFileHeader();
+      var fileHdr = this._buildIvfFileHeader(chunk.data);
       ivfData = new Uint8Array(32 + 12 + chunk.data.length);
       ivfData.set(fileHdr, 0);
       _writeIvfFrameAt(ivfData, 32, chunk.data.length, this._decodeIndex++);
@@ -658,19 +658,32 @@ VideoDecoder.prototype._applyStreamDimensions = function (w, h, source) {
   for (var i = 0; i < held.length; i++) this._fq.push(held[i]);
 };
 
-VideoDecoder.prototype._buildIvfFileHeader = function () {
+// The header's size is the stream's where its first frame says it: a VP8
+// key frame carries it (RFC 6386 §9.1: start code 9d 01 2a, then 14-bit
+// width and height). It used to be the config's — 1920x1080 when the
+// config gives none — and FFmpeg reports an IVF VP8 stream at its header's
+// size (VP9 and AV1 have parsers that read the frame instead), so
+// _watchStreamDimensions cut 1920x1080 frames out of 160x120 ones: a VP8
+// decoder without codedWidth / codedHeight output nothing.
+VideoDecoder.prototype._buildIvfFileHeader = function (first) {
   var cfg = this._config;
   var fourcc = 'VP90';
   if (cfg.codec === 'vp8') fourcc = 'VP80';
   else if (cfg.codec === 'av1') fourcc = 'AV01';
+  var w = cfg.width, h = cfg.height;
+  if (cfg.codec === 'vp8' && first && first.length >= 10 && (first[0] & 1) === 0 &&
+      first[3] === 0x9d && first[4] === 0x01 && first[5] === 0x2a) {
+    w = (first[6] | (first[7] << 8)) & 0x3fff;
+    h = (first[8] | (first[9] << 8)) & 0x3fff;
+  }
 
   var b = new Uint8Array(32);
   b.set(fromAscii('DKIF'), 0);
   writeU16LE(b, 4, 0);
   writeU16LE(b, 6, 32);
   b.set(fromAscii(fourcc), 8);
-  writeU16LE(b, 12, cfg.width);
-  writeU16LE(b, 14, cfg.height);
+  writeU16LE(b, 12, w);
+  writeU16LE(b, 14, h);
   writeU32LE(b, 16, cfg.framerate || 30);
   writeU32LE(b, 20, 1);
   writeU32LE(b, 24, 0);

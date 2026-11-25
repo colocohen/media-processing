@@ -34,7 +34,7 @@ const BROWSER_ENTRY = `
   export { default as SegmentBuilder } from './src/segment_builder.js';
   export { default as SubtitleEncoder } from './src/subtitle_encoder.js';
   export { default as CEA608Encoder, buildCea608SeiNalu } from './src/cea608_encoder.js';
-  export { createEncryptor, ivFromSequence, ivFromHex, ivToHex } from './src/encryption.js';
+  export { encryptorFromHook, ivFromSequence, ivFromHex, ivToHex } from './src/encryption.js';
 
   // ── Writers (muxers) ──
   export { default as TSWriter } from './src/writer_ts.js';
@@ -47,10 +47,21 @@ const BROWSER_ENTRY = `
   // ── Readers (demuxers) ──
   // A file fed in pieces → its samples — pure parsing, the same code as
   // in Node. FileDemuxer picks the container: MP4 / MOV / 3GP / fMP4
-  // (MP4Reader) or WebM / MKV (WebMReader).
+  // (MP4Reader), WebM / MKV (WebMReader), MPEG-TS, FLV, IVF, Ogg Opus,
+  // ADTS, raw H.264 / H.265, MP3, FLAC, WAV (the *FileReader / MP3Reader /
+  // FLACReader / WAVReader).
   export { default as FileDemuxer } from './src/file_demuxer.js';
   export { default as MP4Reader } from './src/reader_mp4.js';
   export { default as WebMReader } from './src/reader_webm.js';
+  export { default as TSFileReader } from './src/reader_ts_file.js';
+  export { default as ADTSFileReader } from './src/reader_adts_file.js';
+  export { default as OggFileReader } from './src/reader_ogg_file.js';
+  export { default as IVFFileReader } from './src/reader_ivf_file.js';
+  export { default as FLVFileReader } from './src/reader_flv_file.js';
+  export { default as AnnexBFileReader } from './src/reader_annexb_file.js';
+  export { default as MP3Reader } from './src/reader_mp3.js';
+  export { default as FLACReader } from './src/reader_flac.js';
+  export { default as WAVReader } from './src/reader_wav.js';
 
   // ── Bitstream / codec utilities ──
   export {

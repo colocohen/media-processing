@@ -156,8 +156,8 @@ function SegmentBuilder(opts) {
   //     iv:        Uint8Array(16) | null,  // null = derive from sequence
   //   }
   //
-  // The encryptor may not exist yet when _emit fires (Web Crypto
-  // importKey is async). To handle both "not ready yet" AND "previous
+  // The encryptor may not exist yet when _emit fires
+  // (set later with setEncryptor). To handle both "not ready yet" AND "previous
   // segment still encrypting", we use a single FIFO queue:
   //   - _pendingEncryptions[]: segments waiting (preserve sequence order)
   //   - _encryptionInProgress: true while an encrypt() call is in flight
@@ -1191,7 +1191,7 @@ SegmentBuilder.prototype._emit = function (videoChunks, audioChunks, metadataChu
 
   if (this._encryption) {
     // Enqueue and try to process. The queue handles ordering and
-    // also "encryptor not yet ready" (Web Crypto importKey latency).
+    // also "encryptor not yet ready" (set later with setEncryptor).
     this._pendingEncryptions.push(info);
     this._processEncryptionQueue();
   } else {
@@ -1337,7 +1337,7 @@ SegmentBuilder.prototype.failEncryption = function (err) {
 
 /**
  * Inject the encryptor after construction. Used by HLSEncoder which
- * starts the Web Crypto key import asynchronously and only has the
+ * creates the encryptor asynchronously and only has the
  * ready Encryptor instance later. Calling this also kicks off any
  * segments that were enqueued in the meantime.
  *

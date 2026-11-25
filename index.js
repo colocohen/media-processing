@@ -61,7 +61,7 @@ export { default as SegmentBuilder } from './src/segment_builder.js';
 export { default as SubtitleEncoder } from './src/subtitle_encoder.js';
 export { default as CEA608Encoder, buildCea608SeiNalu } from './src/cea608_encoder.js';
 export {
-  createEncryptor, ivFromSequence, ivFromHex, ivToHex,
+  encryptorFromHook, ivFromSequence, ivFromHex, ivToHex,
 } from './src/encryption.js';
 
 // ── Writers (muxers) ──
@@ -82,6 +82,17 @@ export { default as AnnexBReader } from './src/reader_annexb.js';
 export { default as MP4Reader } from './src/reader_mp4.js';
 export { default as WebMReader } from './src/reader_webm.js';
 export { default as FileDemuxer } from './src/file_demuxer.js';
+// The FILE readers of the stream containers (FileDemuxer picks them; the
+// API of MP4Reader / WebMReader).
+export { default as TSFileReader } from './src/reader_ts_file.js';
+export { default as ADTSFileReader } from './src/reader_adts_file.js';
+export { default as OggFileReader } from './src/reader_ogg_file.js';
+export { default as IVFFileReader } from './src/reader_ivf_file.js';
+export { default as FLVFileReader } from './src/reader_flv_file.js';
+export { default as AnnexBFileReader } from './src/reader_annexb_file.js';
+export { default as MP3Reader } from './src/reader_mp3.js';
+export { default as FLACReader } from './src/reader_flac.js';
+export { default as WAVReader } from './src/reader_wav.js';
 
 // ── High-level Node ──
 export { default as Demuxer } from './src/demuxer.js';

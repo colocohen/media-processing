@@ -1,5 +1,5 @@
 /**
- * encryption — Web Crypto wrapper for HLS AES-128-CBC segment encryption.
+ * encryption — what HLS AES-128 segment encryption asks of the encoder.
  *
  * Implements the encryption side of RFC 8216 §4.4.4.4 (EXT-X-KEY) for
  * METHOD=AES-128: each Media Segment is encrypted standalone with
@@ -13,16 +13,8 @@
  * only Media Segments. Players fetch the init clear, then decrypt
  * each media segment with its IV before parsing.
  *
- * Web Crypto's subtle.encrypt uses PKCS#7 padding by default for
- * AES-CBC, which matches the HLS spec exactly.
- *
- * API style: callbacks. Web Crypto's subtle.* methods natively return
- * Promises — we wrap them once at the boundary so the rest of the
- * library exposes Node-style (err, result) callbacks throughout.
- *
- * Browser support: SubtleCrypto.encrypt is universal in modern
- * browsers and Node.js 18+. We only need 'AES-CBC' which is in the
- * baseline algorithm set everywhere.
+ * The cipher itself is the caller's: a hook (encryptorFromHook, below),
+ * so this library carries no cryptography.
  */
 
 import { isValidIvHex } from './utils/playlist_utils.js';
@@ -101,138 +93,56 @@ export function ivToHex(iv) {
 }
 
 /**
- * Hand a value to a Node-style callback without letting the callback's
- * own exceptions be swallowed into the promise chain.
+ * The segment encryptor over the caller's cipher.
  *
- * `p.then(onFulfilled, onRejected)` registers SIBLINGS: if onFulfilled
- * throws, onRejected never sees it and the resulting promise rejects
- * with nobody listening. Since every public function here bridges a
- * Web Crypto promise to a callback, a bug in the CALLER's callback
- * surfaced as an unhandled rejection — which Node terminates the
- * process on by default, and attributes to this file rather than to
- * the code that actually threw.
+ * The cipher is not part of this library: the caller passes
+ * `encrypt(plaintext, iv, callback(err, ciphertext))`, AES-128-CBC with
+ * PKCS#7 padding of the whole segment under its key, with any crypto it
+ * likes (cryptographic-primitives, WebCrypto, node:crypto, a KMS). What
+ * the spec asks of the encoder stays here: which bytes are encrypted
+ * (each Media Segment whole, never the init), with which IV, in which
+ * order, and the EXT-X-KEY tag.
  *
- * Rethrowing on a fresh tick turns it back into an ordinary uncaught
- * exception with the caller's stack, which is what a callback-style API
- * should produce.
+ * The wrapper holds the hook to what the segment builder relies on:
+ *   - the result comes on a later turn, never inside the call (a hook
+ *     that calls back at once is deferred);
+ *   - a hook that throws fails that segment (a gap), as an error
+ *     through the callback would;
+ *   - one result per segment (a second callback is ignored);
+ *   - the ciphertext is a Uint8Array of the length AES-CBC with PKCS#7
+ *     gives (16 * (floor(n / 16) + 1) bytes); anything else fails the
+ *     segment rather than publishing bytes no player can decrypt.
+ * The hook gets copies of the plaintext and the IV.
+ *
+ * @param {Function} hook  encrypt(plaintext, iv, callback)
+ * @returns {{ encrypt: Function }}
  */
-function _invoke(callback, err, value) {
-  try {
-    callback(err, value);
-  } catch (e) {
-    setTimeout(function () { throw e; }, 0);
+export function encryptorFromHook(hook) {
+  if (typeof hook !== 'function') {
+    throw new TypeError('encryptorFromHook: hook must be a function (plaintext, iv, callback)');
   }
+  return {
+    encrypt: function (plaintext, iv, callback) {
+      var want = 16 * (Math.floor(plaintext.length / 16) + 1);
+      var inCall = true, done = false;
+      function finish(err, ct) {
+        if (done) return;
+        done = true;
+        if (!err && !(ct instanceof Uint8Array && ct.length === want)) {
+          err = new Error('encryption: the encrypt hook gave ' +
+            (ct instanceof Uint8Array ? ct.length + ' bytes' : 'no Uint8Array') + ' for a ' +
+            plaintext.length + '-byte segment; AES-128-CBC with PKCS#7 padding gives ' + want);
+          ct = undefined;
+        }
+        if (inCall) setTimeout(function () { callback(err || null, ct); }, 0);
+        else callback(err || null, ct);
+      }
+      try {
+        hook(plaintext.slice(), iv.slice(), function (err, ct) { finish(err, ct); });
+      } catch (e) {
+        finish(e instanceof Error ? e : new Error(String(e)));
+      }
+      inCall = false;
+    },
+  };
 }
-
-/**
- * Find the SubtleCrypto interface across browser / Node environments.
- * Browsers expose `crypto.subtle` on globalThis. Node 18+ exposes the
- * same shape on globalThis.crypto.
- */
-function _getSubtle() {
-  if (typeof globalThis !== 'undefined' &&
-      globalThis.crypto && globalThis.crypto.subtle) {
-    return globalThis.crypto.subtle;
-  }
-  throw new Error('encryption: Web Crypto API not available — ' +
-                  'requires browser or Node.js 18+');
-}
-
-/**
- * Create an Encryptor bound to a single AES-128 key. The key is
- * imported once into the Web Crypto subsystem (where it's stored
- * non-extractable) and reused for every segment, which is the
- * standard HLS pattern.
- *
- * Web Crypto's importKey is natively Promise-based; we wrap it so the
- * public API uses Node-style (err, result) callbacks throughout.
- *
- * @param {object}    opts
- * @param {Uint8Array} opts.key    Raw 16-byte AES-128 key.
- * @param {Function}  callback     callback(err, encryptor)
- */
-export function createEncryptor(opts, callback) {
-  if (typeof callback !== 'function') {
-    throw new TypeError('createEncryptor: callback function required');
-  }
-  if (!opts || !(opts.key instanceof Uint8Array) || opts.key.length !== 16) {
-    // Synchronous validation errors throw rather than calling callback —
-    // these are programming bugs, not runtime conditions. Matches Node
-    // convention for argument-shape errors.
-    throw new TypeError('createEncryptor: opts.key must be Uint8Array(16)');
-  }
-
-  var subtle;
-  try {
-    subtle = _getSubtle();
-  } catch (e) {
-    // Defer to next tick so the caller sees consistent async cadence.
-    setTimeout(function () { _invoke(callback, e); }, 0);
-    return;
-  }
-
-  // 'raw' format is the literal 16 bytes. AES-CBC algorithm. Not
-  // extractable — the key never leaves Web Crypto's secure context.
-  // Only 'encrypt' usage; we never decrypt locally.
-  subtle.importKey(
-    'raw',
-    opts.key,
-    { name: 'AES-CBC' },
-    false,
-    ['encrypt']
-  ).then(function (cryptoKey) {
-    _invoke(callback, null, new Encryptor(cryptoKey, subtle));
-  }, function (err) {
-    _invoke(callback, err);
-  });
-}
-
-/**
- * Encryptor — wraps a CryptoKey + the encrypt() routine. Returned via
- * the callback to createEncryptor. Reused for every segment; the key
- * material lives inside Web Crypto's secure context for the lifetime
- * of the instance.
- */
-function Encryptor(cryptoKey, subtle) {
-  this._key = cryptoKey;
-  this._subtle = subtle;
-}
-
-/**
- * Encrypt a media segment with AES-128-CBC and PKCS#7 padding.
- *
- * Web Crypto returns an ArrayBuffer of length plaintext.length +
- * (16 - plaintext.length % 16). When plaintext is a multiple of 16,
- * an extra full block of padding is appended (PKCS#7 requirement —
- * the player needs to know how many padding bytes to strip).
- *
- * The IV must be exactly 16 bytes. For sequence-based IVs, callers
- * typically pass the result of ivFromSequence(mediaSequenceNumber).
- *
- * @param {Uint8Array} plaintext
- * @param {Uint8Array} iv         16 bytes
- * @param {Function}   callback   callback(err, ciphertext)
- */
-Encryptor.prototype.encrypt = function (plaintext, iv, callback) {
-  if (typeof callback !== 'function') {
-    throw new TypeError('Encryptor.encrypt: callback function required');
-  }
-  if (!(plaintext instanceof Uint8Array)) {
-    throw new TypeError('Encryptor.encrypt: plaintext must be Uint8Array');
-  }
-  if (!(iv instanceof Uint8Array) || iv.length !== 16) {
-    throw new TypeError('Encryptor.encrypt: iv must be Uint8Array(16)');
-  }
-
-  this._subtle.encrypt(
-    { name: 'AES-CBC', iv: iv },
-    this._key,
-    plaintext
-  ).then(function (buffer) {
-    // ArrayBuffer → Uint8Array view. No copy; the caller can use it
-    // directly as a Uint8Array (set into a larger buffer, upload, etc.).
-    _invoke(callback, null, new Uint8Array(buffer));
-  }, function (err) {
-    _invoke(callback, err);
-  });
-};
