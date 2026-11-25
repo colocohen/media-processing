@@ -22,6 +22,37 @@ function _domex(msg, name) {
   return e;
 }
 
+// ── W3C WebCodecs §3.6 / §4.6 / §5.6 / §6.6 "Schedule Dequeue Event" ──
+//
+//   1. If [[dequeue event scheduled]] equals true, return.
+//   2. Assign true to [[dequeue event scheduled]].
+//   3. Queue a task to run the following steps:
+//      1. Fire a simple event named dequeue at this.
+//      2. Assign false to [[dequeue event scheduled]].
+//
+// A dequeue event was dispatched synchronously after every output (and
+// one per reset); outputs that come out before the task runs now share
+// one event, which reads the queue size as it is then. "Queue a task" is
+// setImmediate: a macrotask after the current one (an FFmpeg 'data'
+// callback that may deliver many outputs) and after its microtasks (a
+// flush promise settled by the same outputs) — queueMicrotask would run
+// inside that callback's turn and coalesce nothing across it, and
+// setTimeout(0) waits a timer tick (1 ms) for no reason. The event was
+// dispatched with no argument, so `e.type` in a handler was a TypeError
+// on undefined. A listener that throws does not leave the flag set (DOM
+// dispatch reports a listener's exception and goes on).
+function scheduleDequeue(self) {
+  if (self._dequeueEventScheduled) return;
+  self._dequeueEventScheduled = true;
+  setImmediate(function () {
+    try {
+      if (self.dispatchEvent) self.dispatchEvent('dequeue', { type: 'dequeue', target: self });
+    } finally {
+      self._dequeueEventScheduled = false;
+    }
+  });
+}
+
 function initCoder(self, init) {
   var userOutput = (init && init.output) || function () {};
   // Wrap output to fire 'dequeue' event + forward metadata arg.
@@ -36,12 +67,9 @@ function initCoder(self, init) {
     if (!self._queueByInput && self._queueSize > 0) self._queueSize--;
     self._stats.outputCount++;
     userOutput(chunk, metadata);
-    // W3C WebCodecs fires a plain Event named "dequeue" on the codec.
-    // It was dispatched with no argument, so `e.type` in a handler was
-    // a TypeError on undefined.
-    if (self.dispatchEvent) {
-      self.dispatchEvent('dequeue', { type: 'dequeue', target: self });
-    }
+    // W3C WebCodecs fires a plain Event named "dequeue" on the codec
+    // (Schedule Dequeue Event, below: one at a time, as a task).
+    scheduleDequeue(self);
   };
   // Wrap the user's error callback so _stats.errorCount is real.
   // It was declared in _stats below and never incremented anywhere in
@@ -58,6 +86,7 @@ function initCoder(self, init) {
   self._ffmpeg = new FFmpegProcess(init);
   self._reader = null;
   self._queueSize = 0;
+  self._dequeueEventScheduled = false;   // W3C [[dequeue event scheduled]]
   self._eventListeners = {};
 
   // Production monitoring
@@ -97,13 +126,17 @@ function configureCoder(self) {
   if (self._state === 'closed') {
     throw _domex('Cannot configure a closed coder', 'InvalidStateError');
   }
+  // The queue size goes to 0 with the run it stops (its outputs will not
+  // come); a configure() made after the previous run had finished (held
+  // behind it, see drainThen) keeps the count of the calls held after it.
+  if (self._state === 'configured' && self._ffmpeg.running) self._queueSize = 0;
   if (self._state === 'configured') {
     self._ffmpeg.stop();
     detachCoderListeners(self._ffmpeg);
     self._reader = null;
   }
   self._state = 'configured';
-  self._queueSize = 0;
+  self._configEpoch = (self._configEpoch || 0) + 1;
 }
 
 var FLUSH_TIMEOUT = 10000;
@@ -212,12 +245,9 @@ function flushCoder(self, cb) {
       if (err) { if (cb) cb(err); return; }   // rejected: state is failCoder's/close()'s
       if (stopProcess) self._ffmpeg.stop();
       self._state = 'configured';
-      self._queueSize = 0;
-      // Spec: flush() sets [[key chunk required]] back to true — after a
-      // flush the codec has no reference frames, so decoding must start
-      // from a key chunk again. Only decoders carry the flag.
-      if (typeof self._keyChunkRequired === 'boolean') self._keyChunkRequired = true;
+      self._queueSize = self._heldWork || 0;
       if (cb) cb();
+      releaseCalls(self);
     }
 
     // output_end = pipe:3 EOF, stdout_end = pipe:1 EOF (audio decoder),
@@ -242,9 +272,107 @@ function flushCoder(self, cb) {
     self._ffmpeg.on('close', onClose);
 
     self._ffmpeg.endInput();
+    // The calls made from now until this run has exited wait for it
+    // (holdCalls): they went to an FFmpeg whose input was ended — lost.
+    holdCalls(self);
     return;
   }
   if (cb) cb();
+}
+
+// ── Calls made while a flush() is in progress ──
+//
+// W3C: flush() is a control message like the others — the encode() /
+// decode() / configure() / flush() calls after it are queued behind it
+// and run once it is done. Here a flush ends FFmpeg's input and waits for
+// it to exit, and those calls went to that FFmpeg: encode() of 3 frames,
+// flush(), encode() of 2 more, flush() — 3 chunks out, both flushes
+// resolved, the 2 frames gone (write() on an ended stdin returns false).
+// They are held now (their synchronous checks made at the call, as the
+// spec's are) and made in order once the flush has resolved; reset(),
+// close() and a codec failure drop them, as they do the spec's control
+// messages. Also used while a configure() that is not supported waits
+// for its close (failCoder drops them).
+function holdCalls(self) { if (!self._held) { self._held = []; self._heldWork = 0; } }
+function holdingCalls(self) { return !!self._held; }
+/** Hold `fn`; `work`: it is an encode()/decode() (counted in the queue size). */
+function holdCall(self, fn, work) {
+  self._held.push(fn);
+  if (work) self._heldWork++;
+}
+function releaseCalls(self) {
+  var q = self._held;
+  self._held = null;
+  self._heldWork = 0;
+  for (var i = 0; q && i < q.length; i++) {
+    if (self._state === 'closed') return;
+    if (self._held) { self._held.push(q[i]); continue; }   // a held flush() holds the rest again
+    q[i]();
+  }
+}
+function dropCalls(self) { self._held = null; self._heldWork = 0; }
+
+/**
+ * A flush() made while calls are held: queued like them. `run(cb)` is
+ * the flush itself; until then the promise is pending — reset()/close()
+ * reject it (AbortError) and failCoder with its error.
+ */
+function holdFlush(self, run, cb) {
+  var settled = false;
+  function onFail(err) { if (settled) return; settled = true; cb(err); }
+  addPendingFlush(self, onFail);
+  holdCall(self, function () {
+    removePendingFlush(self, onFail);
+    if (settled) return;
+    settled = true;
+    run(cb);
+  }, false);
+}
+
+// ── configure() with a config the codecs cannot do ──
+//
+// W3C: configure() sets [[state]] "configured" and queues the configure
+// control message; when Check Configuration Support says no, that message
+// closes the coder with a NotSupportedError (a queued task). Calls made
+// before then are queued behind it (held here) and go with the close.
+function failUnsupported(self, err, draining) {
+  var epoch = self._configEpoch;
+  holdCalls(self);
+  function fail() {
+    if (self._configEpoch !== epoch || self._state !== 'configured') return;
+    failCoder(self, err);
+  }
+  // Runs of the previous configuration still finishing (a reconfigure
+  // retires them, VideoEncoder): their outputs come before the close.
+  var left = 0;
+  for (var i = 0; draining && i < draining.length; i++) {
+    if (!draining[i].running) continue;
+    left++;
+    draining[i].on('close', function () { if (--left === 0) fail(); });
+  }
+  if (!left) queueMicrotask(fail);
+}
+
+/**
+ * A configure() on a running coder (AudioEncoder, AudioDecoder): the
+ * calls made before it finish in the running FFmpeg — end its input and
+ * hold `fn` (the configure) and every later call until it has exited
+ * cleanly. configureCoder() used to stop it, and whatever was still
+ * inside was lost (W3C: configure() is queued behind the encode() /
+ * decode() calls before it; their outputs come first). A failed exit is
+ * failCoder's (watchExit).
+ */
+function drainThen(self, fn) {
+  var proc = self._ffmpeg;
+  holdCalls(self);
+  holdCall(self, fn, false);
+  var epoch = self._configEpoch;
+  proc.on('close', function (code, signal) {
+    if (exitError(code, signal) || self._configEpoch !== epoch || self._state !== 'configured') return;
+    self._queueSize = self._heldWork || 0;
+    releaseCalls(self);
+  });
+  proc.endInput();
 }
 
 // W3C: close() and reset() reject a pending flush() with an AbortError.
@@ -253,7 +381,27 @@ function flushCoder(self, cb) {
 // 'configured' on a closed coder.
 function _abortError() { return _domex('Aborted due to close() or reset()', 'AbortError'); }
 
+// W3C Reset / Close: on a closed coder an InvalidStateError (close() is
+// final: reset() set a closed coder back to "unconfigured", close() twice
+// passed). A queue size above 0 goes to 0 with a dequeue event (it went
+// to 0 silently): Reset VideoEncoder step 7 "If [[encodeQueueSize]] is
+// greater than zero: Set [[encodeQueueSize]] to zero. Run the Schedule
+// Dequeue Event algorithm." (the same in the other three).
+function _checkNotClosed(self, what) {
+  if (self._state === 'closed') throw _domex('Cannot ' + what + ' a closed coder', 'InvalidStateError');
+}
+function resetQueue(self) {
+  dropCalls(self);
+  self._configEpoch = (self._configEpoch || 0) + 1;
+  if (self._queueSize > 0) {
+    self._queueSize = 0;
+    scheduleDequeue(self);
+  }
+}
+
 function closeCoder(self) {
+  _checkNotClosed(self, 'close');
+  resetQueue(self);
   rejectPendingFlushes(self, _abortError());
   self._ffmpeg.stop();
   detachCoderListeners(self._ffmpeg);
@@ -263,6 +411,8 @@ function closeCoder(self) {
 }
 
 function resetCoder(self) {
+  _checkNotClosed(self, 'reset');
+  resetQueue(self);
   rejectPendingFlushes(self, _abortError());
   self._ffmpeg.stop();
   detachCoderListeners(self._ffmpeg);
@@ -317,7 +467,7 @@ function wireReader(self, reader, eventMap) {
  * Includes:
  *  - flush() → Promise (browser-compatible) + callback backward compat
  *  - addEventListener / removeEventListener (EventTarget)
- *  - dequeue event (fires when output is produced)
+ *  - dequeue event (scheduled when output is produced: scheduleDequeue)
  */
 function applyCoderPrototype(Ctor, options) {
   var role = options && options.role;   // 'encoder' | 'decoder' | undefined
@@ -332,12 +482,18 @@ function applyCoderPrototype(Ctor, options) {
       if (typeof cb === 'function') { cb(stateErr); return; }
       return Promise.reject(stateErr);
     }
+    // W3C (decoders): flush() sets [[key chunk required]] when it is
+    // called — it was set when the flush completed, so a delta chunk
+    // decoded right after flush() passed.
+    if (typeof self._keyChunkRequired === 'boolean') self._keyChunkRequired = true;
+    var run = function (done) { flushCoder(self, done); };
     if (typeof cb === 'function') {
-      flushCoder(self, cb);   // cb(err): err set when the flush was rejected
+      if (holdingCalls(self)) holdFlush(self, run, cb); else run(cb);   // cb(err): err set when rejected
       return;
     }
     return new Promise(function (resolve, reject) {
-      flushCoder(self, function (err) { if (err) reject(err); else resolve(); });
+      var done = function (err) { if (err) reject(err); else resolve(); };
+      if (holdingCalls(self)) holdFlush(self, run, done); else run(done);
     });
   };
 
@@ -413,6 +569,8 @@ function applyCoderPrototype(Ctor, options) {
 }
 
 export {
+  holdCalls, holdingCalls, holdCall, holdFlush, releaseCalls, dropCalls, failUnsupported, resetQueue, drainThen, _domex as domex,
+  scheduleDequeue,
   initCoder, configureCoder, flushCoder, closeCoder, resetCoder, wireReader, applyCoderPrototype,
   exitError, failCoder, watchExit, detachCoderListeners, notConfiguredError, addPendingFlush, removePendingFlush, rejectPendingFlushes,
 };

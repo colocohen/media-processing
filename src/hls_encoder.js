@@ -91,25 +91,12 @@ import SegmentBuilder from './segment_builder.js';
 import EventEmitter from './core/events.js';
 import { isValidVideoRange } from './utils/playlist_utils.js';
 import { createEncryptor, ivFromHex, ivToHex } from './encryption.js';
-import CEA608Encoder, { buildCea608SeiNalu } from './cea608_encoder.js';
+import CEA608Encoder, { buildCea608SeiNalu, padCcData } from './cea608_encoder.js';
 import { injectSeiIntoAU, codecStringFromAnnexB, codecStringFromAvcC,
          codecStringFromHvcC } from './utils/nalu_utils.js';
 
 
-// Fallback frame duration when the encoder doesn't report chunk.duration.
-// Used by the CEA-608 caption injection path to compute the frame's
-// PTS window [pts, pts+frameDuration). 30fps (1/30s = 33,333 µs) is the
-// safe NTSC default — a frame or two of imprecision in the cc_data
-// pacing has no perceptible impact on caption rendering. Modern
-// encoders (Chrome's WebCodecs, etc.) populate chunk.duration so this
-// is rarely the active path.
-var _DEFAULT_FRAME_DURATION_US = 33333;
-
-// AAC LC samples per frame — fixed by the spec. Used to compute the
-// uniform PTS step for audio chunks (see _onAudioChunk's restamping
-// logic and the comment at _audioFirstChunkPtsUs in the constructor).
-// Same value lives in aac-utils.js for parsed ADTS frames.
-var _AAC_LC_SAMPLES_PER_FRAME = 1024;
+// (AAC samples per frame: _aacSamplesPerFrame, by the codec string.)
 
 // Default audio sample rate when neither caller config nor the
 // encoder's metadata provides one. 48 kHz is the universal modern
@@ -172,6 +159,18 @@ function _defaultAudioCodecString(codec) {
  * the safe LC default and matches what most encoders emit.
  */
 function _aacEncoderDelay(codecString) {
+  return _aacSamplesPerFrame(codecString);
+}
+
+/**
+ * Output samples one AAC access unit decodes to (ISO/IEC 14496-3): 1024
+ * for AAC LC; 2048 for HE-AAC v1 / v2 — SBR doubles the output rate, and
+ * the sample rate the restamp divides by (the AudioData's) is that
+ * output rate. Was 1024 for all: an HE-AAC track was restamped at half
+ * its frames' length (21.3 ms steps for 42.7 ms frames at 48 kHz), the
+ * audio squeezed onto half the timeline.
+ */
+function _aacSamplesPerFrame(codecString) {
   if (codecString === 'mp4a.40.5' || codecString === 'mp4a.40.29') {
     return 2048;
   }
@@ -393,15 +392,22 @@ function _extractAv1ConfigFromChunk(au, codecString) {
     // shouldn't happen — bail rather than guess.
     if (!hasSize) return null;
 
-    // LEB128 size (up to 8 bytes per AV1 spec §4.10.5).
-    var size = 0, shift = 0, lebBytes = 0;
-    while (off < au.length && lebBytes < 8) {
+    // LEB128 size (up to 8 bytes, at most 2^32 - 1: AV1 spec §4.10.5).
+    // Summed as a double: it used to be OR-ed into a 32-bit int, so a
+    // size of 2^31 or more came out negative — the walk went backwards
+    // (a size of 2^32 - 6 looped forever) or cut a short seq_hdr. A size
+    // that runs past the chunk or the 8 bytes, or above 2^32 - 1, is
+    // not a bitstream we can walk.
+    var size = 0, lebBytes = 0, done = false;
+    while (lebBytes < 8) {
+      if (off >= au.length) return null;
       var b = au[off];
-      off++; lebBytes++;
-      size |= (b & 0x7F) << shift;
-      if ((b & 0x80) === 0) break;
-      shift += 7;
+      off++;
+      size += (b & 0x7F) * Math.pow(2, 7 * lebBytes);
+      lebBytes++;
+      if ((b & 0x80) === 0) { done = true; break; }
     }
+    if (!done || size > 0xFFFFFFFF) return null;
 
     if (obuType === 1) {  // OBU_SEQUENCE_HEADER
       seqHdrStart = obuStart;
@@ -465,7 +471,10 @@ function _extractAv1ConfigFromChunk(au, codecString) {
  *                                            Defaults to 'init.mp4'. Ignored
  *                                            for TS (which has no init).
  * @param {boolean}[opts.forceKeyframes=true] Force IDR at segment boundaries.
- * @param {boolean}[opts.independentSegments] Passed to Playlist.
+ * @param {boolean}[opts.independentSegments] Passed to Playlist (default:
+ *                                            true but for live / event
+ *                                            video, where it cannot be
+ *                                            promised: see the constructor).
  * @param {object} [opts.video]               Video config, or omit for audio-only.
  * @param {string} opts.video.codec           'h264' | 'h265' | 'vp9' | 'av1'.
  *                                            VP9 and AV1 require format='fmp4'.
@@ -760,6 +769,40 @@ function HLSEncoder(opts) {
   }
   this._mode = opts.mode || 'live';
   this._forceKeyframes = opts.forceKeyframes !== false;
+  // Live / event: TARGETDURATION (ceil(segmentDuration)) is fixed, and an
+  // EXTINF rounded above it is forbidden (RFC 8216 §4.3.3.1) — a segment
+  // over it can't be listed, and refusing it would drop it. So a keyframe
+  // is asked for early enough that the segment closes within the target
+  // (_encodeVideoFrame), and the builder closes one that would still
+  // outgrow it (the encoder's keyframe late or never — forceKeyframes
+  // false —, a gap in the input) before the frame that would push it
+  // there, on a frame that may not be a keyframe. Then that next segment
+  // is not independent, so EXT-X-INDEPENDENT-SEGMENTS, which can't be
+  // taken back once written (rfc8216bis §6.2.1), is not declared for
+  // live / event video. (VOD raises its target instead; audio frames are
+  // all independent.) It used to be: TARGETDURATION:2 above EXTINF:3.000.
+  this._targetDurationSec = Math.ceil(segmentDurationSec);
+  this._targetCut = (this._mode === 'live' || this._mode === 'event');
+  this._mayCutOffKey = this._targetCut && !!opts.video;
+  if (this._mayCutOffKey && opts.independentSegments === true) {
+    throw new Error('HLSEncoder: independentSegments cannot be promised for a live / event ' +
+                    'video stream (a segment that would outgrow TARGETDURATION is closed on ' +
+                    'a frame that may not be a keyframe); leave it unset');
+  }
+  // LL-HLS: the PART-TARGET written is partDuration rounded to a whole
+  // number of frame intervals at the configured rate (at least one), so
+  // parts cut on frame starts are the target itself — 8/30 s at 30 fps
+  // for 0.25 (7.5 frames, rounded half up), written 0.26667 (rounded up to the 5 decimals parts are
+  // written with). With 0.1 at 25 fps the parts were 2 frames, 0.08 s,
+  // under the 85 % of the target rfc8216bis §4.4.4.9 requires (now 0.12).
+  this._partTargetSec = this._partDurationSec;
+  if (this._partDurationSec > 0 && opts.video) {
+    var partFps = opts.video.framerate || 30;
+    if (partFps > 0 && isFinite(partFps)) {
+      var partFrames = Math.max(1, Math.round(this._partDurationSec * partFps));
+      this._partTargetSec = Math.ceil(partFrames * 100000 / partFps - 1e-6) / 100000;
+    }
+  }
 
   // URI conventions per format. fMP4 uses CMAF-standard '.m4s' for media
   // segments and a single 'init.mp4' for the EXT-X-MAP target. TS uses
@@ -804,6 +847,7 @@ function HLSEncoder(opts) {
 
   this._lastForcedKeyframeUs = null;
   this._lastKeyCell = -Infinity;   // grid cell of the last forced keyframe
+  this._lastVideoTs = null;        // the previous frame's timestamp
 
   // ── Bandwidth tracking (for getStreamInf / master playlist) ──
   // The HLS spec requires the BANDWIDTH attribute on EXT-X-STREAM-INF
@@ -937,6 +981,11 @@ function HLSEncoder(opts) {
       name:       cap.name || cap.language || 'English',
     };
     this._captionsIsH265 = opts.video.codec === 'h265';
+    // A frame's window [pts, pts + duration) for the cc_data when the
+    // encoder reports no chunk.duration: the configured frame interval
+    // (it was 1/30 s whatever the rate — at 60 fps every window spanned
+    // two frames).
+    this._captionsFrameDurUs = Math.round(1000000 / (opts.video.framerate || 30));
   } else {
     this._cea608 = null;
     this._captionsConfig = null;
@@ -1023,11 +1072,20 @@ HLSEncoder.prototype.feed = function (input, ptsUs) {
   }
   this._ensureConfigured();
 
+  // A track the encoder was not constructed with has no encoder to take
+  // the input: it used to fail on the missing encoder with a TypeError,
+  // after the input had already moved the shared timeline and the clocks.
   if ((typeof VideoFrame !== 'undefined' && input instanceof VideoFrame) || _looksLikeVideoFrame(input)) {
+    if (!this._opts.video) {
+      throw new Error('HLSEncoder.feed: VideoFrame fed, but the encoder has no video track (opts.video)');
+    }
     this._encodeVideoFrame(input, ptsUs);
     return;
   }
   if ((typeof AudioData !== 'undefined' && input instanceof AudioData) || _looksLikeAudioData(input)) {
+    if (!this._opts.audio) {
+      throw new Error('HLSEncoder.feed: AudioData fed, but the encoder has no audio track (opts.audio)');
+    }
     this._encodeAudioData(input, ptsUs);
     return;
   }
@@ -1864,9 +1922,9 @@ HLSEncoder.prototype._ensureConfigured = function () {
     mode: this._mode,
     targetDuration: Math.ceil(this._segmentDurationSec),
     windowSize: opts.windowSize || 6,
-    independentSegments: opts.independentSegments,
+    independentSegments: this._mayCutOffKey ? false : opts.independentSegments,
     initSegmentUri: this._initSegmentUri,  // null for TS
-    partTargetDuration: this._partDurationSec,
+    partTargetDuration: this._partTargetSec,
     partHoldBack: opts.partHoldBack,
   });
 
@@ -1933,7 +1991,8 @@ HLSEncoder.prototype._ensureConfigured = function () {
   this._segmentBuilder = new SegmentBuilder({
     writer: this._writer,
     segmentDuration: this._segmentDurationSec,
-    partDuration: this._partDurationSec,
+    partDuration: this._partTargetSec,
+    targetDuration: this._targetCut ? this._targetDurationSec : 0,
     iFramePlaylist: this._iFramePlaylistEnabled,
     hasVideo: !!opts.video,
     gridAligned: this._forceKeyframes,
@@ -2156,8 +2215,18 @@ HLSEncoder.prototype._encodeVideoFrame = function (frame, ptsUsOverride) {
   if (this._forceKeyframes) {
     var cell = Math.floor((ts - this._originUs()) / this._segmentDurationUs);
     forceKey = (this._lastForcedKeyframeUs === null) || cell > this._lastKeyCell;
-    if (forceKey) this._lastKeyCell = cell;
+    if (forceKey) {
+      this._lastKeyCell = cell;
+    } else if (this._targetCut && this._lastVideoTs !== null &&
+               Math.round((2 * ts - this._lastVideoTs - this._lastForcedKeyframeUs) / 1000000) >
+               this._targetDurationSec) {
+      // Live / event: the next frame, as far from this one as this one is
+      // from the last, would take the segment past TARGETDURATION — it
+      // ends here (the builder closes it on this keyframe).
+      forceKey = true;
+    }
   }
+  this._lastVideoTs = ts;
 
   // A segment-boundary keyframe is mandatory, so it carries
   // bypassThrottle (as GopCoordinator's do). Without it, the Node
@@ -2307,9 +2376,10 @@ HLSEncoder.prototype._onVideoChunk = function (chunk, metadata) {
   // mode the queue is FIFO (no reordering), so shift() always pairs
   // the next chunk with its original input PTS.
   //
-  // But an encoder may also DROP frames (the Node VideoEncoder evicts a
+  // But an encoder may also DROP frames (the Node VideoEncoder evicted a
   // retired FFmpeg's buffered frames when more than 4 keyframe restarts
-  // are pending — input fed much faster than real time). Then the FIFO
+  // were pending — input fed much faster than real time; it no longer
+  // does, but an encoder given by the caller may still drop). Then the FIFO
   // pairs every later chunk with an earlier frame's PTS: measured, chunk
   // #8 (timestamp 2.000 s) was stamped 0.267 s and segment durations
   // came out 2.467 / 9.633 / 4.167 s. So when chunk.timestamp equals a
@@ -2340,19 +2410,18 @@ HLSEncoder.prototype._onVideoChunk = function (chunk, metadata) {
   // IDR) but AFTER the AUD if one is present, per H.264 §7.4.1.2.3.
   //
   // We pull triples for the window [ptsUs, ptsUs + frameDurationUs)
-  // — using chunk.duration when the encoder reports it, otherwise
-  // falling back to a 30fps frame duration. The CEA608 encoder paces
-  // its output to fit into one frame's worth of cc_data (max 2
-  // triples at NTSC rates), so this gives every queued byte-pair a
-  // home without dropping any.
+  // — using chunk.duration when the encoder reports it, otherwise the
+  // configured frame interval. The CEA608 encoder gives the frame the
+  // field-1 pairs of the 608 slots in it (at most one per 1/29.97 s);
+  // the frame's cc_data is then padded to the cc_count ATSC A/53 Part 4
+  // fixes for its rate, every frame (a fixed 9600 bit/s). Before, only
+  // frames with a pair carried cc_data, with cc_count 1 or 2.
   if (this._cea608) {
     var frameDurUs = (chunk.duration && chunk.duration > 0)
-      ? chunk.duration : _DEFAULT_FRAME_DURATION_US;
+      ? chunk.duration : this._captionsFrameDurUs;
     var triples = this._cea608.getCcDataForFrame(ptsUs, ptsUs + frameDurUs);
-    if (triples.length > 0) {
-      var seiNal = buildCea608SeiNalu(triples, this._captionsIsH265);
-      au = injectSeiIntoAU(au, seiNal, this._captionsIsH265);
-    }
+    var seiNal = buildCea608SeiNalu(padCcData(triples, frameDurUs), this._captionsIsH265);
+    au = injectSeiIntoAU(au, seiNal, this._captionsIsH265);
   }
 
   // CEA-608 above is scheduled on the input time base (addCaption's
@@ -2413,6 +2482,12 @@ HLSEncoder.prototype._maybeDropSilentAudio = function (atEnd) {
   if (this._format !== 'fmp4' || !this._opts.audio || !this._opts.video) return;
   if (this._audioDropped || this._audioConfigCaptured || !this._videoConfigCaptured) return;
   if (!this._segmentBuilder) return;
+  // Once the init segment is out its tracks are fixed. An Opus track
+  // needs no config (the writer builds a dOps), so the init can go out
+  // with a track that never delivers: dropping it then failed with
+  // 'init segment already written' inside end(), and the final segment
+  // was never flushed.
+  if (this._segmentBuilder.hasWrittenInit()) return;
   if (!atEnd) {
     // AudioData was fed: chunks are on their way (encoder latency).
     if (this._audioEncoderConfigured) return;
@@ -2461,6 +2536,7 @@ HLSEncoder.prototype._onAudioChunk = function (chunk, metadata) {
   //
   // Step is codec-dependent:
   //   AAC LC: 1024 samples / sampleRate seconds. At 48kHz = 21333.33µs.
+  //   HE-AAC: 2048 (SBR: the output rate is twice the core's).
   //   Opus  : 20ms (960 samples at 48kHz) by default. The encoder
   //           reports this via chunk.duration; we trust it for Opus
   //           because Opus frame timing is exact (each packet's
@@ -2476,7 +2552,8 @@ HLSEncoder.prototype._onAudioChunk = function (chunk, metadata) {
       this._audioPtsStepUs  = chunk.duration;
       this._audioDurationUs = chunk.duration;
     } else {
-      this._audioPtsStepUs  = _AAC_LC_SAMPLES_PER_FRAME * 1000000 / sampleRate;
+      var aacCs = (this._opts.audio && this._opts.audio.codecString) || _defaultAudioCodecString('aac');
+      this._audioPtsStepUs  = _aacSamplesPerFrame(aacCs) * 1000000 / sampleRate;
       this._audioDurationUs = Math.round(this._audioPtsStepUs);
     }
   }
@@ -2567,6 +2644,7 @@ HLSEncoder.prototype._onSegment = function (info) {
   this._playlist.addSegment({
     uri: uri,
     duration: info.duration,
+    independent: info.independent,
   });
 
   // Update bandwidth tracking. Per HLS RFC 8216 §4.3.4.2 BANDWIDTH is
@@ -2657,6 +2735,7 @@ HLSEncoder.prototype._onPart = function (info) {
     byteOffset:  info.byteOffset,
     byteLength:  info.byteLength,
     independent: info.independent,
+    gap:         info.gap,
   });
 
   this._ee.emit('part', {
@@ -2668,6 +2747,7 @@ HLSEncoder.prototype._onPart = function (info) {
     byteOffset:      info.byteOffset,
     byteLength:      info.byteLength,
     independent:     info.independent,
+    gap:             info.gap,
     final:           info.final,
   });
 

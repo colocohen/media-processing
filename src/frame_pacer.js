@@ -57,6 +57,13 @@ function FramePacer(opts) {
   // _anchorMs + (k * _frameDurMs).
   this._anchorMs = 0;
   this._sinceAnchorIndex = 0;  // resets to 0 across pause/resume cycles
+
+  // _run counts start() calls; _tickRun is the run whose tick is calling
+  // back (0: none). A tick reschedules itself after its callback (see
+  // resume()), and knows when the callback stopped and restarted the
+  // pacer.
+  this._run = 0;
+  this._tickRun = 0;
 }
 
 /**
@@ -70,6 +77,7 @@ FramePacer.prototype.start = function (cb) {
   }
   this._callback = cb;
   this._running = true;
+  this._run++;
   this._paused = false;
   this._frameIndex = 0;
   this._anchorMs = _now();
@@ -99,7 +107,12 @@ FramePacer.prototype.pause = function () {
 FramePacer.prototype.resume = function () {
   if (!this._running || !this._paused) return;
   this._paused = false;
-  if (this._timer !== null) return;
+  // From inside the callback (pause() then resume() there — an onDrain
+  // that fires at once): the tick in progress reschedules on its own
+  // cadence after the callback. This used to schedule a timer here AND
+  // in the tick, two timer chains from then on; pause() cleared only
+  // one, so the other went on calling back while paused.
+  if (this._timer !== null || this._tickRun === this._run) return;
   this._anchorMs = _now();
   this._sinceAnchorIndex = 0;
   this._scheduleNext();
@@ -143,6 +156,8 @@ FramePacer.prototype._scheduleNext = function () {
   self._timer = setTimeout(function () {
     self._timer = null;
     if (!self._running) return;
+    var run = self._run;
+    self._tickRun = run;
     if (self._callback) {
       // Insulate the pacer from callback exceptions: a misbehaving
       // consumer shouldn't kill the timer chain. Errors surface to
@@ -185,6 +200,12 @@ FramePacer.prototype._scheduleNext = function () {
         setTimeout(function () { throw e; }, 0);
       }
     }
+    self._tickRun = 0;
+    // stop() then start() inside the callback: the new run has its own
+    // frame index and timer chain (this tail used to count the frame into
+    // the new run and schedule a second chain beside its own: indexes
+    // repeated and the rate doubled with every restart).
+    if (self._run !== run) return;
     self._frameIndex++;
     self._sinceAnchorIndex++;
     if (self._running && !self._paused) self._scheduleNext();

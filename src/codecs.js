@@ -8,6 +8,7 @@
 
 import { selectEncoder, registerEncoderArgs } from './hw_accel.js';
 import { cpus } from 'node:os';
+import { enforceRange } from './core/webidl.js';
 
 /**
  * WebCodecs profile names (extracted from full codec strings like
@@ -770,7 +771,390 @@ function getAllAudioCodecCapabilities() {
   return getSupportedAudioCodecs().map(getAudioCodecCapabilities);
 }
 
+// ═══════════════════════════════════════════
+// WebCodecs configurations (W3C WebCodecs §7, the codec registrations)
+// ═══════════════════════════════════════════
+//
+// What the four WebCodecs classes share for configure() and
+// isConfigSupported(): the WebIDL conversion of the config dictionaries
+// (enum members and [EnforceRange] integers are TypeErrors), the
+// "valid config" checks of §7.5-7.8 (TypeErrors too), and "Check
+// Configuration Support" (§7.1): a valid codec string per its
+// registration, and a codec that can do the exact profile / bit depth /
+// chroma the string names, at the configured size, rate and channels.
+//
+// These were missing. isConfigSupported() answered from the codec's
+// short name alone (any 'avc1.*' was supported, also 'avc1.FF000b'; a
+// config with width 0 or codec '' resolved instead of rejecting with a
+// TypeError), and configure() took any codec: 'foo' failed only at the
+// first encode(), with an Error through the error callback and the
+// coder left "configured". Unsupported now means: isConfigSupported()
+// resolves { supported: false }; configure() closes the coder with a
+// NotSupportedError, asynchronously (the spec's configure control
+// message).
+//
+// The library's short names ('h264', 'h265', 'vp9', 'av1', 'aac' —
+// ambiguous about profile and level, so not WebCodecs codec strings) stay
+// accepted as an extension, with the codec's defaults; so do 'pcm',
+// 'g711-alaw' and 'g711-ulaw' (the encoders' raw outputs). Every other
+// string must be a registration's exact form (case and whitespace
+// included: 'vP8' and ' vp8' are not 'vp8').
+
+var _H264_PROFILE_IDCS = [66, 77, 88, 100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135];
+var _H264_LEVEL_IDCS = [9, 10, 11, 12, 13, 20, 21, 22, 30, 31, 32, 40, 41, 42, 50, 51, 52, 60, 61, 62];
+var _HEVC_LEVEL_IDCS = [30, 60, 63, 90, 93, 120, 123, 150, 153, 156, 180, 183, 186];
+var _VP9_LEVELS = [10, 11, 20, 21, 30, 31, 40, 41, 50, 51, 52, 60, 61, 62];
+var _AAC_STRINGS = { 'mp4a.40.2': 2, 'mp4a.40.02': 2, 'mp4a.40.5': 5, 'mp4a.40.05': 5,
+  'mp4a.40.29': 29, 'mp4a.40.42': 42, 'mp4a.67': 0x67 };
+var _MP3_STRINGS = { 'mp3': 1, 'mp4a.69': 1, 'mp4a.6B': 1, 'mp4a.40.34': 1 };
+var _PCM_STRINGS = { 'pcm-u8': 1, 'pcm-s16': 1, 'pcm-s24': 1, 'pcm-s32': 1, 'pcm-f32': 1 };
+var _PLAIN_AUDIO = { opus: 1, flac: 1, vorbis: 1, ulaw: 1, alaw: 1 };
+var _SHORT_NAMES = { h264: 1, h265: 1, vp9: 1, av1: 1, aac: 1, pcm: 1, 'g711-alaw': 1, 'g711-ulaw': 1 };
+// ISO/IEC 23091-2 code points (VP9 / AV1 codec strings' colour fields).
+var _COLOUR_PRIMARIES = [1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 22];
+var _TRANSFER = [1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18];
+var _MATRIX = [0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
+
+function _num2(s) { return parseInt(s, 10); }
+
+/**
+ * A WebCodecs codec string read per its registration, or null when it
+ * is not one (nor one of the library's short names).
+ *   { name, short, profile, level, bitDepth, chroma, objectType }
+ * name: the short name the rest of the library uses (normalizeCodec's).
+ * chroma: '420' | '422' | '444' | 'mono' where the string says.
+ */
+function parseWebCodecsCodec(codec) {
+  if (typeof codec !== 'string') return null;
+  var s = codec;
+  var info = { name: null, short: false, profile: null, level: null, bitDepth: null, chroma: null, objectType: null };
+  if (_SHORT_NAMES[s]) { info.name = s; info.short = true; return info; }
+  if (s === 'vp8') { info.name = 'vp8'; return info; }
+  if (_PLAIN_AUDIO[s] || _PCM_STRINGS[s]) { info.name = s; return info; }
+  if (_MP3_STRINGS[s]) { info.name = 'mp3'; return info; }
+  if (Object.prototype.hasOwnProperty.call(_AAC_STRINGS, s)) {
+    info.name = 'aac'; info.objectType = _AAC_STRINGS[s]; return info;
+  }
+  var m;
+  // AVC: avc1.PPCCLL / avc3.PPCCLL (RFC 6381 §3.4, 14496-15 §5.4.1).
+  if ((m = /^avc[13]\.([0-9A-Fa-f]{2})([0-9A-Fa-f]{2})([0-9A-Fa-f]{2})$/.exec(s))) {
+    var p = parseInt(m[1], 16), c = parseInt(m[2], 16), l = parseInt(m[3], 16);
+    if (_H264_PROFILE_IDCS.indexOf(p) < 0 || (c & 0x03) || _H264_LEVEL_IDCS.indexOf(l) < 0) return null;
+    info.name = 'h264'; info.profile = p; info.level = l; info.constraints = c;
+    info.bitDepth = (p === 110 || p === 122 || p === 244 || p === 44) ? null : 8;
+    info.chroma = (p === 122) ? '422' : (p === 244 || p === 44) ? '444' : (p === 110 || p === 100 || p === 66 || p === 77 || p === 88) ? '420' : null;
+    return info;
+  }
+  // HEVC: hev1./hvc1.[A-C]?profile.compat.(L|H)level(.constraint){0,6}
+  // (14496-15 Annex E.3).
+  if ((m = /^(?:hev1|hvc1)\.([ABC]?)(\d{1,2})\.([0-9A-Fa-f]{1,8})\.([LH])(\d{1,3})((?:\.[0-9A-Fa-f]{1,2}){0,6})$/.exec(s))) {
+    var hp = _num2(m[2]), hl = _num2(m[5]);
+    if (hp > 31 || _HEVC_LEVEL_IDCS.indexOf(hl) < 0) return null;
+    info.name = 'h265'; info.profile = hp; info.level = hl; info.tier = m[4];
+    info.profileSpace = m[1] || '';
+    return info;
+  }
+  // VP9: vp09.PP.LL.DD[.CC[.cp[.tc[.mc[.FF]]]]] (VP9-ISOBMFF "Codecs
+  // Parameter String"): two digits each.
+  if ((m = /^vp09\.(\d{2})\.(\d{2})\.(\d{2})((?:\.\d{2}){0,5})$/.exec(s))) {
+    var vp = _num2(m[1]), vl = _num2(m[2]), vd = _num2(m[3]);
+    var rest = m[4] ? m[4].slice(1).split('.').map(_num2) : [];
+    if (vp > 3 || _VP9_LEVELS.indexOf(vl) < 0 || [8, 10, 12].indexOf(vd) < 0) return null;
+    if (vp < 2 && vd !== 8) return null;          // profiles 0 / 1: 8 bit
+    if (vp >= 2 && vd === 8) return null;         // profiles 2 / 3: 10 / 12 bit
+    var cc = rest.length > 0 ? rest[0] : 1;       // default 4:2:0 (colocated)
+    if (cc > 3) return null;
+    if ((vp === 0 || vp === 2) && cc > 1) return null;   // 4:2:0 only
+    if ((vp === 1 || vp === 3) && cc < 2) return null;   // 4:2:2 / 4:4:0 / 4:4:4
+    if (rest.length > 1 && _COLOUR_PRIMARIES.indexOf(rest[1]) < 0) return null;
+    if (rest.length > 2 && _TRANSFER.indexOf(rest[2]) < 0) return null;
+    if (rest.length > 3 && _MATRIX.indexOf(rest[3]) < 0) return null;
+    if (rest.length > 4 && rest[4] > 1) return null;
+    info.name = 'vp9'; info.profile = vp; info.level = vl; info.bitDepth = vd;
+    info.chroma = cc <= 1 ? '420' : cc === 2 ? '422' : '444';
+    return info;
+  }
+  // AV1: av01.P.LLT.DD[.M[.CCC[.cp[.tc[.mc[.F]]]]]] (AV1-ISOBMFF §5).
+  if ((m = /^av01\.(\d)\.(\d{2})([MH])\.(\d{2})(?:\.(\d)(?:\.(\d{3})(?:\.(\d{2})(?:\.(\d{2})(?:\.(\d{2})(?:\.(\d))?)?)?)?)?)?$/.exec(s))) {
+    var ap = _num2(m[1]), al = _num2(m[2]), ad = _num2(m[4]);
+    if (ap > 2 || (al > 23 && al !== 31) || [8, 10, 12].indexOf(ad) < 0) return null;
+    if (m[3] === 'H' && al < 8) return null;      // seq_tier only above level 3.3
+    if (ad === 12 && ap !== 2) return null;       // 12 bit: Professional
+    var mono = m[5] !== undefined ? _num2(m[5]) : 0;
+    if (mono > 1 || (mono && ap === 1)) return null;
+    var cs = m[6] !== undefined ? m[6] : (mono ? '111' : (ap === 1 ? '000' : '110'));
+    if (['110', '111', '112', '100', '000'].indexOf(cs) < 0) return null;
+    if (ap === 0 && cs.slice(0, 2) !== '11') return null;   // Main: 4:2:0 / mono
+    if (ap === 1 && cs !== '000') return null;               // High: 4:4:4
+    if (mono && cs.slice(0, 2) !== '11') return null;
+    if (m[7] !== undefined && _COLOUR_PRIMARIES.indexOf(_num2(m[7])) < 0) return null;
+    if (m[8] !== undefined && _TRANSFER.indexOf(_num2(m[8])) < 0) return null;
+    if (m[9] !== undefined && _MATRIX.indexOf(_num2(m[9])) < 0) return null;
+    if (m[10] !== undefined && _num2(m[10]) > 1) return null;
+    info.name = 'av1'; info.profile = ap; info.level = al; info.bitDepth = ad;
+    info.chroma = mono ? 'mono' : cs === '000' ? '444' : cs === '100' ? '422' : '420';
+    return info;
+  }
+  return null;
+}
+
+// What the FFmpeg codecs here can do. Encoders get yuv420p (8-bit
+// 4:2:0: VideoEncoder's -pix_fmt) — a 10-bit, 4:2:2 or 4:4:4 profile
+// would be encoded as something else; libx264 / libx265 need even
+// sizes in 4:2:0. FFmpeg's own AAC encoder is LC only (an HE-AAC string
+// came out as LC labelled 'mp4a.40.5'); libopus takes its five rates
+// and, with the default mapping, up to 8 channels.
+var _ADTS_RATES = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350];
+var CONFIG_CAPS = {
+  videoEncoder: {
+    vp8:  { maxSize: 16383 },
+    vp9:  { profiles: [0], bitDepths: [8], chroma: ['420'], maxSize: 65536 },
+    av1:  { profiles: [0], bitDepths: [8], chroma: ['420'], maxSize: 65536 },
+    h264: { profiles: [66, 77, 100], bitDepths: [8], chroma: ['420'], maxSize: 16384, even: true },
+    h265: { profiles: [1], bitDepths: [8], chroma: ['420'], maxSize: 16384, even: true },
+  },
+  videoDecoder: {
+    vp8:  {},
+    vp9:  { profiles: [0, 1, 2, 3] },
+    av1:  { profiles: [0, 1, 2] },
+    h264: { profiles: [66, 77, 88, 100, 110, 122, 244, 44] },
+    h265: { profiles: [1, 2, 3, 4] },
+  },
+  audioEncoder: {
+    aac:  { objectTypes: [2], sampleRates: _ADTS_RATES, maxChannels: 8 },
+    opus: { sampleRates: [8000, 12000, 16000, 24000, 48000], maxChannels: 8 },
+    mp3:  { sampleRates: [8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000], maxChannels: 2 },
+    flac: { maxRate: 655350, maxChannels: 8 },
+    vorbis: { maxChannels: 8 },
+    'g711-alaw': {}, 'g711-ulaw': {}, alaw: {}, ulaw: {}, pcm: {},
+  },
+  audioDecoder: {
+    aac:  { objectTypes: [2, 5, 29, 0x67] },
+    opus: { maxChannels: 255 },
+    mp3: {}, flac: {}, vorbis: { needsDescription: true },
+    alaw: {}, ulaw: {}, 'g711-alaw': {}, 'g711-ulaw': {},
+    'pcm-u8': {}, 'pcm-s16': {}, 'pcm-s24': {}, 'pcm-s32': {}, 'pcm-f32': {},
+  },
+};
+
+var SCALABILITY_MODES = ['L1T1', 'L1T2', 'L1T3'];
+
+function _videoCaps(caps, info) {
+  if (!caps) return false;
+  if (info.profile !== null && caps.profiles && caps.profiles.indexOf(info.profile) < 0) return false;
+  if (info.bitDepth !== null && caps.bitDepths && caps.bitDepths.indexOf(info.bitDepth) < 0) return false;
+  if (info.chroma !== null && caps.chroma && caps.chroma.indexOf(info.chroma) < 0) return false;
+  // A profile whose bit depth / chroma the string leaves open (H.264
+  // High 10 and up) is the profile's, not 8-bit 4:2:0.
+  if (info.name === 'h264' && info.profile !== null && caps.bitDepths && info.bitDepth === null) return false;
+  return true;
+}
+
+/** Check Configuration Support for a (valid) VideoEncoderConfig. */
+function videoEncoderConfigSupported(config) {
+  var info = parseWebCodecsCodec(config.codec);
+  if (!info) return false;
+  var caps = CONFIG_CAPS.videoEncoder[info.name];
+  if (!_videoCaps(caps, info)) return false;
+  if (config.width > caps.maxSize || config.height > caps.maxSize) return false;
+  if (caps.even && ((config.width & 1) || (config.height & 1))) return false;
+  if (config.scalabilityMode !== undefined && SCALABILITY_MODES.indexOf(config.scalabilityMode) < 0) return false;
+  if (config.alpha === 'keep') return false;      // no alpha side data from FFmpeg
+  try { return !!getVideoCodec(info.name, config); } catch (e) { return false; }
+}
+
+/** Check Configuration Support for a (valid) VideoDecoderConfig. */
+function videoDecoderConfigSupported(config, descriptionOk) {
+  var info = parseWebCodecsCodec(config.codec);
+  if (!info) return false;
+  var caps = CONFIG_CAPS.videoDecoder[info.name];
+  if (!_videoCaps(caps, info)) return false;
+  return descriptionOk !== false;
+}
+
+/** Check Configuration Support for a (valid) AudioEncoderConfig. */
+function audioEncoderConfigSupported(config) {
+  var info = parseWebCodecsCodec(config.codec);
+  if (!info) return false;
+  var caps = CONFIG_CAPS.audioEncoder[info.name];
+  if (!caps) return false;
+  if (info.objectType !== null && caps.objectTypes && caps.objectTypes.indexOf(info.objectType) < 0) return false;
+  if (caps.sampleRates && caps.sampleRates.indexOf(config.sampleRate) < 0) return false;
+  if (caps.maxRate && config.sampleRate > caps.maxRate) return false;
+  if (caps.maxChannels && config.numberOfChannels > caps.maxChannels) return false;
+  if (info.name === 'opus' && config.opus && config.opus.format === 'ogg') return false;   // raw packets only
+  try { return !!getAudioCodec(info.name, config); } catch (e) { return false; }
+}
+
+/** Check Configuration Support for a (valid) AudioDecoderConfig. */
+function audioDecoderConfigSupported(config, descriptionOk) {
+  var info = parseWebCodecsCodec(config.codec);
+  if (!info) return false;
+  var caps = CONFIG_CAPS.audioDecoder[info.name];
+  if (!caps) return false;
+  if (info.objectType !== null && caps.objectTypes && caps.objectTypes.indexOf(info.objectType) < 0) return false;
+  if (caps.maxChannels && config.numberOfChannels > caps.maxChannels) return false;
+  if (caps.needsDescription && !config.description) return false;
+  return descriptionOk !== false;
+}
+
+// ── WebIDL conversion and validity ──
+//
+// A dictionary's members are converted in lexicographic order (WebIDL
+// §3.2.17), the first bad one throws. Each entry: [member, kind, arg].
+//   'enum' (arg: values), 'ul' ([EnforceRange] unsigned long), 'ull'
+//   (unsigned long long), 'req' (required, any value), 'dict' (arg: a
+//   nested entry list).
+var _HW = ['no-preference', 'prefer-hardware', 'prefer-software'];
+var VIDEO_ENCODER_CONFIG_IDL = [
+  ['alpha', 'enum', ['keep', 'discard']],
+  ['avc', 'dict', [['format', 'enum', ['annexb', 'avc']]]],
+  ['bitrate', 'ull'],
+  ['bitrateMode', 'enum', ['constant', 'variable', 'quantizer']],
+  ['codec', 'req'],
+  ['displayHeight', 'ul'],
+  ['displayWidth', 'ul'],
+  ['hardwareAcceleration', 'enum', _HW],
+  ['height', 'ul', 'req'],
+  ['hevc', 'dict', [['format', 'enum', ['annexb', 'hevc']]]],
+  ['latencyMode', 'enum', ['quality', 'realtime']],
+  ['width', 'ul', 'req'],
+];
+var VIDEO_DECODER_CONFIG_IDL = [
+  ['codec', 'req'],
+  ['codedHeight', 'ul'],
+  ['codedWidth', 'ul'],
+  ['displayAspectHeight', 'ul'],
+  ['displayAspectWidth', 'ul'],
+  ['hardwareAcceleration', 'enum', _HW],
+];
+var AUDIO_ENCODER_CONFIG_IDL = [
+  ['aac', 'dict', [['format', 'enum', ['aac', 'adts']]]],
+  ['bitrate', 'ull'],
+  ['bitrateMode', 'enum', ['constant', 'variable']],
+  ['codec', 'req'],
+  ['numberOfChannels', 'ul', 'req'],
+  ['opus', 'dict', [
+    ['application', 'enum', ['voip', 'audio', 'lowdelay']],
+    ['complexity', 'ul'],
+    ['format', 'enum', ['opus', 'ogg']],
+    ['frameDuration', 'ull'],
+    ['packetlossperc', 'ul'],
+    ['signal', 'enum', ['auto', 'music', 'voice']],
+  ]],
+  ['sampleRate', 'ul', 'req'],
+];
+var AUDIO_DECODER_CONFIG_IDL = [
+  ['codec', 'req'],
+  ['numberOfChannels', 'ul', 'req'],
+  ['sampleRate', 'ul', 'req'],
+];
+
+var _RANGE = { ul: 'unsigned long', ull: 'unsigned long long' };
+
+function _quoteList(values) {
+  return values.map(function (v) { return "'" + v + "'"; }).join(' or ');
+}
+
+/** WebIDL-convert `config` per `idl`: a converted copy, or throws a TypeError. */
+function _convertDict(config, idl, prefix, path) {
+  var out = {};
+  for (var k in config) if (Object.prototype.hasOwnProperty.call(config, k)) out[k] = config[k];
+  for (var i = 0; i < idl.length; i++) {
+    var name = idl[i][0], kind = idl[i][1], arg = idl[i][2];
+    var v = config[name];
+    var what = path + name;
+    if (v === undefined) {
+      if (kind === 'req' || arg === 'req') throw new TypeError(prefix + ': ' + what + ' required');
+      continue;
+    }
+    if (kind === 'enum') {
+      var sv = String(v);
+      if (arg.indexOf(sv) < 0) throw new TypeError(prefix + ': ' + what + ' must be ' + _quoteList(arg) + " (got '" + sv + "')");
+      out[name] = sv;
+    } else if (kind === 'ul' || kind === 'ull') {
+      out[name] = enforceRange(v, _RANGE[kind], prefix + ': ' + what);
+    } else if (kind === 'dict') {
+      if (v === null || typeof v !== 'object') {
+        if (v === null) continue;   // null is an empty dictionary
+        throw new TypeError(prefix + ': ' + what + ' must be a dictionary');
+      }
+      out[name] = _convertDict(v, arg, prefix, what + '.');
+    } else if (kind === 'req') {
+      out[name] = String(v);
+    }
+  }
+  return out;
+}
+
+// "codec is empty after stripping leading and trailing ASCII whitespace"
+function _emptyCodec(codec) { return String(codec).replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, '') === ''; }
+
+var _OPUS_FRAME_DURATIONS = [2500, 5000, 10000, 20000, 40000, 60000];
+
+/**
+ * The WebIDL conversion + "valid VideoEncoderConfig" (§7.8): the
+ * converted config, or throws the TypeError. `prefix`: the method
+ * ('VideoEncoder.configure', 'VideoEncoder.isConfigSupported').
+ */
+function checkVideoEncoderConfig(config, prefix) {
+  if (!config || typeof config !== 'object') throw new TypeError(prefix + ': config required');
+  var c = _convertDict(config, VIDEO_ENCODER_CONFIG_IDL, prefix, '');
+  if (_emptyCodec(c.codec)) throw new TypeError(prefix + ': codec required');
+  if (c.width === 0 || c.height === 0) throw new TypeError(prefix + ': width and height must not be 0');
+  if (c.displayWidth === 0 || c.displayHeight === 0) throw new TypeError(prefix + ': displayWidth and displayHeight must not be 0');
+  if (c.bitrate === 0) throw new TypeError(prefix + ': bitrate must not be 0');
+  return c;
+}
+
+/** Conversion + "valid VideoDecoderConfig" (§7.6). */
+function checkVideoDecoderConfig(config, prefix) {
+  if (!config || typeof config !== 'object') throw new TypeError(prefix + ': config required');
+  var c = _convertDict(config, VIDEO_DECODER_CONFIG_IDL, prefix, '');
+  if (_emptyCodec(c.codec)) throw new TypeError(prefix + ': codec required');
+  if ((c.codedWidth === undefined) !== (c.codedHeight === undefined)) throw new TypeError(prefix + ': codedWidth and codedHeight must be given together');
+  if (c.codedWidth === 0 || c.codedHeight === 0) throw new TypeError(prefix + ': codedWidth and codedHeight must not be 0');
+  if ((c.displayAspectWidth === undefined) !== (c.displayAspectHeight === undefined)) throw new TypeError(prefix + ': displayAspectWidth and displayAspectHeight must be given together');
+  if (c.displayAspectWidth === 0 || c.displayAspectHeight === 0) throw new TypeError(prefix + ': displayAspectWidth and displayAspectHeight must not be 0');
+  return c;
+}
+
+/** Conversion + "valid AudioEncoderConfig" (§7.7), with the Opus registration's checks. */
+function checkAudioEncoderConfig(config, prefix) {
+  if (!config || typeof config !== 'object') throw new TypeError(prefix + ': config required');
+  var c = _convertDict(config, AUDIO_ENCODER_CONFIG_IDL, prefix, '');
+  if (_emptyCodec(c.codec)) throw new TypeError(prefix + ': codec required');
+  // A codec-specific extension of the config's own codec whose
+  // registration has validity steps decides alone — §7.7 step 2 returns
+  // their result (Opus registration §6.1, "check if an OpusEncoderConfig
+  // is valid"; frameDuration's default 20000 is valid).
+  if (c.codec === 'opus' && c.opus) {
+    var o = c.opus;
+    if (o.frameDuration !== undefined && _OPUS_FRAME_DURATIONS.indexOf(o.frameDuration) < 0) {
+      throw new TypeError(prefix + ': opus.frameDuration must be one of ' + _OPUS_FRAME_DURATIONS.join(', ') + ' µs (got ' + o.frameDuration + ')');
+    }
+    if (o.complexity !== undefined && o.complexity > 10) throw new TypeError(prefix + ': opus.complexity must be 0..10 (got ' + o.complexity + ')');
+    if (o.packetlossperc !== undefined && o.packetlossperc > 100) throw new TypeError(prefix + ': opus.packetlossperc must be 0..100 (got ' + o.packetlossperc + ')');
+    return c;
+  }
+  if (c.sampleRate === 0 || c.numberOfChannels === 0) throw new TypeError(prefix + ': sampleRate and numberOfChannels must not be 0');
+  return c;
+}
+
+/** Conversion + "valid AudioDecoderConfig" (§7.5). */
+function checkAudioDecoderConfig(config, prefix) {
+  if (!config || typeof config !== 'object') throw new TypeError(prefix + ': config required');
+  var c = _convertDict(config, AUDIO_DECODER_CONFIG_IDL, prefix, '');
+  if (_emptyCodec(c.codec)) throw new TypeError(prefix + ': codec required');
+  if (c.sampleRate === 0 || c.numberOfChannels === 0) throw new TypeError(prefix + ': sampleRate and numberOfChannels must not be 0');
+  return c;
+}
+
 export {
+  parseWebCodecsCodec, CONFIG_CAPS, SCALABILITY_MODES,
+  videoEncoderConfigSupported, videoDecoderConfigSupported,
+  audioEncoderConfigSupported, audioDecoderConfigSupported,
+  checkVideoEncoderConfig, checkVideoDecoderConfig, checkAudioEncoderConfig, checkAudioDecoderConfig,
   getVideoCodec, getAudioCodec,
   getSupportedVideoCodecs, getSupportedAudioCodecs,
   getVideoCodecCapabilities, getAudioCodecCapabilities,

@@ -5,7 +5,8 @@
 
 import { frameByteSize } from './core/frame_size.js';
 import { initCoder, configureCoder, applyCoderPrototype, watchExit, detachCoderListeners,
-  addPendingFlush, removePendingFlush } from './base_coder.js';
+  addPendingFlush, removePendingFlush, holdingCalls, holdCall, failUnsupported, domex } from './base_coder.js';
+import { checkVideoDecoderConfig, videoDecoderConfigSupported } from './codecs.js';
 import { normalizeCodec } from './utils/codec_strings.js';
 import FrameQueue from './core/frame_queue.js';
 import { writeU16LE, writeU32LE, fromAscii } from './core/bytes.js';
@@ -44,7 +45,18 @@ var _baseReset = VideoDecoder.prototype.reset;
 var _baseClose = VideoDecoder.prototype.close;
 
 VideoDecoder.prototype.configure = function (config) {
-  if (!config || !config.codec) throw new TypeError('VideoDecoder.configure: codec required');
+  // W3C: the WebIDL conversion and "valid VideoDecoderConfig" are
+  // TypeErrors, then a closed decoder an InvalidStateError (codecs.js).
+  config = checkVideoDecoderConfig(config, 'VideoDecoder.configure');
+  if (this._state === 'closed') throw domex('Cannot configure a closed coder', 'InvalidStateError');
+  if (holdingCalls(this)) {
+    // Queued behind a flush() in progress (base_coder holdCalls).
+    var self = this;
+    this._state = 'configured';
+    this._keyChunkRequired = true;
+    holdCall(this, function () { self.configure(config); }, false);
+    return;
+  }
 
   // Per W3C WebCodecs §6.5: codedWidth and codedHeight are OPTIONAL
   // in VideoDecoderConfig (the spec defaults them from the decoded
@@ -74,8 +86,9 @@ VideoDecoder.prototype.configure = function (config) {
   var bitstream = (vcodec === 'h264' || vcodec === 'h265')
     ? bitstreamFromDescription(config.description ? toUint8Array(config.description) : null, vcodec === 'h265')
     : { lengthSize: 0, paramSets: null };
-  if (bitstream.error) throw new TypeError('VideoDecoder.configure: ' + bitstream.error);
-  if (this._state === 'closed') configureCoder(this);   // throws InvalidStateError
+  // A description that is not one (bitstream.error) is a config the
+  // decoder cannot do: NotSupportedError below (it was a TypeError; W3C
+  // keeps TypeErrors for invalid configs, §7.6).
 
   // Reconfiguring while chunks are in flight, or while a previous
   // reconfigure is still draining: queue it (see _drainThenConfigure).
@@ -132,11 +145,24 @@ VideoDecoder.prototype.configure = function (config) {
   this._bytesPerFrame = frameByteSize('I420', w, h);
   this._fq = null;
 
+  // The config's display aspect, orientation and colour space go on
+  // every frame (W3C Output VideoFrames); they were ignored.
+  this._frameMeta = {
+    displayAspectWidth: config.displayAspectWidth, displayAspectHeight: config.displayAspectHeight,
+    rotation: config.rotation || 0, flip: !!config.flip, colorSpace: config.colorSpace || null,
+  };
+
   this.context.state = 'configured';
   this.context.codec = this._config.codec;
   this.context.width = w;
   this.context.height = h;
   this.context.frameCount = 0;
+
+  // Check Configuration Support (codecs.js).
+  if (!videoDecoderConfigSupported(config, !bitstream.error)) {
+    failUnsupported(this, domex("VideoDecoder.configure: unsupported config (codec '" + config.codec + "')" +
+      (bitstream.error ? ': ' + bitstream.error : ''), 'NotSupportedError'));
+  }
 };
 
 // configure() with chunks still in flight. W3C queues configure() behind
@@ -166,8 +192,15 @@ VideoDecoder.prototype._drainThenConfigure = function (config) {
     for (var i = 0; i < items.length; i++) {
       if (self._draining) { self._draining.items.push(items[i]); continue; }
       try {
+        // A decode() was checked and counted when it was made. Calls held
+        // meanwhile (a flush() made during the drain, the configure() just
+        // replayed being held behind it) keep the rest behind them: the
+        // decodes were written straight to the decoder, ahead of the
+        // configure() made before them — decoded with the configuration
+        // they were not submitted under.
         if (items[i].config) self.configure(items[i].config);
-        else self.decode(items[i].chunk);
+        else if (holdingCalls(self)) holdCall(self, (function (c) { return function () { self._decodeNow(c); }; })(items[i].chunk), true);
+        else self._decodeNow(items[i].chunk);
       } catch (e) {
         self._error(e);
         return;
@@ -182,6 +215,7 @@ VideoDecoder.prototype._drainThenConfigure = function (config) {
 VideoDecoder.prototype.flush = function (cb) {
   var self = this;
   if (!this._draining) return _baseFlush.call(this, cb);
+  this._keyChunkRequired = true;   // W3C: set by flush() itself
   // Resolves after the queued chunks are out too: flush again once the
   // drain has replayed them.
   var p = new Promise(function (resolve, reject) {
@@ -240,13 +274,23 @@ VideoDecoder.prototype.decode = function (chunk) {
     throw inputErr;
   }
 
+  this._queueSize++;
   if (this._draining) {
     // A reconfigure is draining: decoded after it, in order.
-    this._queueSize++;
     this._draining.items.push({ chunk: chunk });
     return;
   }
+  if (holdingCalls(this)) {
+    // Queued behind a flush() in progress (base_coder holdCalls).
+    var self = this;
+    holdCall(this, function () { self._decodeNow(chunk); }, true);
+    return;
+  }
+  this._decodeNow(chunk);
+};
 
+VideoDecoder.prototype._decodeNow = function (chunk) {
+  if (this._draining) { this._draining.items.push({ chunk: chunk }); return; }
   if (!this._ffmpeg.running) this._startFFmpeg();
 
   var containerName = getDefaultContainer(this._config.codec);
@@ -267,7 +311,6 @@ VideoDecoder.prototype.decode = function (chunk) {
       _writeIvfFrameAt(ivfData, 0, chunk.data.length, this._decodeIndex++);
       ivfData.set(chunk.data, 12);
     }
-    this._queueSize++;
     this._ffmpeg.write(ivfData);
   } else {
     // H.264 / H.265 reach FFmpeg as Annex-B: convert length-prefixed
@@ -293,7 +336,6 @@ VideoDecoder.prototype.decode = function (chunk) {
     combined.set(body, psLen);
     combined.set(aud, psLen + body.length);
     if (ps) this._descriptionSent = true;
-    this._queueSize++;
     this._ffmpeg.write(combined);
   }
 
@@ -499,14 +541,16 @@ VideoDecoder.prototype._startFFmpeg = function () {
     } else {
       ts = Math.round((self._frameIndex * 1e6) / (cfg.framerate || 30));
     }
-    var vf = new VideoFrame({
+    var init = {
       data: frameBuf,
       format: 'I420',
       codedWidth: self._outWidth,
       codedHeight: self._outHeight,
       timestamp: ts,
       duration: dur,
-    });
+    };
+    _applyFrameMeta(init, self._frameMeta, self._outWidth, self._outHeight);
+    var vf = new VideoFrame(init);
     self._frameIndex++;
     self.context.frameCount = self._frameIndex;
     self._output(vf);
@@ -535,6 +579,26 @@ VideoDecoder.prototype._startFFmpeg = function () {
   });
   self._ffmpeg.on('error', function (e) { self._error(e); });
 };
+
+/**
+ * W3C Output VideoFrames / Create a VideoFrame: the config's rotation and
+ * flip, its colorSpace, and the display size grown until its ratio is
+ * displayAspectWidth : displayAspectHeight.
+ */
+function _applyFrameMeta(init, meta, w, h) {
+  if (!meta) return;
+  if (meta.rotation) init.rotation = meta.rotation;
+  if (meta.flip) init.flip = true;
+  if (meta.colorSpace) init.colorSpace = meta.colorSpace;
+  var aw = meta.displayAspectWidth, ah = meta.displayAspectHeight;
+  if (aw && ah) {
+    var dw = w, dh = h;
+    if (dw * ah < dh * aw) dw = Math.round(dh * aw / ah);
+    else if (dw * ah > dh * aw) dh = Math.round(dw * ah / aw);
+    init.displayWidth = dw;
+    init.displayHeight = dh;
+  }
+}
 
 // One second of 1080p is far more than the startup window ever needs;
 // crossing it means the stream report is not coming.
@@ -636,13 +700,20 @@ VideoDecoder.isConfigSupported = function (config) {
   // configure() does. The container table knows only short names, so
   // every WebCodecs codec string — avc1.*, vp09.*, av01.*, hvc1.* —
   // was reported unsupported while configure() accepted it.
-  var supported = false;
-  try {
-    supported = !!(config && config.codec && getDefaultContainer(normalizeCodec(config.codec)));
-  } catch (e) { supported = false; }
+  //
+  // W3C: an invalid config rejects with a TypeError; supported is Check
+  // Configuration Support (codecs.js), with an avc / hevc description
+  // that has to be a record.
+  var c;
+  try { c = checkVideoDecoderConfig(config, 'VideoDecoder.isConfigSupported'); }
+  catch (e) { return Promise.reject(e); }
+  var vcodec = normalizeCodec(c.codec), descOk = true;
+  if ((vcodec === 'h264' || vcodec === 'h265') && c.description) {
+    descOk = !bitstreamFromDescription(toUint8Array(c.description), vcodec === 'h265').error;
+  }
   return Promise.resolve({
-    supported: supported,
-    config: _cloneDecoderConfig(config),
+    supported: videoDecoderConfigSupported(c, descOk),
+    config: _cloneDecoderConfig(c),
   });
 };
 
@@ -652,7 +723,7 @@ VideoDecoder.isConfigSupported = function (config) {
 var _DECODER_CONFIG_KEYS = [
   'codec', 'codedWidth', 'codedHeight', 'description', 'framerate',
   'displayAspectWidth', 'displayAspectHeight', 'colorSpace',
-  'hardwareAcceleration', 'optimizeForLatency',
+  'hardwareAcceleration', 'optimizeForLatency', 'rotation', 'flip',
 ];
 function _cloneDecoderConfig(config) {
   var out = {};

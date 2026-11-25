@@ -3,10 +3,11 @@
  * Validates input data alignment.
  */
 
-import { initCoder, configureCoder, wireReader, applyCoderPrototype, watchExit, detachCoderListeners, failCoder } from './base_coder.js';
+import { initCoder, configureCoder, wireReader, applyCoderPrototype, watchExit, detachCoderListeners, failCoder,
+  holdCalls, holdingCalls, holdCall, failUnsupported, drainThen, domex } from './base_coder.js';
 import { normalizeCodec } from './utils/codec_strings.js';
 import { EncodedAudioChunk } from './encoded_chunk.js';
-import { getAudioCodec } from './codecs.js';
+import { getAudioCodec, checkAudioEncoderConfig, audioEncoderConfigSupported } from './codecs.js';
 import { getDefaultContainer, getContainer, getContainerFormat, getContainerExtra } from './containers.js';
 import { getOpusPacketDurationUs } from './utils/opus_utils.js';
 import { buildAudioSpecificConfig, stripAdts, audioSpecificConfigFromAdts, parseAdtsHeader } from './utils/aac_utils.js';
@@ -72,107 +73,22 @@ var _VALID_OPUS_SIGNALS = ['auto', 'voice', 'music'];
 var _VALID_OPUS_APPLICATIONS = ['voip', 'audio', 'lowdelay'];
 
 function _validateAndMapOpusConfig(opus) {
+  // The checks (TypeErrors for what the registration calls invalid, and
+  // 'ogg' unsupported) are codecs.js checkAudioEncoderConfig /
+  // audioEncoderConfigSupported: W3C makes an invalid OpusEncoderConfig a
+  // TypeError and an unsupported one a NotSupportedError through close —
+  // here they were NotSupportedErrors thrown out of configure(). The
+  // format is always 'opus' (raw packets); an 'ogg' one is not supported.
   var out = {};
-
-  if (opus.format !== undefined) {
-    if (_VALID_OPUS_FORMATS.indexOf(opus.format) === -1) {
-      _throwNotSupported(
-        "OpusEncoderConfig.format must be 'opus' or 'ogg', got " +
-        JSON.stringify(opus.format)
-      );
-    }
-    // Our pipeline always emits raw Opus packets (the OGG container
-    // reader unpacks pages → Opus packets → EncodedAudioChunk). That
-    // matches OpusBitstreamFormat='opus' chunk semantics from the
-    // codec registration spec ("Opus packets, as described in section
-    // 3 of [OPUS]"). 'ogg' would require additionally setting an
-    // Identification Header on AudioDecoderConfig.description per
-    // [OPUS-IN-OGG] §5.1 — out of scope for this iteration. Reject
-    // explicitly so callers don't get silently-wrong behavior.
-    if (opus.format === 'ogg') {
-      _throwNotSupported(
-        "OpusEncoderConfig.format='ogg' is not yet supported (only 'opus' " +
-        "raw-packet chunks are emitted; pass codecOptions ['-f','ogg'] " +
-        "to bypass the OGG reader if you need framed output)"
-      );
-    }
-    // out.format intentionally not set — current default is already 'opus'.
-  }
-
-  if (opus.signal !== undefined) {
-    if (_VALID_OPUS_SIGNALS.indexOf(opus.signal) === -1) {
-      _throwNotSupported(
-        "OpusEncoderConfig.signal must be 'auto', 'voice', or 'music', got " +
-        JSON.stringify(opus.signal)
-      );
-    }
-    out.signal = opus.signal;
-  }
-
-  if (opus.application !== undefined) {
-    if (_VALID_OPUS_APPLICATIONS.indexOf(opus.application) === -1) {
-      _throwNotSupported(
-        "OpusEncoderConfig.application must be 'voip', 'audio', or 'lowdelay', got " +
-        JSON.stringify(opus.application)
-      );
-    }
-    out.application = opus.application;
-  }
-
-  if (opus.frameDuration !== undefined) {
-    if (typeof opus.frameDuration !== 'number' ||
-        _VALID_OPUS_FRAME_DURATIONS_US.indexOf(opus.frameDuration) === -1) {
-      _throwNotSupported(
-        "OpusEncoderConfig.frameDuration must be one of " +
-        _VALID_OPUS_FRAME_DURATIONS_US.join(', ') + " µs (got " +
-        opus.frameDuration + ")"
-      );
-    }
-    // codecs.js consumes ptimeMs (libopus uses ms). Spec is in µs.
-    out.ptimeMs = opus.frameDuration / 1000;
-  }
-
-  if (opus.complexity !== undefined) {
-    if (typeof opus.complexity !== 'number' ||
-        !Number.isInteger(opus.complexity) ||
-        opus.complexity < 0 || opus.complexity > 10) {
-      _throwNotSupported(
-        "OpusEncoderConfig.complexity must be an integer 0..10 (got " +
-        opus.complexity + ")"
-      );
-    }
-    out.complexity = opus.complexity;
-  }
-
-  if (opus.packetlossperc !== undefined) {
-    if (typeof opus.packetlossperc !== 'number' ||
-        !Number.isInteger(opus.packetlossperc) ||
-        opus.packetlossperc < 0 || opus.packetlossperc > 100) {
-      _throwNotSupported(
-        "OpusEncoderConfig.packetlossperc must be an integer 0..100 (got " +
-        opus.packetlossperc + ")"
-      );
-    }
-    out.packetlossperc = opus.packetlossperc;
-  }
-
-  if (opus.useinbandfec !== undefined) {
-    out.useinbandfec = !!opus.useinbandfec;
-  }
-
-  if (opus.usedtx !== undefined) {
-    out.usedtx = !!opus.usedtx;
-  }
-
+  if (opus.signal !== undefined) out.signal = opus.signal;
+  if (opus.application !== undefined) out.application = opus.application;
+  // codecs.js consumes ptimeMs (libopus uses ms). Spec is in µs.
+  if (opus.frameDuration !== undefined) out.ptimeMs = opus.frameDuration / 1000;
+  if (opus.complexity !== undefined) out.complexity = opus.complexity;
+  if (opus.packetlossperc !== undefined) out.packetlossperc = opus.packetlossperc;
+  if (opus.useinbandfec !== undefined) out.useinbandfec = !!opus.useinbandfec;
+  if (opus.usedtx !== undefined) out.usedtx = !!opus.usedtx;
   return out;
-}
-
-function _throwNotSupported(msg) {
-  // Per WebCodecs spec (§"configure()"): invalid configuration values
-  // reject the configure step with NotSupportedError.
-  var e = new Error(msg);
-  e.name = 'NotSupportedError';
-  throw e;
 }
 
 function AudioEncoder(init) {
@@ -202,7 +118,35 @@ function AudioEncoder(init) {
 applyCoderPrototype(AudioEncoder, { role: 'encoder' });
 
 AudioEncoder.prototype.configure = function (config) {
-  if (!config || !config.codec) throw new TypeError('AudioEncoder.configure: codec required');
+  // W3C: the WebIDL conversion and "valid AudioEncoderConfig" (with the
+  // Opus registration's checks) are TypeErrors, then a closed encoder an
+  // InvalidStateError (codecs.js).
+  config = checkAudioEncoderConfig(config, 'AudioEncoder.configure');
+  if (this._state === 'closed') throw domex('Cannot configure a closed coder', 'InvalidStateError');
+  var self = this;
+  if (holdingCalls(this)) {
+    // Queued behind a flush() in progress (base_coder holdCalls).
+    this._state = 'configured';
+    holdCall(this, function () { self._configureRun(config); }, false);
+    return;
+  }
+  this._configureRun(config);
+};
+
+// Frames / chunks in flight finish with the configuration they were
+// made under (drainThen); else configure now. Also for a configure()
+// held behind a flush: decided when it runs.
+AudioEncoder.prototype._configureRun = function (config) {
+  var self = this;
+  if (this._state === 'configured' && this._ffmpeg.running && this._queueSize > 0) {
+    // Frames in flight: they finish with this configuration (drainThen).
+    drainThen(this, function () { self._configureNow(config); });
+    return;
+  }
+  this._configureNow(config);
+};
+
+AudioEncoder.prototype._configureNow = function (config) {
   configureCoder(this);
 
   var normalizedCodec = normalizeCodec(config.codec);
@@ -222,10 +166,7 @@ AudioEncoder.prototype.configure = function (config) {
 
   var aacFormat = null;
   if (normalizedCodec === 'aac') {
-    aacFormat = (config.aac && config.aac.format !== undefined) ? config.aac.format : 'aac';
-    if (!_AAC_FORMATS[aacFormat]) {
-      throw new TypeError("AudioEncoder.configure: aac.format must be 'aac' or 'adts' (got '" + aacFormat + "')");
-    }
+    aacFormat = (config.aac && config.aac.format !== undefined) ? config.aac.format : 'aac';   // checked by codecs.js
   }
 
   this._config = {
@@ -234,8 +175,9 @@ AudioEncoder.prototype.configure = function (config) {
     // never the short name — a browser AudioDecoder rejects 'aac'.
     codecString: String(config.codec),
     aacFormat: aacFormat,
-    sampleRate: config.sampleRate || 48000,
-    numberOfChannels: config.numberOfChannels || 2,
+    // Required members (W3C); they were 48000 / 2 when missing.
+    sampleRate: config.sampleRate,
+    numberOfChannels: config.numberOfChannels,
     bitrate: config.bitrate || 0,
     bitrateMode: config.bitrateMode || 'variable',  // 'constant','variable'
     codecOptions: config.codecOptions || null,
@@ -259,13 +201,12 @@ AudioEncoder.prototype.configure = function (config) {
   // NotSupportedError — e.g. Opus at 44100 Hz) closes the encoder with
   // that error, asynchronously. It surfaced as an exception thrown out of
   // the FIRST encode() instead, from _startFFmpeg.
+  // Check Configuration Support (codecs.js) does that check too.
+  var nsMsg = null;
   try { getAudioCodec(normalizedCodec, this._config); }
-  catch (eCfg) {
-    var selfCfg = this;
-    var nsErr = new Error(eCfg && eCfg.message || String(eCfg));
-    nsErr.name = 'NotSupportedError';
-    queueMicrotask(function () { failCoder(selfCfg, nsErr); });
-  }
+  catch (eCfg) { nsMsg = eCfg && eCfg.message || String(eCfg); }
+  if (!nsMsg && !audioEncoderConfigSupported(config)) nsMsg = "AudioEncoder.configure: unsupported config (codec '" + config.codec + "')";
+  if (nsMsg) failUnsupported(this, domex(nsMsg, 'NotSupportedError'));
 
   this._encodeCount = 0;
   // ── W3C timestamp anchoring ──
@@ -286,6 +227,15 @@ AudioEncoder.prototype.configure = function (config) {
   // the next run's output restarted at the first run's timestamps.
   this._runSegments = [];
   this._runInputUs = 0;
+  // The PCM format FFmpeg is fed (s16 or f32, see encode()) is decided
+  // again by the first AudioData of this configuration. It was decided by
+  // the encoder's first AudioData ever and kept across configure(): an
+  // encoder first fed s16, reconfigured and fed f32, converted every f32
+  // frame to s16 (clipping beyond ±1, 16-bit precision) — the format was
+  // meant to follow the frames of the configuration they are encoded
+  // under. (This runs when the configuration applies: after the frames
+  // in flight have drained in the previous one's format, drainThen.)
+  this._inputFormat = null;
   this._decoderConfigSent = false;  // emit decoderConfig on first output chunk
   this._opusHead = null;            // captured from ogg stream (opus only)
   this.context.state = 'configured';
@@ -307,13 +257,6 @@ AudioEncoder.prototype.encode = function (audioData) {
   }
   if (!audioData || audioData._closed || !audioData.data) {
     throw new TypeError('AudioEncoder.encode: audioData is closed or has no data');
-  }
-
-  var _inDurUs = 0;
-  if (typeof audioData.numberOfFrames === 'number' && audioData.sampleRate) {
-    _inDurUs = audioData.numberOfFrames * 1e6 / audioData.sampleRate;
-  } else if (typeof audioData.duration === 'number') {
-    _inDurUs = audioData.duration;
   }
 
   // ── Per-frame format consistency check (W3C WebCodecs alignment) ──
@@ -343,20 +286,52 @@ AudioEncoder.prototype.encode = function (audioData) {
   // Accept absent fields as "skip the check" — the alignment check
   // below catches the most common form of mismatch (channel count
   // wrong → byte alignment wrong) anyway.
-  if (typeof audioData.numberOfChannels === 'number' &&
-      audioData.numberOfChannels !== this._config.numberOfChannels) {
-    this._error(new Error(
-      'AudioEncoder.encode: audioData.numberOfChannels=' + audioData.numberOfChannels +
-      ' does not match configured numberOfChannels=' + this._config.numberOfChannels
-    ));
+  //
+  // W3C: an AudioData the codec cannot encode is an encoding error —
+  // "close AudioEncoder with an EncodingError" once the frames before it
+  // are out (the encode is queued behind them); the error callback is
+  // only called by that close. Here it was called with a plain Error,
+  // the frame dropped and the encoder kept going ("configured", the
+  // error callback's contract broken). The configuration it is checked
+  // against is the one this encode() runs under (a configure() held
+  // behind a flush applies later: the check runs then).
+  if (holdingCalls(this)) {
+    // W3C encode() step 4: a clone of the AudioData is what gets encoded
+    // — the caller may close theirs as soon as encode() returns.
+    var selfH = this;
+    var held = typeof audioData.clone === 'function' ? audioData.clone() : audioData;
+    this._queueSize++;
+    holdCall(this, function () {
+      if (selfH._queueSize > 0) selfH._queueSize--;
+      try { selfH._encodeNow(held); } finally { if (held !== audioData) held.close(); }
+    }, true);
     return;
   }
-  if (typeof audioData.sampleRate === 'number' &&
+  return this._encodeNow(audioData);
+};
+
+AudioEncoder.prototype._encodeNow = function (audioData) {
+  var _inDurUs = 0;
+  if (typeof audioData.numberOfFrames === 'number' && audioData.sampleRate) {
+    _inDurUs = audioData.numberOfFrames * 1e6 / audioData.sampleRate;
+  } else if (typeof audioData.duration === 'number') {
+    _inDurUs = audioData.duration;
+  }
+  var mismatch = null;
+  if (typeof audioData.numberOfChannels === 'number' &&
+      audioData.numberOfChannels !== this._config.numberOfChannels) {
+    mismatch = 'AudioEncoder.encode: audioData.numberOfChannels=' + audioData.numberOfChannels +
+      ' does not match configured numberOfChannels=' + this._config.numberOfChannels;
+  } else if (typeof audioData.sampleRate === 'number' &&
       audioData.sampleRate !== this._config.sampleRate) {
-    this._error(new Error(
-      'AudioEncoder.encode: audioData.sampleRate=' + audioData.sampleRate +
-      ' does not match configured sampleRate=' + this._config.sampleRate
-    ));
+    mismatch = 'AudioEncoder.encode: audioData.sampleRate=' + audioData.sampleRate +
+      ' does not match configured sampleRate=' + this._config.sampleRate;
+  }
+  if (mismatch) {
+    var self = this, err = domex(mismatch, 'EncodingError');
+    var fail = function () { failCoder(self, err); };
+    if (this._ffmpeg.running) drainThen(this, fail);
+    else { holdCalls(this); queueMicrotask(fail); }   // nothing in flight: the next task
     return;
   }
 
@@ -608,7 +583,11 @@ AudioEncoder.prototype._startFFmpeg = function () {
     });
     // FFmpeg exited: the last partial frame (before a flush completes —
     // flush() listens on 'close' after this does).
+    // Not after a failed exit: watchExit (attached first) has closed the
+    // coder with an EncodingError by then, and a closed coder outputs
+    // nothing (W3C) — the tail came out after the error callback.
     self._ffmpeg.on('close', function () {
+      if (self._state === 'closed') { pending = null; return; }
       if (pending && pending.length) { var p = pending; pending = null; emitRaw(p); }
     });
     self._ffmpeg.on('error', function (e) { self._error(e); });
@@ -707,12 +686,13 @@ AudioEncoder.isConfigSupported = function (config) {
   // getAudioCodec THROWS NotSupportedError for a config it rejects
   // (Opus at 44100 Hz) — and it threw out of isConfigSupported
   // synchronously. W3C: an unsupported config resolves {supported:false}.
-  var supported;
-  try { supported = !!getAudioCodec(normalizeCodec(config.codec), config); }
-  catch (e) { supported = false; }
+  // W3C: an invalid config rejects with a TypeError (codecs.js).
+  var c;
+  try { c = checkAudioEncoderConfig(config, 'AudioEncoder.isConfigSupported'); }
+  catch (e) { return Promise.reject(e); }
   return Promise.resolve({
-    supported: supported,
-    config: _cloneAudioEncoderConfig(config),
+    supported: audioEncoderConfigSupported(c),
+    config: _cloneAudioEncoderConfig(c),
   });
 };
 
@@ -725,7 +705,15 @@ function _cloneAudioEncoderConfig(config) {
   if (!config) return out;
   for (var i = 0; i < _AUDIO_ENCODER_CONFIG_KEYS.length; i++) {
     var k = _AUDIO_ENCODER_CONFIG_KEYS[i];
-    if (config[k] !== undefined) out[k] = config[k];
+    if (config[k] === undefined) continue;
+    // Nested dictionaries are cloned with their own members (Clone
+    // Configuration).
+    if (k === 'aac' && config.aac) out.aac = config.aac.format !== undefined ? { format: config.aac.format } : {};
+    else if (k === 'opus' && config.opus) {
+      out.opus = {};
+      var om = ['application', 'complexity', 'format', 'frameDuration', 'packetlossperc', 'signal', 'usedtx', 'useinbandfec'];
+      for (var j = 0; j < om.length; j++) if (config.opus[om[j]] !== undefined) out.opus[om[j]] = config.opus[om[j]];
+    } else out[k] = config[k];
   }
   return out;
 }

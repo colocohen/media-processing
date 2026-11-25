@@ -33,29 +33,34 @@ import { isValidIvHex } from './utils/playlist_utils.js';
  *  MUST use the Media Sequence Number as the IV when encrypting or
  *  decrypting that Media Segment."
  *
- * The IV is a 128-bit big-endian integer. Sequence numbers fit in
- * 32 bits in practice (years of segments at typical durations), so
- * we put the sequence in the low 4 bytes and zero-pad the high 12.
+ * The IV is a 128-bit big-endian integer: the sequence number in the
+ * low bytes, zeros above.
  *
  * @param {number} sequenceNumber  Non-negative integer.
  * @returns {Uint8Array}            Exactly 16 bytes.
  */
 export function ivFromSequence(sequenceNumber) {
-  // The shifts below are 32-bit. A sequence at or above 2^32 would wrap
-  // and silently reuse an earlier IV — catastrophic for CBC, since two
-  // segments encrypted under the same key and IV leak their XOR. At six
-  // seconds per segment that is ~800,000 years away, so this is a guard
-  // against a caller passing something wrong (a timestamp, a negative,
-  // a float) rather than against natural growth.
-  if (typeof sequenceNumber !== 'number' || !Number.isInteger(sequenceNumber) ||
-      sequenceNumber < 0 || sequenceNumber > 0xFFFFFFFF) {
+  // A Media Sequence Number is a decimal-integer, 0 to 2^64-1 (RFC 8216
+  // §4.2, §4.3.3.2); a JS number holds it exactly up to 2^53-1. This
+  // used to stop at 2^32-1 (32-bit shifts), refusing valid sequence
+  // numbers such as a live stream's MSN derived from the wall clock in
+  // milliseconds. A non-integer, a negative or a value past 2^53-1 is
+  // still refused: it would round, and two segments encrypted under the
+  // same key and IV leak their XOR (CBC).
+  if (typeof sequenceNumber !== 'number' || !Number.isSafeInteger(sequenceNumber) ||
+      sequenceNumber < 0) {
     throw new RangeError(
       'encryption.ivFromSequence: sequenceNumber must be an integer in ' +
-      '[0, 2^32-1], got ' + sequenceNumber
+      '[0, 2^53-1], got ' + sequenceNumber
     );
   }
   var iv = new Uint8Array(16);
-  // High 12 bytes already zero. Low 4 bytes = sequence in big-endian.
+  // High 9 bytes stay zero (the number is under 2^53). Low 7 bytes =
+  // sequence in big-endian: the low 32 bits, then the bits above them.
+  var hi = Math.floor(sequenceNumber / 4294967296);
+  iv[9]  = (hi >>> 16) & 0xFF;
+  iv[10] = (hi >>> 8) & 0xFF;
+  iv[11] = hi & 0xFF;
   iv[12] = (sequenceNumber >>> 24) & 0xFF;
   iv[13] = (sequenceNumber >>> 16) & 0xFF;
   iv[14] = (sequenceNumber >>> 8) & 0xFF;

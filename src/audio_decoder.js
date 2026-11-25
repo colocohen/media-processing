@@ -27,7 +27,9 @@
  * of the first chunk, so the browser's default raw-AAC form did not decode.
  */
 
-import { initCoder, configureCoder, applyCoderPrototype, watchExit, detachCoderListeners } from './base_coder.js';
+import { initCoder, configureCoder, applyCoderPrototype, watchExit, detachCoderListeners,
+  holdingCalls, holdCall, failUnsupported, drainThen, domex } from './base_coder.js';
+import { checkAudioDecoderConfig, audioDecoderConfigSupported } from './codecs.js';
 
 // Output PCM: FFmpeg's interleaved format and bytes per sample, by the
 // outputFormat's sample type.
@@ -81,24 +83,55 @@ function AudioDecoder(init) {
 applyCoderPrototype(AudioDecoder, { role: 'decoder' });
 
 AudioDecoder.prototype.configure = function (config) {
-  if (!config || !config.codec) throw new TypeError('AudioDecoder.configure: codec required');
+  // W3C: the WebIDL conversion and "valid AudioDecoderConfig" are
+  // TypeErrors (sampleRate and numberOfChannels are required: they were
+  // 48000 / 2 when missing), then a closed decoder an InvalidStateError.
+  config = checkAudioDecoderConfig(config, 'AudioDecoder.configure');
+  if (this._state === 'closed') throw domex('Cannot configure a closed coder', 'InvalidStateError');
+  var self = this;
+  this._keyChunkRequired = true;   // W3C: at the call, whenever it applies
+  if (holdingCalls(this)) {
+    // Queued behind a flush() in progress (base_coder holdCalls).
+    this._state = 'configured';
+    holdCall(this, function () { self._configureRun(config); }, false);
+    return;
+  }
+  this._configureRun(config);
+};
+
+// Frames / chunks in flight finish with the configuration they were
+// made under (drainThen); else configure now. Also for a configure()
+// held behind a flush: decided when it runs.
+AudioDecoder.prototype._configureRun = function (config) {
+  var self = this;
+  if (this._state === 'configured' && this._ffmpeg.running && this._inputQueue.length > 0) {
+    // Chunks in flight: they finish with this configuration (drainThen).
+    drainThen(this, function () { self._configureNow(config); });
+    return;
+  }
+  this._configureNow(config);
+};
+
+AudioDecoder.prototype._configureNow = function (config) {
   configureCoder(this);
 
   this._config = {
     codec:            normalizeCodec(config.codec),
-    sampleRate:       config.sampleRate || 48000,
-    numberOfChannels: config.numberOfChannels || 2,
+    sampleRate:       config.sampleRate,
+    numberOfChannels: config.numberOfChannels,
     outputFormat:     config.outputFormat || 's16',
     description:      config.description || null,   // e.g. AAC AudioSpecificConfig
   };
 
   // AAC: a description means raw access units (see header comment).
+  // One that does not parse is a config the decoder cannot do
+  // (NotSupportedError below; it was a TypeError, which W3C keeps for
+  // invalid configs, §7.5).
   this._aacConfig = null;
+  var descError = null;
   if (this._config.codec === 'aac' && this._config.description) {
     this._aacConfig = parseAudioSpecificConfig(toUint8Array(this._config.description));
-    if (!this._aacConfig) {
-      throw new TypeError('AudioDecoder.configure: description is not a valid AudioSpecificConfig');
-    }
+    if (!this._aacConfig) descError = 'description is not a valid AudioSpecificConfig';
   }
 
   this._descriptionSent = false;
@@ -109,10 +142,7 @@ AudioDecoder.prototype.configure = function (config) {
   // carries as the description. Without one there is nothing to decode
   // with (the registry makes it required).
   this._mkv = null;
-  if (this._config.codec === 'vorbis') {
-    if (!this._config.description) {
-      throw new TypeError('AudioDecoder.configure: vorbis requires a description (Xiph-laced header packets)');
-    }
+  if (this._config.codec === 'vorbis' && this._config.description) {
     this._mkv = new MKVWriter({ tracks: [{
       type: 'audio', codecId: 'A_VORBIS',
       codecPrivate: new Uint8Array(toUint8Array(this._config.description)),
@@ -168,6 +198,13 @@ AudioDecoder.prototype.configure = function (config) {
   this.context.sampleRate = this._config.sampleRate;
   this.context.numberOfChannels = this._config.numberOfChannels;
   this.context.frameCount = 0;
+
+  // Check Configuration Support (codecs.js): Vorbis without its header
+  // packets (the description) cannot be decoded.
+  if (!audioDecoderConfigSupported(config, !descError)) {
+    failUnsupported(this, domex("AudioDecoder.configure: unsupported config (codec '" + config.codec + "')" +
+      (descError ? ': ' + descError : ''), 'NotSupportedError'));
+  }
 };
 
 AudioDecoder.prototype.decode = function (chunk) {
@@ -206,13 +243,23 @@ AudioDecoder.prototype.decode = function (chunk) {
     inputErr.name = 'TypeError';
     throw inputErr;
   }
+  this._queueSize++;
+  if (holdingCalls(this)) {
+    // Queued behind a flush() in progress (base_coder holdCalls).
+    var self = this;
+    holdCall(this, function () { self._decodeNow(chunk); }, true);
+    return;
+  }
+  this._decodeNow(chunk);
+};
+
+AudioDecoder.prototype._decodeNow = function (chunk) {
   if (!this._ffmpeg.running) this._startFFmpeg();
 
   // Raw-frames mode: wrap each packet in an OGG page before handing
   // to FFmpeg. The first decode() triggers the two mandatory header
   // pages (OpusHead + OpusTags).
   if (this._oggMuxer) {
-    this._queueSize++;
     if (!this._oggHeadersFed) {
       this._ffmpeg.write(this._oggMuxer.writeHeaders());
       this._oggHeadersFed = true;
@@ -251,7 +298,6 @@ AudioDecoder.prototype.decode = function (chunk) {
     // Vorbis: one SimpleBlock per packet, after the Matroska header.
     // Block timestamps are relative to the run's first chunk (they
     // must be >= 0); output timestamps come from the input records.
-    this._queueSize++;
     if (!this._mkvHeaderFed) {
       this._ffmpeg.write(this._mkv.writeHeader());
       this._mkvHeaderFed = true;
@@ -260,14 +306,12 @@ AudioDecoder.prototype.decode = function (chunk) {
     this._ffmpeg.write(this._mkv.writeFrame(1, chunk.data, chunk.timestamp - this._mkvBaseTs, true));
   } else if (this._pcmIn) {
     // Raw PCM: the sample count is exact — bytes / (channels * bytes per sample).
-    this._queueSize++;
     this._ffmpeg.write(chunk.data);
     var pcmFrames = Math.floor(chunk.data.length / (this._config.numberOfChannels * this._pcmIn.bps));
     this._pushInputRecord(chunk.timestamp, pcmFrames);
     return;
   } else if (this._config.codec === 'aac') {
     // Raw AAC (description given) → ADTS; ADTS chunks pass through.
-    this._queueSize++;
     this._ffmpeg.write(this._aacConfig ? wrapAdtsWithConfig(chunk.data, this._aacConfig) : chunk.data);
   } else if (!this._descriptionSent && this._config.description && chunk.type === 'key') {
     // Codecs whose description is a stream header FFmpeg reads in-band
@@ -276,11 +320,9 @@ AudioDecoder.prototype.decode = function (chunk) {
     var combined = new Uint8Array(desc.length + chunk.data.length);
     combined.set(desc, 0);
     combined.set(chunk.data, desc.length);
-    this._queueSize++;
     this._ffmpeg.write(combined);
     this._descriptionSent = true;
   } else {
-    this._queueSize++;
     this._ffmpeg.write(chunk.data);
   }
 
@@ -406,8 +448,12 @@ AudioDecoder.prototype._startFFmpeg = function () {
     this._oggMuxer.reset();
     this._oggHeadersFed = false;
   }
-  // Likewise a Matroska (Vorbis) run starts with its own header.
+  // Likewise a Matroska (Vorbis) run starts with its own header, and a
+  // FLAC one with its STREAMINFO (the description, in front of the run's
+  // first key chunk): _descriptionSent stayed true across a flush, so the
+  // next FFmpeg got FLAC frames without the stream header.
   this._mkvHeaderFed = false;
+  this._descriptionSent = false;
   if (this._mkv) this._mkv = new MKVWriter({ tracks: this._mkv._tracks });
 
   // Small probesize for audio — ADTS/OGG streams are typically only a few KB.
@@ -474,12 +520,17 @@ AudioDecoder.prototype._startFFmpeg = function () {
 };
 
 AudioDecoder.isConfigSupported = function (config) {
-  var name = config && config.codec ? normalizeCodec(config.codec) : null;
-  var supported = !!(name && (getDefaultContainer(name) || _PCM_IN[name]));
-  if (name === 'vorbis' && !(config && config.description)) supported = false;
-  // W3C AudioDecoderSupport carries `config` alongside `supported`; see
-  // the matching note on VideoDecoder.isConfigSupported.
-  return Promise.resolve({ supported: supported, config: _cloneAudioDecoderConfig(config) });
+  // W3C: an invalid config rejects with a TypeError; supported is Check
+  // Configuration Support (codecs.js), with an AAC description that has
+  // to be an AudioSpecificConfig. AudioDecoderSupport carries `config`
+  // alongside `supported`; see the matching note on
+  // VideoDecoder.isConfigSupported.
+  var c;
+  try { c = checkAudioDecoderConfig(config, 'AudioDecoder.isConfigSupported'); }
+  catch (e) { return Promise.reject(e); }
+  var descOk = !(normalizeCodec(c.codec) === 'aac' && c.description &&
+    !parseAudioSpecificConfig(toUint8Array(c.description)));
+  return Promise.resolve({ supported: audioDecoderConfigSupported(c, descOk), config: _cloneAudioDecoderConfig(c) });
 };
 
 var _AUDIO_DECODER_CONFIG_KEYS = [

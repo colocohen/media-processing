@@ -18,6 +18,7 @@ var mediaCapabilities = {
   // smooth/powerEfficient. W3C: supported only if every configured part
   // is; smooth/powerEfficient likewise hold only if they hold for all.
   decodingInfo: function (config) {
+    config = _checkConfiguration(config, 'decodingInfo', _DECODING_TYPES);
     return _combine(config,
       function (v) {
         var codec = _parseCodecString(v.contentType || '');
@@ -34,6 +35,7 @@ var mediaCapabilities = {
   },
 
   encodingInfo: function (config) {
+    config = _checkConfiguration(config, 'encodingInfo', _ENCODING_TYPES);
     return _combine(config,
       function (v) {
         var codec = _parseCodecString(v.contentType || '');
@@ -59,6 +61,103 @@ var mediaCapabilities = {
       });
   },
 };
+
+// ── W3C validity (Media Capabilities §2.1, §2.5) ──
+//
+// decodingInfo() / encodingInfo() reject a configuration that is not a
+// valid one with a TypeError: the WebIDL conversion of the dictionaries
+// (the required members — type; video's contentType, width, height,
+// bitrate and framerate; audio's contentType — and the enums), neither
+// audio nor video given, a framerate that is not finite and above 0, a
+// member given for a type it does not apply to. All of these were
+// answered {supported: false} (or, for a missing width / framerate,
+// supported with 1920x1080 at 30 fps assumed). Here they throw: the
+// methods answer synchronously (the spec's Promise is an open item).
+// The contentType's MIME validity stays lenient — a bare codec string
+// ('vp9', 'avc1.42E01E') is accepted as an extension.
+var _DECODING_TYPES = ['file', 'media-source', 'webrtc'];
+var _ENCODING_TYPES = ['record', 'webrtc'];
+var _VIDEO_IDL = [
+  ['bitrate', 'ull', true], ['colorGamut', ['srgb', 'p3', 'rec2020']], ['contentType', 'str', true],
+  ['framerate', 'double', true], ['hasAlphaChannel', 'bool'], ['hdrMetadataType', ['smpteSt2086', 'smpteSt2094-10', 'smpteSt2094-40']],
+  ['height', 'ul', true], ['scalabilityMode', 'str'], ['spatialScalability', 'bool'],
+  ['transferFunction', ['srgb', 'pq', 'hlg']], ['width', 'ul', true],
+];
+var _AUDIO_IDL = [
+  ['bitrate', 'ull'], ['channels', 'str'], ['contentType', 'str', true], ['samplerate', 'ul'], ['spatialRendering', 'bool'],
+];
+
+// WebIDL conversions of the plain (not [EnforceRange]) integer types:
+// modulo 2^32 / 2^64, NaN and the infinities 0. double: finite or a TypeError.
+function _toUnsigned(v, bits) {
+  var x = Number(v);
+  if (!Number.isFinite(x)) return 0;
+  x = Math.trunc(x);
+  var m = Math.pow(2, bits);
+  x = x - Math.floor(x / m) * m;
+  return x === 0 ? 0 : x;
+}
+
+function _convert(dict, idl, what) {
+  if (dict === null) dict = {};
+  if (typeof dict !== 'object') throw new TypeError(what + ' must be a dictionary');
+  var out = {};
+  for (var i = 0; i < idl.length; i++) {
+    var name = idl[i][0], kind = idl[i][1], v = dict[name];
+    if (v === undefined) {
+      if (idl[i][2]) throw new TypeError(what + '.' + name + ' required');
+      continue;
+    }
+    if (Array.isArray(kind)) {
+      var sv = String(v);
+      if (kind.indexOf(sv) < 0) throw new TypeError(what + '.' + name + " must be one of '" + kind.join("', '") + "' (got '" + sv + "')");
+      out[name] = sv;
+    } else if (kind === 'str') out[name] = String(v);
+    else if (kind === 'bool') out[name] = !!v;
+    else if (kind === 'ul') out[name] = _toUnsigned(v, 32);
+    else if (kind === 'ull') out[name] = _toUnsigned(v, 64);
+    else if (kind === 'double') {
+      var d = Number(v);
+      if (!Number.isFinite(d)) throw new TypeError(what + '.' + name + ' must be a finite number');
+      out[name] = d;
+    }
+  }
+  return out;
+}
+
+function _checkConfiguration(config, method, types) {
+  var prefix = 'MediaCapabilities.' + method;
+  if (config === null || config === undefined) config = {};
+  if (typeof config !== 'object') throw new TypeError(prefix + ': configuration must be a dictionary');
+  // Inherited members first (MediaConfiguration: audio, video), then the
+  // derived dictionary's (type) — WebIDL §3.2.17.
+  var out = {};
+  if (config.audio !== undefined) out.audio = _convert(config.audio, _AUDIO_IDL, prefix + ': audio');
+  if (config.video !== undefined) out.video = _convert(config.video, _VIDEO_IDL, prefix + ': video');
+  if (config.type === undefined) throw new TypeError(prefix + ': type required');
+  var type = String(config.type);
+  if (types.indexOf(type) < 0) throw new TypeError(prefix + ": type must be one of '" + types.join("', '") + "' (got '" + type + "')");
+  out.type = type;
+  if (!out.audio && !out.video) throw new TypeError(prefix + ': audio or video required');
+  var decoding = types === _DECODING_TYPES;
+  var v = out.video, a = out.audio;
+  if (v) {
+    if (!(v.framerate > 0)) throw new TypeError(prefix + ': video.framerate must be greater than 0');
+    var hdrOk = decoding && type !== 'webrtc';
+    ['hdrMetadataType', 'colorGamut', 'transferFunction'].forEach(function (k) {
+      if (v[k] !== undefined && !hdrOk) throw new TypeError(prefix + ': video.' + k + " does not apply to type '" + type + "'");
+    });
+    if (v.scalabilityMode !== undefined && !(!decoding && type === 'webrtc')) throw new TypeError(prefix + ": video.scalabilityMode does not apply to type '" + type + "'");
+    if (v.spatialScalability !== undefined && !decoding) throw new TypeError(prefix + ": video.spatialScalability does not apply to type '" + type + "'");
+  }
+  if (a) {
+    var chOk = decoding || type === 'webrtc';
+    ['channels', 'samplerate'].forEach(function (k) {
+      if (a[k] !== undefined && !chOk) throw new TypeError(prefix + ': audio.' + k + " does not apply to type '" + type + "'");
+    });
+  }
+  return out;
+}
 
 function _combine(config, videoInfo, audioInfo) {
   var parts = [];

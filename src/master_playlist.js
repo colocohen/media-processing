@@ -59,7 +59,10 @@
  *   Audio rendition fields:
  *     groupId    (string,  required)
  *     name       (string,  required)
- *     uri        (string,  required)   Media playlist with audio only.
+ *     uri        (string,  optional)   Media playlist with audio only.
+ *                                      Without it the rendition's audio
+ *                                      is in the variants' own media
+ *                                      (rfc8216bis §4.4.6.1).
  *     language   (string,  optional)   BCP-47 tag (e.g., 'en', 'es-MX').
  *     default    (boolean, optional)   At most one DEFAULT=YES per group.
  *     autoselect (boolean, optional)
@@ -104,7 +107,18 @@
  */
 
 import { escapeQuoted, isValidVideoRange, isValidVariableName, isValidIvHex,
-         isValidEncryptionMethod, parseAttributeList } from './utils/playlist_utils.js';
+         isValidEncryptionMethod, isValidKeyFormatVersions, parseAttributeList, decimalFloat,
+         decimalNumber, checkUriLine } from './utils/playlist_utils.js';
+
+// STABLE-VARIANT-ID / STABLE-RENDITION-ID: only [a-zA-Z0-9+/=.-_]
+// (rfc8216bis §4.4.6.1, §4.4.6.2).
+var _RE_STABLE_ID = /^[A-Za-z0-9+\/=.\-_]+$/;
+function _checkStableId(id, what) {
+  if (id && !_RE_STABLE_ID.test(id)) {
+    throw new TypeError('buildMasterPlaylist: ' + what + ' "' + id +
+                        '" must use only [a-zA-Z0-9+/=.-_] (RFC 8216bis §4.4.6.2)');
+  }
+}
 
 /**
  * Validate the common shape required of any variant entry (regular
@@ -122,9 +136,20 @@ function _validateVariantShape(v, arrName, idx) {
   if (!v || typeof v.uri !== 'string') {
     throw new TypeError('buildMasterPlaylist: ' + arrName + '[' + idx + '].uri required');
   }
-  if (typeof v.bandwidth !== 'number' || !(v.bandwidth > 0)) {
+  // Finite too: Infinity passed and was written as BANDWIDTH=Infinity.
+  if (typeof v.bandwidth !== 'number' || !(v.bandwidth > 0) || !isFinite(v.bandwidth)) {
     throw new TypeError('buildMasterPlaylist: ' + arrName + '[' + idx +
                         '].bandwidth (positive number) required');
+  }
+  // AVERAGE-BANDWIDTH is a decimal-integer, RESOLUTION a
+  // decimal-resolution (RFC 8216 §4.2): both were written unchecked
+  // (AVERAGE-BANDWIDTH=-1, RESOLUTION=1x1,X=1 — a second attribute).
+  if (typeof v.averageBandwidth === 'number') {
+    decimalFloat(v.averageBandwidth, 'buildMasterPlaylist: ' + arrName + '[' + idx + '].averageBandwidth');
+  }
+  if (v.resolution && !/^[0-9]+x[0-9]+$/.test(v.resolution)) {
+    throw new TypeError('buildMasterPlaylist: ' + arrName + '[' + idx +
+      '].resolution must be <width>x<height> (got "' + v.resolution + '")');
   }
   if (v.videoRange !== undefined && !isValidVideoRange(v.videoRange)) {
     throw new TypeError('buildMasterPlaylist: ' + arrName + '[' + idx +
@@ -142,23 +167,37 @@ export function buildMasterPlaylist(opts) {
     throw new TypeError('buildMasterPlaylist: opts.variants (non-empty array) required');
   }
   for (var vi = 0; vi < variants.length; vi++) {
-    _validateVariantShape(variants[vi], 'variant', vi);
+    var vv = variants[vi];
+    _validateVariantShape(vv, 'variant', vi);
+    // The URI is the line after EXT-X-STREAM-INF (see playlist.js); SCORE
+    // and FRAME-RATE are decimal-floating-points (NaN was written as
+    // FRAME-RATE=NaN).
+    checkUriLine(vv.uri, 'buildMasterPlaylist: variant[' + vi + '].uri');
+    if (typeof vv.score === 'number') {
+      decimalFloat(vv.score, 'buildMasterPlaylist: variant[' + vi + '].score');
+    }
+    if (typeof vv.frameRate === 'number') {
+      decimalFloat(vv.frameRate, 'buildMasterPlaylist: variant[' + vi + '].frameRate');
+    }
+    _checkStableId(vv.stableVariantId, 'variant[' + vi + '].stableVariantId');
   }
 
   // Cross-validate rendition group references. Catching this here gives
   // a clear error pointing at the master, not a silent producibility
   // failure where the player simply ignores broken references.
-  var audioGroupIds    = _collectGroupIds(opts.audioRenditions);
+  // An AUDIO rendition's URI is OPTIONAL (rfc8216bis §4.4.6.1: without
+  // it the audio is in the variant's own media); it was required.
+  var audioGroupIds    = _collectGroupIds(opts.audioRenditions, { uriRequired: false });
   var subtitleGroupIds = _collectGroupIds(opts.subtitleRenditions);
   var ccGroupIds       = _collectGroupIds(opts.closedCaptionsRenditions,
                                           { uriRequired: false });
   for (var ci = 0; ci < variants.length; ci++) {
     var c = variants[ci];
-    if (c.audio && !audioGroupIds[c.audio]) {
+    if (c.audio && !audioGroupIds.has(c.audio)) {
       throw new Error('buildMasterPlaylist: variant[' + ci +
         '].audio = "' + c.audio + '" but no audio rendition with that GROUP-ID');
     }
-    if (c.subtitles && !subtitleGroupIds[c.subtitles]) {
+    if (c.subtitles && !subtitleGroupIds.has(c.subtitles)) {
       throw new Error('buildMasterPlaylist: variant[' + ci +
         '].subtitles = "' + c.subtitles + '" but no subtitle rendition with that GROUP-ID');
     }
@@ -172,11 +211,21 @@ export function buildMasterPlaylist(opts) {
     // CLOSED-CAPTIONS = null   → opt-out (emit "CLOSED-CAPTIONS=NONE").
     if (typeof c.closedCaptions === 'string' &&
         Array.isArray(opts.closedCaptionsRenditions) &&
-        !ccGroupIds[c.closedCaptions]) {
+        !ccGroupIds.has(c.closedCaptions)) {
       throw new Error('buildMasterPlaylist: variant[' + ci +
         '].closedCaptions = "' + c.closedCaptions +
         '" but no closed-captions rendition with that GROUP-ID');
     }
+  }
+  // CLOSED-CAPTIONS=NONE on one variant requires it on every variant
+  // (rfc8216bis §4.4.6.2); a mix was written as given.
+  var ccNone = 0;
+  for (var cni = 0; cni < variants.length; cni++) {
+    if (variants[cni].closedCaptions === null) ccNone++;
+  }
+  if (ccNone > 0 && ccNone < variants.length) {
+    throw new Error('buildMasterPlaylist: closedCaptions null (CLOSED-CAPTIONS=NONE) ' +
+                    'must be on every variant or on none (RFC 8216bis §4.4.6.2)');
   }
 
   var lines = [];
@@ -200,10 +249,19 @@ export function buildMasterPlaylist(opts) {
   // substitution in any URI that follows. Validated upfront — bad
   // form is easier to fix at config time than after a player rejects.
   var serializedDefines = [];
+  var definedNames = new Set();
   if (Array.isArray(opts.defines)) {
     for (var dii = 0; dii < opts.defines.length; dii++) {
       var def = opts.defines[dii];
       var defLine = _serializeDefineEntry(def, dii);
+      // No two EXT-X-DEFINEs may declare one Variable Name (rfc8216bis
+      // §4.4.2.3: a parser MUST fail on it).
+      var defName = typeof def.name === 'string' ? def.name : def.queryparam;
+      if (definedNames.has(defName)) {
+        throw new TypeError('buildMasterPlaylist: defines[' + dii + '] declares "' +
+                            defName + '" again (RFC 8216bis §4.4.2.3)');
+      }
+      definedNames.add(defName);
       serializedDefines.push(defLine);
       if (minVersion < 8) minVersion = 8;
       if (def.queryparam !== undefined && minVersion < 11) minVersion = 11;
@@ -226,9 +284,18 @@ export function buildMasterPlaylist(opts) {
   // optimization — saves the player from refetching the same key
   // when switching variants. Same attribute set as EXT-X-KEY but
   // lives at the master level.
+  // Not two with the same METHOD, URI, IV, KEYFORMAT and
+  // KEYFORMATVERSIONS (rfc8216bis §4.4.6.5) — the same line.
   if (Array.isArray(opts.sessionKeys)) {
+    var keyLines = new Set();
     for (var ski = 0; ski < opts.sessionKeys.length; ski++) {
-      lines.push(_serializeSessionKey(opts.sessionKeys[ski], ski));
+      var skLine = _serializeSessionKey(opts.sessionKeys[ski], ski);
+      if (keyLines.has(skLine)) {
+        throw new TypeError('buildMasterPlaylist: sessionKeys[' + ski +
+                            '] repeats an earlier session key (RFC 8216bis §4.4.6.5)');
+      }
+      keyLines.add(skLine);
+      lines.push(skLine);
     }
   }
 
@@ -236,9 +303,20 @@ export function buildMasterPlaylist(opts) {
   // metadata — title, cast, chapters, custom IDs. Visible to the
   // player at startup before any media is fetched. Multiple entries
   // with the same DATA-ID can coexist for different LANGUAGEs.
+  // Not two with the same DATA-ID and LANGUAGE (rfc8216bis §4.4.6.4).
   if (Array.isArray(opts.sessionData)) {
+    var dataIds = new Set();
     for (var sdi = 0; sdi < opts.sessionData.length; sdi++) {
-      lines.push(_serializeSessionData(opts.sessionData[sdi], sdi));
+      var sd = opts.sessionData[sdi];
+      var sdLine = _serializeSessionData(sd, sdi);
+      var sdKey = JSON.stringify([sd.dataId, sd.language === undefined ? null : String(sd.language)]);
+      if (dataIds.has(sdKey)) {
+        throw new TypeError('buildMasterPlaylist: sessionData[' + sdi +
+                            '] repeats the DATA-ID and LANGUAGE of an earlier entry ' +
+                            '(RFC 8216bis §4.4.6.4)');
+      }
+      dataIds.add(sdKey);
+      lines.push(sdLine);
     }
   }
 
@@ -248,14 +326,19 @@ export function buildMasterPlaylist(opts) {
   // the same content. The player polls the manifest periodically and
   // switches when the priority list changes.
   if (opts.contentSteering) {
-    lines.push(_serializeContentSteering(opts.contentSteering));
+    lines.push(_serializeContentSteering(opts.contentSteering, variants));
   }
 
   // EXT-X-START on master applies to every variant — players seek to
   // the offset on initial playback regardless of which variant they
   // pick. Useful for mid-roll start, "last viewed" resume, etc.
   if (opts.start) {
-    var startAttrs = 'TIME-OFFSET=' + opts.start.timeOffset;
+    // As Playlist.setStart: a signed-decimal-floating-point (an absent one
+    // was written as TIME-OFFSET=undefined).
+    if (typeof opts.start.timeOffset !== 'number' || !isFinite(opts.start.timeOffset)) {
+      throw new TypeError('buildMasterPlaylist: opts.start.timeOffset (finite number) required');
+    }
+    var startAttrs = 'TIME-OFFSET=' + decimalNumber(opts.start.timeOffset);
     if (opts.start.precise) startAttrs += ',PRECISE=YES';
     lines.push('#EXT-X-START:' + startAttrs);
   }
@@ -311,13 +394,18 @@ export function buildMasterPlaylist(opts) {
 // ── Internal helpers ──────────────────────────────────────────
 
 function _collectGroupIds(renditions, opts) {
-  var map = {};
+  // A Set: with a plain object, a variant's audio: 'toString' found
+  // Object.prototype's and passed with no such group.
+  var map = new Set();
   if (!Array.isArray(renditions)) return map;
   // Per RFC 8216 §4.4.6.1, CLOSED-CAPTIONS renditions MUST NOT have a
   // URI — captions live inline in the video stream. AUDIO/SUBTITLES
   // renditions DO require URI. Caller passes { uriRequired: false }
   // for CLOSED-CAPTIONS; default is true.
   var uriRequired = !opts || opts.uriRequired !== false;
+  // Per group: its NAMEs, and whether a member is DEFAULT=YES.
+  var names = new Map();
+  var defaults = new Set();
   for (var i = 0; i < renditions.length; i++) {
     var r = renditions[i];
     if (!r || typeof r.groupId !== 'string') {
@@ -329,7 +417,23 @@ function _collectGroupIds(renditions, opts) {
     if (uriRequired && typeof r.uri !== 'string') {
       throw new TypeError('buildMasterPlaylist: rendition[' + i + '].uri required');
     }
-    map[r.groupId] = true;
+    _checkStableId(r.stableRenditionId, 'rendition[' + i + '].stableRenditionId');
+    // rfc8216bis §4.4.6.1.1: the members of a group have different NAMEs,
+    // and at most one is DEFAULT=YES. Neither was checked.
+    if (!names.has(r.groupId)) names.set(r.groupId, new Set());
+    if (names.get(r.groupId).has(r.name)) {
+      throw new TypeError('buildMasterPlaylist: rendition[' + i + '].name "' + r.name +
+                          '" repeats a NAME of group "' + r.groupId + '" (RFC 8216bis §4.4.6.1.1)');
+    }
+    names.get(r.groupId).add(r.name);
+    if (r.default) {
+      if (defaults.has(r.groupId)) {
+        throw new TypeError('buildMasterPlaylist: rendition[' + i + '] is a second DEFAULT ' +
+                            'of group "' + r.groupId + '" (RFC 8216bis §4.4.6.1.1)');
+      }
+      defaults.add(r.groupId);
+    }
+    map.add(r.groupId);
   }
   return map;
 }
@@ -428,8 +532,11 @@ function _serializeMediaRendition(type, r) {
   if (r.characteristics) {
     attrs.push('CHARACTERISTICS="' + escapeQuoted(r.characteristics) + '"');
   }
-  if (r.channels)        attrs.push('CHANNELS="' + escapeQuoted(r.channels) + '"');
-  attrs.push('URI="' + escapeQuoted(r.uri) + '"');
+  // CHANNELS MUST NOT be present unless TYPE is AUDIO (rfc8216bis
+  // §4.4.6.1); it was written for subtitles too.
+  if (type === 'AUDIO' && r.channels) attrs.push('CHANNELS="' + escapeQuoted(r.channels) + '"');
+  // URI is optional for AUDIO (see buildMasterPlaylist).
+  if (typeof r.uri === 'string') attrs.push('URI="' + escapeQuoted(r.uri) + '"');
 
   return '#EXT-X-MEDIA:' + attrs.join(',');
 }
@@ -543,9 +650,8 @@ function _serializeIFrameStreamInf(v) {
  * Render one EXT-X-DEFINE entry. Three forms — exactly one set of
  * fields must be present per the spec:
  *   - { name, value }     literal substitution
- *   - { import: name }    pull from another playlist (used only in
- *                         media playlists; included here for symmetry
- *                         in case callers reuse the entry shape)
+ *   - { import: name }    pull from the Multivariant Playlist: media
+ *                         playlists only, refused here
  *   - { queryparam: name } extract from playlist URL (HLS v11+)
  */
 function _serializeDefineEntry(def, idx) {
@@ -560,7 +666,9 @@ function _serializeDefineEntry(def, idx) {
   var formCount = (hasName && hasValue ? 1 : 0) +
                   (hasImport ? 1 : 0) +
                   (hasQuery ? 1 : 0);
-  if (formCount !== 1) {
+  // A name without a value counts as no form: { name, import } passed as
+  // the import form and was written NAME="a",VALUE="undefined".
+  if (formCount !== 1 || hasName !== hasValue) {
     throw new TypeError('buildMasterPlaylist: defines[' + idx + '] requires exactly ' +
                         'one of {name+value}, {import}, {queryparam}');
   }
@@ -571,13 +679,13 @@ function _serializeDefineEntry(def, idx) {
                           def.name + '" must match [A-Za-z0-9_-]+');
     }
     return '#EXT-X-DEFINE:NAME="' + escapeQuoted(def.name) +
-           '",VALUE="' + escapeQuoted(def.value) + '"';
+           '",VALUE="' + escapeQuoted(def.value, true) + '"';   // VALUE MAY be empty (§4.4.2.3)
   }
+  // IMPORT takes a variable from the Multivariant Playlist, so it MUST
+  // NOT occur in one (rfc8216bis §4.4.2.3); it was written.
   if (hasImport) {
-    if (!isValidVariableName(def['import'])) {
-      throw new TypeError('buildMasterPlaylist: defines[' + idx + '].import invalid');
-    }
-    return '#EXT-X-DEFINE:IMPORT="' + escapeQuoted(def['import']) + '"';
+    throw new TypeError('buildMasterPlaylist: defines[' + idx + '].import is only allowed ' +
+                        'in a Media Playlist (RFC 8216bis §4.4.2.3)');
   }
   if (!isValidVariableName(def.queryparam)) {
     throw new TypeError('buildMasterPlaylist: defines[' + idx + '].queryparam invalid');
@@ -669,6 +777,13 @@ function _serializeSessionKey(sk, idx) {
     attrs += ',KEYFORMAT="' + escapeQuoted(sk.keyFormat) + '"';
   }
   if (sk.keyFormatVersions !== undefined) {
+    // Positive integers separated by "/" (rfc8216bis §4.4.4.4, which
+    // EXT-X-SESSION-KEY's attributes follow); any string was written.
+    if (!isValidKeyFormatVersions(String(sk.keyFormatVersions))) {
+      throw new TypeError('buildMasterPlaylist: sessionKeys[' + idx + '].keyFormatVersions must be ' +
+                          'positive integers separated by "/" (RFC 8216bis §4.4.4.4), got ' +
+                          JSON.stringify(String(sk.keyFormatVersions)));
+    }
     attrs += ',KEYFORMATVERSIONS="' + escapeQuoted(sk.keyFormatVersions) + '"';
   }
   return '#EXT-X-SESSION-KEY:' + attrs;
@@ -682,17 +797,29 @@ function _serializeSessionKey(sk, idx) {
  *
  * @param {object} cs
  * @param {string} cs.serverUri    URI of the steering manifest (JSON).
- * @param {string} [cs.pathwayId]  Pathway identifier for this playlist.
+ * @param {string} [cs.pathwayId]  Pathway identifier for this playlist:
+ *                                  one of the variants' pathwayIds.
  *                                  Reverse-DNS is the convention. The
  *                                  steering manifest can reorder which
  *                                  pathway is preferred at any moment.
  */
-function _serializeContentSteering(cs) {
+function _serializeContentSteering(cs, variants) {
   if (!cs || typeof cs.serverUri !== 'string') {
     throw new TypeError('buildMasterPlaylist: contentSteering.serverUri (string) required');
   }
   var attrs = 'SERVER-URI="' + escapeQuoted(cs.serverUri) + '"';
   if (cs.pathwayId !== undefined) {
+    // It MUST be the PATHWAY-ID of one or more variants (rfc8216bis
+    // §4.4.6.6): a client applies it until the manifest arrives, and a
+    // pathway without variants leaves it nothing to play.
+    var onVariant = false;
+    for (var pi = 0; pi < variants.length; pi++) {
+      if (variants[pi].pathwayId && variants[pi].pathwayId === cs.pathwayId) onVariant = true;
+    }
+    if (!onVariant) {
+      throw new TypeError('buildMasterPlaylist: contentSteering.pathwayId "' + cs.pathwayId +
+                          '" is not the pathwayId of any variant (RFC 8216bis §4.4.6.6)');
+    }
     attrs += ',PATHWAY-ID="' + escapeQuoted(cs.pathwayId) + '"';
   }
   return '#EXT-X-CONTENT-STEERING:' + attrs;
@@ -797,14 +924,16 @@ export function parseMasterPlaylist(text) {
     }
 
     if (line.indexOf('#EXT-X-STREAM-INF:') === 0) {
-      pendingVariant = _streamInfToVariant(parseAttributeList(line.slice(18)));
+      var quoted = {};
+      pendingVariant = _streamInfToVariant(parseAttributeList(line.slice(18), quoted));
       // CLOSED-CAPTIONS=NONE (unquoted enumerated-string) means "no
       // captions" and maps to null — what buildMasterPlaylist writes back
       // as NONE. parseAttributeList drops the quotes, so it came back as
       // the group name "NONE" and a rebuild threw ("no closed-captions
       // rendition with that GROUP-ID") or wrote CLOSED-CAPTIONS="NONE".
-      // A quoted "NONE" stays a GROUP-ID.
-      if (/(^|,)CLOSED-CAPTIONS=NONE(,|$)/.test(line.slice(18))) {
+      // A quoted "NONE" stays a GROUP-ID. Decided from the attribute
+      // itself: a text search took NAME="x,CLOSED-CAPTIONS=NONE" for it.
+      if (pendingVariant.closedCaptions === 'NONE' && !quoted['CLOSED-CAPTIONS']) {
         pendingVariant.closedCaptions = null;
       }
     } else if (line.indexOf('#EXT-X-I-FRAME-STREAM-INF:') === 0) {

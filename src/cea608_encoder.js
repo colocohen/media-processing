@@ -11,9 +11,11 @@
 //   - Captions are encoded as 2-byte pairs ("byte pairs")
 //   - Pairs are packed into "cc_data" triples in a SEI message that
 //     rides along inside H.264/H.265 video streams
-//   - One triple per video frame at NTSC rates (≈30fps/60fps); the
-//     CC clock runs at 60Hz, so 60fps gets 1 triple/frame and 30fps
-//     gets 2 triples/frame (we emit 1 to keep things simple)
+//   - Line 21 field 1 carries one byte pair per field-1 slot, 29.97 a
+//     second (CTA-608-E); in DTV cc_data that is one cc_type 00
+//     construct per 1/29.97 s of media time (ATSC A/53 Part 4, CTA-708
+//     §4.3.6), so a 30 fps frame carries one (and one frame in 1001
+//     none), a 60 fps frame every other one, a 24 fps frame one or two
 //   - Each character has a parity bit set to give it odd parity
 //
 // Reference: CEA-608-E, Apple HLS authoring guide §10.
@@ -28,7 +30,7 @@
 //   - Each cue is decomposed into a sequence of byte pairs:
 //       RCL, ENM, PAC, [text...], EOC  (at cue start)
 //       EDM                             (at cue end)
-//   - The byte-pair queue is drained one pair per video frame
+//   - The byte-pair queue is drained one pair per field-1 slot
 //   - getCcDataForFrame(ptsUs) returns the cc_data triples for the
 //     given frame's PTS; consumer wraps in SEI and injects into AU
 
@@ -279,7 +281,7 @@ function _buildCuePairs(text, channel) {
   startUnits.push(twice([ctrlP, _ENM_P]));     // Erase Non-displayed Memory
 
   // Wrap text to lines of 32 chars max, up to 4 rows.
-  var lines = _wrapText(text, 32, 4);
+  var lines = _wrapText(_composeMarks(text), 32, 4);
   // Multi-row captions stack from row 15 upward (so single-line
   // captions go on row 15, two-line on rows 14-15, etc.).
   var startRow = 15 - lines.length + 1;
@@ -314,9 +316,33 @@ function _buildCuePairs(text, channel) {
 }
 
 /**
+ * Combining marks (U+0300–U+036F) go with the character before them.
+ * CEA-608 has no combining characters: a decomposed "é" (e + U+0301,
+ * what NFD text — macOS file names, some subtitle tools — carries) went
+ * out as "e?", the mark a '?' of its own (and a column of the wrap).
+ * Now a character and its marks are one: their composed form when
+ * CEA-608 has it (e + U+0301 → é, basic 0x5C), else the character
+ * alone — the accents dropped, as _encodeChar does for a precomposed
+ * letter it has no form for (ő → o). A mark with nothing before it is
+ * dropped.
+ */
+function _composeMarks(text) {
+  return text.replace(/([^\u0300-\u036f]?)[\u0300-\u036f]+/gu, function (all, base) {
+    var c = all.normalize('NFC');
+    return (Array.from(c).length === 1 && _CHARMAP[c.codePointAt(0)]) ? c : base;
+  });
+}
+
+/**
  * Greedy word-wrap to maxWidth columns, max maxLines rows. Lines are
  * trimmed; words longer than maxWidth are hard-broken. Excess lines
  * are dropped (consider truncated; v1 keeps things simple).
+ *
+ * Widths are counted in code points — one per CEA-608 column (every
+ * character goes out as one glyph). They were UTF-16 units: a line
+ * with characters outside the BMP (emoji) broke at 16 columns, and a
+ * hard break could fall between the two halves of a surrogate pair,
+ * each half then sent as a '?' of its own ("a" + 20 emoji: 22 '?').
  */
 function _wrapText(text, maxWidth, maxLines) {
   var lines = [];
@@ -324,47 +350,51 @@ function _wrapText(text, maxWidth, maxLines) {
   var paragraphs = text.split(/\r?\n/);
   for (var pi = 0; pi < paragraphs.length; pi++) {
     var words = paragraphs[pi].split(/\s+/).filter(function (w) { return w.length > 0; });
-    var current = '';
+    var current = [];                          // code points of the line so far
     for (var wi = 0; wi < words.length; wi++) {
-      var w = words[wi];
+      var w = Array.from(words[wi]);           // code points
       // If word alone is longer than maxWidth, hard-break it
       while (w.length > maxWidth) {
         if (current.length > 0) {
-          lines.push(current);
-          current = '';
+          lines.push(current.join(''));
+          current = [];
           if (lines.length >= maxLines) return lines;
         }
-        lines.push(w.substring(0, maxWidth));
+        lines.push(w.slice(0, maxWidth).join(''));
         if (lines.length >= maxLines) return lines;
-        w = w.substring(maxWidth);
+        w = w.slice(maxWidth);
       }
-      var candidate = current.length === 0 ? w : current + ' ' + w;
+      var candidate = current.length === 0 ? w : current.concat([' '], w);
       if (candidate.length <= maxWidth) {
         current = candidate;
       } else {
-        lines.push(current);
+        lines.push(current.join(''));
         if (lines.length >= maxLines) return lines;
         current = w;
       }
     }
     if (current.length > 0) {
-      lines.push(current);
+      lines.push(current.join(''));
       if (lines.length >= maxLines) return lines;
     }
   }
   return lines;
 }
 
-// CEA-608 byte-pair pacing rate. NTSC line-21 carries one byte-pair
-// every 1/30s = 33,333 µs. We use this to space scheduled pairs from
-// addCue() — start sequence is positioned so that the EOC pair
-// (the one that flips the caption to visible) lands at cue.start.
-//
-// Most HLS players are tolerant of slight timing variations; pairs
-// arriving up to a few hundred ms early or late are still rendered
-// correctly. We only respect this rate for SCHEDULING; the actual
-// emission rate is determined by the host video stream's frame rate.
-var _FRAME_GAP_US = Math.round(1_000_000 / 30);
+// CEA-608 byte-pair rate. NTSC line 21 carries one field-1 byte pair
+// per frame of 1001/30000 s = 33,366.67 µs. Scheduled pairs from
+// addCue() are spaced by it (rounded up, so the schedule never runs
+// ahead of the slots) — the start sequence is positioned so that the
+// first EOC pair (the one that flips the caption to visible) lands at
+// cue.start.
+var _FRAME_GAP_US = Math.round(1_001_000 / 30);
+// The field-1 slots themselves, in thirds of a µs (100100 = 1001/30000
+// s exactly): getCcDataForFrame() puts at most one pair in each, on the
+// frames' own timestamps. It used to take up to two pairs a frame (a
+// doubled control code's copies at one time), 60 field-1 pairs a second
+// at 30 fps where line 21 (and CTA-708's 608-compatible cc_data) carries
+// 29.97: a transcoder to line 21 had to buffer.
+var _SLOT_3US = 100100;
 
 // ── CEA608Encoder ─────────────────────────────────────────────
 
@@ -393,6 +423,11 @@ function CEA608Encoder(opts) {
   this._scheduled = [];
   this._dirty = false;
   this._nowUs = -Infinity;     // start of the last frame drained
+  // The next free field-1 slot, in thirds of a µs (null: none used yet),
+  // and the start of the previous frame (a timeline that jumps back
+  // starts the slots again).
+  this._nextSlot3 = null;
+  this._lastStartUs = null;
 }
 
 /**
@@ -425,7 +460,14 @@ CEA608Encoder.prototype.addCue = function (cue) {
   if (!cue || typeof cue.text !== 'string') {
     throw new TypeError('CEA608Encoder.addCue: cue.text (string) required');
   }
-  if (typeof cue.start !== 'number' || typeof cue.end !== 'number') {
+  // NaN is typeof 'number' and slips past `end <= start` (every
+  // comparison with it is false). It used to be accepted: its pairs got
+  // a NaN pts, sorted to the head of the schedule, and `pts < frameEnd`
+  // never held for them — so no caption at all went out after it, the
+  // valid cues included. (±Infinity is fine: an end at Infinity is a
+  // caption shown until the next one replaces it.)
+  if (typeof cue.start !== 'number' || typeof cue.end !== 'number' ||
+      cue.start !== cue.start || cue.end !== cue.end) {
     throw new TypeError('CEA608Encoder.addCue: cue.start/end (numbers) required');
   }
   if (cue.end <= cue.start) {
@@ -465,17 +507,24 @@ CEA608Encoder.prototype._rebuild = function () {
   var order = started.concat(waiting);
   this._cues = order;
 
-  // Pass 1: when each cue's EOC goes out.
+  // Pass 1: when each cue's EOC goes out. Every pair takes a slot of
+  // its own (a doubled code's copy too), so the load sequence is timed
+  // in pairs: the first EOC pair lands on cue.start when nothing delays
+  // it. (It was timed in units, both copies of a doubled code at one
+  // time — once they go out a slot apart, each caption was shown a slot
+  // per doubled code late.)
   var loadFreeUs = -Infinity;
   var firstUs = [];
   for (var i = 0; i < order.length; i++) {
-    var n = order[i].startUnits.length;
-    var first = order[i].startUs - (n - 1) * _FRAME_GAP_US;
+    var units = order[i].startUnits;
+    var total = _pairCount(units);
+    var eocAt = total - units[units.length - 1].length;   // pairs before the EOC
+    var first = order[i].startUs - eocAt * _FRAME_GAP_US;
     if (first < 0) first = 0;
     if (first < loadFreeUs) first = loadFreeUs;
     firstUs.push(first);
-    order[i].eocUs = first + (n - 1) * _FRAME_GAP_US;
-    loadFreeUs = order[i].eocUs + _FRAME_GAP_US;
+    order[i].eocUs = first + eocAt * _FRAME_GAP_US;
+    loadFreeUs = first + total * _FRAME_GAP_US;
   }
 
   // Pass 2: the pairs. seq keeps units of one cue in order and both
@@ -483,11 +532,14 @@ CEA608Encoder.prototype._rebuild = function () {
   var entries = [];
   var seq = 0;
   function add(cue, units, kind, t0, prio) {
+    var at = 0;   // pairs before unit u
     for (var u = 0; u < units.length; u++) {
       var key = kind + u;
+      var ptsUs = t0 + at * _FRAME_GAP_US;
+      at += units[u].length;
       if (cue.sent.has(key)) continue;
       for (var p = 0; p < units[u].length; p++) {
-        entries.push({ ptsUs: t0 + u * _FRAME_GAP_US, prio: prio, seq: seq++,
+        entries.push({ ptsUs: ptsUs, prio: prio, seq: seq++,
           pair: units[u][p], cue: cue, key: key, last: p === units[u].length - 1 });
       }
     }
@@ -498,7 +550,7 @@ CEA608Encoder.prototype._rebuild = function () {
     var next = order[j + 1];
     // EOC of the next cue replaces this one at/before its end: no EDM.
     c.needsEdm = !(next && next.eocUs <= c.endUs);
-    if (c.needsEdm) add(c, c.endUnits, 'e', Math.max(c.endUs, c.eocUs + _FRAME_GAP_US), 0);
+    if (c.needsEdm) add(c, c.endUnits, 'e', Math.max(c.endUs, firstUs[j] + _pairCount(c.startUnits) * _FRAME_GAP_US), 0);
   }
   entries.sort(function (a, b) { return (a.ptsUs - b.ptsUs) || (a.prio - b.prio) || (a.seq - b.seq); });
   this._scheduled = entries;
@@ -506,17 +558,20 @@ CEA608Encoder.prototype._rebuild = function () {
 };
 
 /**
- * Pull cc_data triples that should be emitted at the given frame PTS.
- * Returns up to 2 triples (NTSC pairs the 60Hz CC clock with 30fps
- * video at 2 byte-pairs/frame; we cap at 2 to leave headroom for
- * future CEA-708 alongside, and to keep parity sequences contiguous).
+ * Pull the cc_data triples that go out with the frame [frameStartUs,
+ * frameEndUs): one pair per field-1 slot (every 1001/30000 s of media
+ * time, CTA-608-E) that falls in the frame — at most one at 25 to 60
+ * fps (none in every other 60 fps frame), one or two at 24 fps — and
+ * only the pairs due by the frame's end. A slot is taken from the
+ * frame's own timestamps, never one before the last slot used: frames
+ * that overlap (a duration longer than the spacing) get no extra slots,
+ * a gap banks none; a timeline that jumps back starts them again.
  *
  * Each triple is { ccType: 0|1|2|3, ccValid: 0|1, b1: byte, b2: byte }.
  * cc_type=0 means "CEA-608 NTSC field 1" — the channel for CC1/CC2.
  *
- * If no real data is queued, returns an empty array. Caller may want
- * to emit a "filler" triple (cc_valid=0, b1/b2=0x80) per frame to
- * keep the SEI message structurally constant — that's optional.
+ * If no real data is queued, returns an empty array; padCcData() fills
+ * a frame's cc_data up to the cc_count ATSC A/53 Part 4 fixes for it.
  *
  * @param {number} frameStartUs   Inclusive lower bound of frame window
  * @param {number} frameEndUs     Exclusive upper bound (= start of next frame)
@@ -525,10 +580,16 @@ CEA608Encoder.prototype.getCcDataForFrame = function (frameStartUs, frameEndUs) 
   if (this._dirty) this._rebuild();
   if (frameStartUs > this._nowUs) this._nowUs = frameStartUs;
   var triples = [];
+  if (this._lastStartUs !== null && frameStartUs < this._lastStartUs) this._nextSlot3 = null;
+  this._lastStartUs = frameStartUs;
+  var slot3 = 3 * frameStartUs;
+  if (this._nextSlot3 !== null && this._nextSlot3 > slot3) slot3 = this._nextSlot3;
 
-  // Take any scheduled pairs whose ptsUs falls into this frame.
-  // Cap at 2 per frame (see header comment).
-  while (triples.length < 2 && this._scheduled.length > 0 &&
+  // Take the scheduled pairs due in this frame, one per slot in it. A
+  // slot in the frame's last µs goes to the next frame: frame times are
+  // whole µs, so at 29.97 fps a 33367 µs frame would otherwise hold two
+  // slots now and then.
+  while (slot3 < 3 * (frameEndUs - 1) && this._scheduled.length > 0 &&
          this._scheduled[0].ptsUs < frameEndUs) {
     var entry = this._scheduled.shift();
     triples.push({
@@ -538,10 +599,46 @@ CEA608Encoder.prototype.getCcDataForFrame = function (frameStartUs, frameEndUs) 
       b2: entry.pair[1],
     });
     if (entry.last) this._markSent(entry.cue, entry.key);
+    slot3 += _SLOT_3US;
+    this._nextSlot3 = slot3;
   }
 
   return triples;
 };
+
+// Pairs in a list of units.
+function _pairCount(units) {
+  var n = 0;
+  for (var i = 0; i < units.length; i++) n += units[i].length;
+  return n;
+}
+
+/**
+ * The cc_count of a frame of `frameDurUs`: ATSC A/53 Part 4 sets it by
+ * the frame rate so that cc_data carries a fixed 9600 bit/s (600
+ * constructs a second: 20 at 29.97 / 30 fps, 10 at 59.94 / 60, 25 at
+ * 23.976 / 24, 24 at 25, 12 at 50 — CTA-708-E §4.3.6.1), at most 31
+ * (5 bits).
+ */
+function ccCountForFrame(frameDurUs) {
+  var n = Math.round(frameDurUs * 600 / 1000000);
+  if (!(n >= 1)) n = 1;
+  return n > 31 ? 31 : n;
+}
+
+/**
+ * A frame's whole cc_data: `triples` (the 608 constructs first) padded
+ * with cc_valid=0 DTVCC constructs (0xFA 0x00 0x00, what FFmpeg's
+ * cc_fifo pads with) up to ccCountForFrame(frameDurUs). Every frame of
+ * a captioned stream carries one (A/53: a fixed bandwidth), the frames
+ * without a 608 pair too.
+ */
+function padCcData(triples, frameDurUs) {
+  var out = triples.slice(0, 31);
+  var n = ccCountForFrame(frameDurUs);
+  while (out.length < n) out.push({ ccType: 2, ccValid: 0, b1: 0, b2: 0 });
+  return out;
+}
 
 // Record a fully emitted unit; forget a cue once nothing of it is left.
 CEA608Encoder.prototype._markSent = function (cue, key) {
@@ -688,4 +785,4 @@ function buildCea608SeiNalu(triples, isH265) {
 }
 
 export default CEA608Encoder;
-export { buildCea608SeiNalu, _withParity, _pacForRow, _wrapText };
+export { buildCea608SeiNalu, padCcData, ccCountForFrame, _withParity, _pacForRow, _wrapText, _composeMarks };

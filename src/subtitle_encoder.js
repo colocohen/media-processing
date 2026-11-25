@@ -85,6 +85,25 @@ function SubtitleEncoder(opts) {
   this._language = opts.language || null;
   this._mode = opts.mode || 'live';
   this._startTime = opts.startTime || 0;
+  // Segments are cut every segmentDuration from startTime, in loops that
+  // run until a time is reached: a negative or zero duration never got
+  // there (or failed only at the first segment, inside Playlist), and an
+  // infinite startTime never moved (-Infinity + 4 is -Infinity: addCue()
+  // looped forever).
+  if (!(isFinite(this._segmentDurationSec) && this._segmentDurationSec > 0)) {
+    throw new RangeError('SubtitleEncoder: opts.segmentDuration must be a finite number > 0, got ' +
+                         this._segmentDurationSec);
+  }
+  if (!isFinite(this._startTime)) {
+    throw new RangeError('SubtitleEncoder: opts.startTime must be a finite number, got ' + this._startTime);
+  }
+  // Nothing written can hold a time before 0: a WebVTT timestamp is
+  // digits only (times were clamped to 0, every cue before it shown at
+  // once) and the IMSC tfdt is unsigned (-4 s was written as 2^64 - 4000).
+  if (this._startTime < 0) {
+    throw new RangeError('SubtitleEncoder: opts.startTime must not be negative ' +
+                         '(a WebVTT timestamp and the IMSC tfdt cannot hold it), got ' + this._startTime);
+  }
 
   // IMSC-specific options. The TTML output uses one default region
   // and one default style — IMSC is designed for richer styling but
@@ -157,9 +176,9 @@ function SubtitleEncoder(opts) {
  *                                   Useful for cross-segment de-dup; players
  *                                   that see the same identifier in two
  *                                   adjacent segments treat it as one cue.
- * @param {string} [cue.settings]    Raw WebVTT cue settings appended to the
- *                                   timing line, e.g. 'align:center,line:80%'.
- *                                   Caller is responsible for syntax.
+ * @param {string} [cue.settings]    WebVTT cue settings appended to the
+ *                                   timing line, e.g. 'align:center line:80%'
+ *                                   (checked against the WebVTT grammar).
  */
 SubtitleEncoder.prototype.addCue = function (cue) {
   if (this._ended) {
@@ -168,7 +187,12 @@ SubtitleEncoder.prototype.addCue = function (cue) {
   if (typeof cue !== 'object' || cue === null) {
     throw new TypeError('SubtitleEncoder.addCue: cue object required');
   }
-  if (typeof cue.start !== 'number' || typeof cue.end !== 'number') {
+  // Finite numbers only. NaN passed every check below (each comparison
+  // with it is false) and the cue was silently lost; an end at Infinity
+  // made flush() / end() emit segments forever (flush runs to the
+  // latest cue end).
+  if (typeof cue.start !== 'number' || typeof cue.end !== 'number' ||
+      !isFinite(cue.start) || !isFinite(cue.end)) {
     throw new TypeError('SubtitleEncoder.addCue: cue.start and cue.end (numbers) required');
   }
   if (cue.start >= cue.end) {
@@ -196,6 +220,7 @@ SubtitleEncoder.prototype.addCue = function (cue) {
       );
     }
   }
+  if (cue.settings) _checkVttSettings(String(cue.settings));
   if (cue.start < this._currentSegmentStart) {
     throw new RangeError(
       'SubtitleEncoder.addCue: cue.start (' + cue.start +
@@ -402,6 +427,54 @@ SubtitleEncoder.prototype._emitSegment = function () {
  * but allowed unconditionally; we always include hours for
  * predictable output formatting (Apple HLS validators expect it).
  */
+// The WebVTT cue settings of the timing line (W3C WebVTT §4.1, §4.4).
+// They were written as given, so a line break in them ended the timing
+// line (the rest became cue text; a blank line ended the cue) and
+// 'align:center,line:80%' — this module's own example — is one invalid
+// align setting a player ignores. A settings list is name:value settings
+// separated by spaces or tabs, without CR / LF / "-->"; the six defined
+// ones have their value grammar and appear once each. Other names are
+// left to the reader (§4.1's syntax allows them; parsers skip them).
+var _VTT_PCT = '(\\d+(?:\\.\\d+)?)%';
+var _VTT_SETTINGS = {
+  vertical: /^(?:rl|lr)$/,
+  line:     new RegExp('^(?:' + _VTT_PCT + '|-?\\d+)(?:,(?:start|center|end))?$'),
+  position: new RegExp('^' + _VTT_PCT + '(?:,(?:line-left|center|line-right))?$'),
+  size:     new RegExp('^' + _VTT_PCT + '$'),
+  align:    /^(?:start|center|end|left|right)$/,
+  region:   /^/,   // a region identifier: any characters (no space / tab)
+};
+function _checkVttSettings(s) {
+  if (/[\r\n]/.test(s) || s.indexOf('-->') >= 0) {
+    throw new TypeError('SubtitleEncoder.addCue: cue.settings must not contain a line break ' +
+                        'or "-->" (W3C WebVTT §4.1)');
+  }
+  var seen = {};
+  var tokens = s.split(/[ \t]+/);
+  for (var i = 0; i < tokens.length; i++) {
+    var t = tokens[i];
+    if (t === '') continue;
+    var colon = t.indexOf(':');
+    var name = colon > 0 ? t.slice(0, colon) : '';
+    var value = colon > 0 ? t.slice(colon + 1) : '';
+    var known = Object.prototype.hasOwnProperty.call(_VTT_SETTINGS, name);
+    var m = known ? _VTT_SETTINGS[name].exec(value) : null;
+    // A WebVTT percentage is in 0..100.
+    if (value === '' || (known && (!m || (m[1] !== undefined && parseFloat(m[1]) > 100)))) {
+      throw new TypeError('SubtitleEncoder.addCue: cue setting ' + JSON.stringify(t) +
+                          ' is not a WebVTT cue setting (W3C WebVTT §4.4: name:value, ' +
+                          'separated by spaces)');
+    }
+    if (known) {
+      if (seen[name]) {
+        throw new TypeError('SubtitleEncoder.addCue: cue setting "' + name +
+                            '" is given twice (W3C WebVTT §4.4)');
+      }
+      seen[name] = true;
+    }
+  }
+}
+
 function _formatVttTime(secondsFloat) {
   return _formatHhMmSsMs(secondsFloat);
 }
@@ -581,11 +654,18 @@ function _formatTtmlTime(secondsFloat) {
 
 /**
  * XML-escape text. TTML cue text is XML PCDATA so the five base
- * entities (& < > " ') must be replaced. We don't strip control
- * characters — caller is responsible for sane input.
+ * entities (& < > " ') must be replaced.
+ *
+ * Characters XML 1.0 does not allow at all (§2.2 Char: the C0 controls
+ * but TAB / LF / CR, U+FFFE / U+FFFF, lone surrogates) are dropped: no
+ * escape can carry them (&#11; is not well-formed either), and one of
+ * them — a vertical tab from a converted caption file, say — made the
+ * whole segment's document not well-formed, every cue in it lost to an
+ * XML parser.
  */
 function _xmlEscape(s) {
   return String(s)
+    .replace(/[^\t\n\r\u0020-\uD7FF\uE000-\uFFFD\u{10000}-\u{10FFFF}]/gu, '')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
@@ -708,7 +788,11 @@ function _buildTtmlDocument(cues, language, region, style) {
   lines.push('  <body>');
   lines.push('    <div>');
 
-  var usedIds = { s0: true, r0: true };   // the style and region ids below
+  // The style and region ids below. No prototype: a cue identifier
+  // "__proto__" set the object's prototype instead of a key, so a second
+  // "__proto__" cue got the same xml:id (XML 1.0 §3.3.1: an ID is unique).
+  var usedIds = Object.create(null);
+  usedIds.s0 = true; usedIds.r0 = true;
   for (var i = 0; i < cues.length; i++) {
     var c = cues[i];
     // xml:id per cue gives players a stable handle for cross-segment
@@ -1015,8 +1099,10 @@ function _buildImscMedia(cues, segStart, segEnd, sequence, language, region, sty
   // 1000ms * Number.MAX_SAFE_INTEGER / 1000 covers eons of streams,
   // but Number.MAX_SAFE_INTEGER is safer with v1. Use v1.
   var tfdtPayload = new Uint8Array(8);
-  // upper 32 bits = 0 (we won't exceed 2^32 ms = ~50 days)
-  writeU32BE(tfdtPayload, 0, 0);
+  // All 64 bits. The upper 32 used to be 0 ("we won't exceed 2^32 ms =
+  // ~50 days"), but that is media time, and startTime may be anything:
+  // startTime 5e6 s gave a tfdt of 705 032 704 ms instead of 5e9.
+  writeU32BE(tfdtPayload, 0, Math.floor(baseDecodeTicks / 4294967296));
   writeU32BE(tfdtPayload, 4, baseDecodeTicks >>> 0);
   var tfdt = _fullBox('tfdt', 1, 0, tfdtPayload);
 
@@ -1060,12 +1146,13 @@ function _buildImscMedia(cues, segStart, segEnd, sequence, language, region, sty
 
   // Optional styp (segment type) at start. Strict parsers need it
   // for byte-range fetches; we always emit it for safety. Brand 'msdh'
-  // (Movie Fragment Sequence Data Header) for fragmented segments.
+  // (a DASH Media Segment, ISO/IEC 23009-1 §6.3.4.2) for fragmented
+  // segments. It also listed 'msix', the Indexed Media Segment brand
+  // (§6.3.4.3), whose segments must carry a 'sidx' — these have none.
   var styp = _box('styp', concat([
     fromAscii('msdh'),
     _u32be(0),
     fromAscii('msdh'),
-    fromAscii('msix'),
   ]));
 
   return concat([styp, moof, mdat]);

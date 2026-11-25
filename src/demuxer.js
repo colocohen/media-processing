@@ -223,6 +223,7 @@ Demuxer.prototype.start = function (opts) {
     hasAudio: !!info.audio && _audioReadable(info.audio.codec),
     startUs: startUs,
     endUs: opts.duration ? (startUs != null ? startUs : Math.round(info.startTime * 1e6)) + Math.round(opts.duration * 1e6) : null,
+    durUs: opts.duration ? Math.round(opts.duration * 1e6) : null,
     offsetUs: 0,
     stopped: false,
     ended: false,
@@ -371,6 +372,12 @@ Demuxer.prototype._startNative = function (run, info) {
       self._startFFmpeg(run, info);
       return;
     }
+    // opts.duration with no startTime: from where the streams read start,
+    // on the timeline the chunks carry. ffprobe's start_time is on its
+    // own: after what a decoder drops in an MP4 (edit-list priming), Ogg
+    // (pre-skip) or MP3 (the encoder delay), not in a WebM — the cut came
+    // 21 ms late on an MP4 with AAC, 25 ms on an MP3.
+    if (run.durUs != null && run.startUs == null) run.endUs = _readStart(run, ri) + run.durUs;
     if (run.startUs != null) r.seek(run.startUs);
   });
   r.on('video', function (s) { self._sample(run, src, 'video', s); });
@@ -517,8 +524,13 @@ Demuxer.prototype._cut = function (run, kind, s) {
       if (ts >= run.endUs) {
         // In decode order a frame shown after the end may be needed by
         // frames shown before it (B-frames): kept until it's clear none
-        // follow — a keyframe, or a run of 16 frames all past the end.
-        if (s.isKeyframe || run.held.length >= 16) { run.held = []; run.videoDone = true; return this._checkCut(run); }
+        // follow — a run of 16 frames all past the end (the most a
+        // decoder reorders: H.264 / H.265's 16-frame DPB). A keyframe
+        // isn't that: after an open-GOP one (an H.265 CRA, an H.264
+        // recovery point) come leading frames shown before it — with the
+        // end between them and it, they were lost (0.32 / 0.36 s of a
+        // 0.4 s cut, x265 open-gop).
+        if (run.held.length >= 16) { run.held = []; run.videoDone = true; return this._checkCut(run); }
         run.held.push(s);
         return;
       }
@@ -694,6 +706,19 @@ function _nativeReadable(info) {
   if (info.video && !(kinds.video && kinds.video[info.video.codec]) && v) return false;
   if (info.audio && !(kinds.audio && kinds.audio[info.audio.codec]) && a) return false;
   return true;
+}
+
+// Where the streams a native run reads start (the earliest; µs): the
+// tracks _adopt takes.
+function _readStart(run, ri) {
+  var v = null, a = null;
+  (ri.tracks || []).forEach(function (t) {
+    if (!t.config) return;
+    if (!v && t.type === 'video') v = t;
+    if (!a && t.type === 'audio') a = t;
+  });
+  var s = [run.hasVideo && v ? v.startUs : null, run.hasAudio && a ? a.startUs : null].filter(function (x) { return x != null; });
+  return s.length ? Math.min.apply(null, s) : (ri.startUs || 0);
 }
 
 // An audio codec this Demuxer delivers as WebCodecs chunks (PCM of any

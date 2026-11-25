@@ -68,6 +68,20 @@ var _MAX_PRE_IDR_BUFFER = 200;
  * @param {boolean} [opts.hasVideo=true]   Set false for audio-only streams.
  * @param {number}  [opts.firstMediaSequence=0]  MSN of sequence 0 (for the
  *                                         sequence-derived AES-128 IV).
+ * @param {number}  [opts.targetDuration]  The playlist's explicit
+ *                                         TARGETDURATION (seconds, rounded
+ *                                         up): no segment outgrows it.
+ *
+ * With targetDuration, a segment that would outgrow it — its EXTINF
+ * rounded to the nearest integer above the target, which RFC 8216
+ * §4.3.3.1 forbids — is closed before the frame that would push it
+ * there, on the latest keyframe that keeps it within the target, else
+ * on the latest frame (the next segment then starts on a frame that is
+ * not a keyframe: its info says independent:false, so a playlist that
+ * declares EXT-X-INDEPENDENT-SEGMENTS refuses it — declare it only when
+ * the keyframes come in time). Without, a late keyframe (sparse GOPs, a
+ * gap in the input) gave a segment of 3 s under TARGETDURATION:2.
+ * A single frame longer than the target still makes a segment over it.
  *
  * A segment whose encryption fails reaches onSegment with gap:true and
  * bytes:null — list it as EXT-X-GAP, don't publish bytes for it.
@@ -106,7 +120,19 @@ function SegmentBuilder(opts) {
   // value is in the 200ms–1s range; outside that range, players may
   // refuse the playlist (PART-TARGET upper bound is half the segment
   // duration per Apple's spec).
-  this._partDurationUs = opts.partDuration ? opts.partDuration * 1000000 : 0;
+  //
+  // A part may last up to PART-TARGET as the playlist writes it (5
+  // decimals) and what rounds down to it there: 0.0333333 is written
+  // 0.03333, and a part of 33334 µs is written 0.03333 as well
+  // (rfc8216bis §4.4.4.9 compares what is written). Frame timestamps are
+  // whole µs, so a target of exactly 1/30 s held 33333 µs frames but not
+  // the 33334 µs ones between them.
+  this._partDurationUs = opts.partDuration ?
+    Math.round(Number(opts.partDuration.toFixed(5)) * 1000000) + 4 : 0;
+  // The explicit TARGETDURATION no segment may outgrow (0: none; see the
+  // constructor's comment).
+  var td = opts.targetDuration;
+  this._targetDurationSec = (td > 0 && isFinite(td)) ? Math.ceil(td) : 0;
 
   // I-frame playlist support. When enabled, each emitted segment
   // carries an `iFrame` property describing the byte range of its
@@ -229,6 +255,12 @@ function SegmentBuilder(opts) {
   this._segmentPartBytes = [];
   this._segmentParts = [];
   this._firstPartOfSegmentIndependent = false;
+  // Does the open segment start on an independent frame (a keyframe, or
+  // any audio frame)? False after a cut that targetDuration forced.
+  this._segmentIndependent = true;
+  // flush(): where the last video frame ends, when audio runs on after
+  // it (a place a part may end at; see flush).
+  this._videoTailEndUs = null;
   // True after disableAudio(): audio pushes are ignored.
   this._audioDisabled = false;
   // Internal byte-offset cursor — mirrors sum of _segmentPartByteLengths
@@ -259,6 +291,7 @@ SegmentBuilder.prototype.pushVideo = function (au, opts) {
     if (!opts.isKey) return;
     this._firstKeyframeReceived = true;
     this._segmentStartPtsUs = opts.ptsUs;
+    this._segmentIndependent = true;
 
     // LL-HLS: open the first part of segment 0 anchored at the IDR PTS.
     // The first part of every segment starts on a keyframe and is
@@ -297,6 +330,13 @@ SegmentBuilder.prototype.pushVideo = function (au, opts) {
 
   // Late chunks (PTS before current segment start) are dropped.
   if (opts.ptsUs < this._segmentStartPtsUs) return;
+
+  // A segment that would end at this frame's start is over the explicit
+  // target: it closes earlier (see the constructor).
+  if (this._pendingBoundaryPtsUs === null && this._videoBuf.length > 0 &&
+      this._overTarget(this._segmentStartPtsUs, opts.ptsUs)) {
+    this._pendingBoundaryPtsUs = this._forcedBoundary(this._videoBuf, opts.ptsUs);
+  }
 
   // Detect a new segment boundary: an IDR that arrives after at
   // least segmentDuration has elapsed since this segment started.
@@ -382,6 +422,16 @@ SegmentBuilder.prototype.pushAudio = function (adts, opts) {
 
   // Audio-only flush trigger: time-based.
   if (!this._hasVideo) {
+    // A segment that would end at this frame's start is over the
+    // explicit target: close it on the latest frame that keeps it within
+    // (every audio frame is independent).
+    while (this._audioBuf.length > 0 && (!this._writer.canWriteInit || this._writer.canWriteInit()) &&
+           this._overTarget(this._segmentStartPtsUs, opts.ptsUs)) {
+      var forced = this._forcedBoundary(this._audioBuf, opts.ptsUs);
+      this._maybeEmitPart(forced, true);
+      this._sealSegment(forced);
+      this._segmentStartPtsUs = forced;
+    }
     // canWriteInit defends the same way the mixed-A+V path does in
     // _maybeSealPending — defer if the writer hasn't received its
     // audio config yet (AAC needs description; Opus is always ready).
@@ -517,21 +567,46 @@ SegmentBuilder.prototype.flush = function () {
     if (aEnd > endPts) endPts = aEnd;
   }
 
+  var videoEnd = null;   // where the last video frame ends
   if (vLen >= 2) {
     var lastVc = this._videoBuf[vLen - 1];
     var prevVc = this._videoBuf[vLen - 2];
     var gap = lastVc.ptsUs - prevVc.ptsUs;
-    if (gap > 0) endPts = Math.max(endPts, lastVc.ptsUs + gap);
+    if (gap > 0) { endPts = Math.max(endPts, lastVc.ptsUs + gap); videoEnd = lastVc.ptsUs + gap; }
   } else if (vLen === 1) {
     // Single-frame segment is a pathological case; fall back to a
     // 30 fps default (~33 ms per frame) which is harmless if wrong.
     endPts = Math.max(endPts, this._videoBuf[0].ptsUs + 33333);
+    videoEnd = this._videoBuf[0].ptsUs + 33333;
+  }
+
+  // The tail over the explicit target: cut it as pushes do (on the
+  // latest keyframe / frame that keeps each segment within the target);
+  // past the last video frame, on the audio that runs on after it (no
+  // more video can come now).
+  while (this._overTarget(this._segmentStartPtsUs, endPts)) {
+    var cut = this._forcedBoundary(this._hasVideo ? this._videoBuf : this._audioBuf, endPts);
+    if (cut >= endPts && this._hasVideo) cut = this._forcedBoundary(this._audioBuf, endPts);
+    if (cut >= endPts) break;   // the last frame alone is longer than the target
+    this._maybeEmitPart(cut, true);
+    var startCut = this._segmentStartPtsUs;
+    this._segmentStartPtsUs = cut;
+    this._emit(_spliceUpTo(this._videoBuf, cut), _spliceUpTo(this._audioBuf, cut),
+               _spliceUpTo(this._metadataBuf, cut), startCut, cut);
   }
 
   // LL-HLS: cut the tail into parts first, so the final part is not
   // everything since the last part (no more data is coming, so don't
-  // wait for audio).
-  this._maybeEmitPart(endPts, true);
+  // wait for audio). Audio that runs on past the last video frame: a
+  // part may end where that frame does (else the part before the final
+  // one could end on the frame's start, a frame long, below 85 % of
+  // PART-TARGET — rfc8216bis §4.4.4.9).
+  this._videoTailEndUs = (videoEnd !== null && endPts > videoEnd) ? videoEnd : null;
+  try {
+    this._maybeEmitPart(endPts, true);
+  } finally {
+    this._videoTailEndUs = null;
+  }
   this._sealAtBoundary(endPts);
 };
 
@@ -542,6 +617,14 @@ SegmentBuilder.prototype.flush = function () {
  */
 SegmentBuilder.prototype.hasPendingBoundary = function () {
   return this._pendingBoundaryPtsUs !== null;
+};
+
+/**
+ * True once the init segment has gone out (and until reset()): from then
+ * on the tracks are fixed, so disableAudio() can no longer drop one.
+ */
+SegmentBuilder.prototype.hasWrittenInit = function () {
+  return this._initEmitted;
 };
 
 /**
@@ -585,6 +668,7 @@ SegmentBuilder.prototype.reset = function () {
   this._segmentPartBytes = [];
   this._segmentParts = [];
   this._firstPartOfSegmentIndependent = false;
+  this._segmentIndependent = true;
   this._segmentByteCursor = 0;
 };
 
@@ -686,7 +770,7 @@ SegmentBuilder.prototype._maybeEmitPart = function (segEndPtsUs, force) {
       var n = this._audioBuf.length;
       if (n === 0 || this._audioBuf[n - 1].ptsUs < partEnd) return;
     }
-    if (!this._emitPart(partEnd)) return;
+    if (!this._emitPart(partEnd, segEnd)) return;
   }
 };
 
@@ -705,6 +789,18 @@ SegmentBuilder.prototype._maybeEmitPart = function (segEndPtsUs, force) {
  * frame); audio frames in audio-only streams. A part never crosses the
  * segment end; the rest of a segment that fits in PART-TARGET becomes
  * the final part at seal time.
+ *
+ * When nothing starts within the target — a frame longer than
+ * PART-TARGET (variable frame rate input, a gap), or the tail of a
+ * stream whose audio outlasts its video — the part ends at the target
+ * itself, inside that frame: the frame keeps its whole duration (its
+ * sample runs on to the next frame, so the track has no hole), the parts
+ * after it carry what else that time holds (the audio), or are GAP=YES
+ * parts when it holds nothing. A part used to be as long as that frame
+ * (0.5 s parts under PART-TARGET 0.3, the whole tail at end()), above
+ * PART-TARGET, which rfc8216bis §4.4.4.9 forbids. (A part cut there can
+ * be shorter than 85 % of the target — the one before the next frame —
+ * if it is not followed by a GAP part: only such input reaches it.)
  */
 SegmentBuilder.prototype._nextPartEnd = function (segEnd) {
   var start = this._partStartPtsUs;
@@ -721,36 +817,47 @@ SegmentBuilder.prototype._nextPartEnd = function (segEnd) {
     if (p > limit) { firstAfter = p; break; }
     best = p;
   }
+  // flush(): the end of the last video frame, after every frame start.
+  var tail = this._videoTailEndUs;
+  if (tail !== null && tail > start && (segEnd === null || segEnd === undefined || tail < segEnd)) {
+    if (tail <= limit) best = tail;
+    else if (firstAfter === null) firstAfter = tail;
+  }
   // Complete once something at/after the target exists: a chunk at
   // exactly the limit, a chunk past it, or the known segment end.
   var reached = (best === limit) || firstAfter !== null ||
                 (segEnd !== null && segEnd !== undefined);
   if (!reached) return null;
   if (best !== null) return best;
-  // A single frame longer than PART-TARGET: the part can't be shorter
-  // than it. Only reachable with frame intervals > PART-TARGET.
-  return firstAfter;
+  // Nothing starts in (start, limit]: the part ends at the target.
+  return Math.max(start + 1, Math.floor(limit));
 };
 
-/** Write one part ending at partEnd. Returns false if nothing to write. */
-SegmentBuilder.prototype._emitPart = function (partEnd) {
+/**
+ * Write one part ending at partEnd (segEnd: the segment's end when
+ * known). A part with no media (a time nothing covers) is a GAP part.
+ */
+SegmentBuilder.prototype._emitPart = function (partEnd, segEnd) {
   var videoForPart    = _spliceUpTo(this._videoBuf,    partEnd);
   var audioForPart    = _spliceUpTo(this._audioBuf,    partEnd);
-  var metadataForPart = _spliceUpTo(this._metadataBuf, partEnd);
 
-  // No chunks at all → nothing to write (defensive: _nextPartEnd only
-  // returns a PTS that a buffered chunk starts at).
   if (videoForPart.length === 0 && audioForPart.length === 0) {
-    return false;
+    return this._emitGapPart(partEnd, false);
   }
+  var metadataForPart = _spliceUpTo(this._metadataBuf, partEnd);
 
   // The first init-segment must go out before any part. Only emits
   // once per stream; later calls return null from writeInit.
   this._emitInitOnce();
 
   var partStart = this._partStartPtsUs;
+  // The last video frame lasts until the next one starts (the part's
+  // end, unless the part was cut inside a frame longer than the target).
+  var videoEnd = this._videoBuf.length > 0 ? this._videoBuf[0].ptsUs :
+    this._videoTailEndUs !== null ? this._videoTailEndUs :
+    (segEnd !== null && segEnd !== undefined) ? segEnd : partEnd;
   var partBytes = this._writer.writeSegment(
-    videoForPart, audioForPart, partEnd, metadataForPart);
+    videoForPart, audioForPart, videoEnd, metadataForPart);
 
   // Track the part's location within the in-progress segment file so
   // EXT-X-PART can declare BYTERANGE for byte-range fetches.
@@ -766,7 +873,9 @@ SegmentBuilder.prototype._emitPart = function (partEnd) {
     endPtsUs:        partEnd,
     byteOffset:      byteOffset,
     byteLength:      byteLength,
-    independent:     this._firstPartOfSegmentIndependent,
+    independent:     this._firstPartOfSegmentIndependent ||
+                     _hasIndependentFrame(this._hasVideo, videoForPart, audioForPart),
+    gap:             false,
     partIndex:       this._segmentParts.length,
     segmentSequence: this._sequence,    // segment that contains this part
     final:           false,             // becomes true via _emit when seg seals
@@ -783,6 +892,51 @@ SegmentBuilder.prototype._emitPart = function (partEnd) {
 };
 
 /**
+ * A part over a time no media sample starts in (after a frame longer
+ * than PART-TARGET): listed with GAP=YES, no bytes. Metadata in it waits
+ * for the next part.
+ */
+SegmentBuilder.prototype._emitGapPart = function (partEnd, isFinal) {
+  var partStart = this._partStartPtsUs;
+  if (!(partEnd > partStart)) return false;
+  var partInfo = {
+    bytes:           new Uint8Array(0),
+    duration:        (partEnd - partStart) / 1000000,
+    startPtsUs:      partStart,
+    endPtsUs:        partEnd,
+    byteOffset:      this._segmentByteCursor,
+    byteLength:      0,
+    independent:     false,
+    gap:             true,
+    partIndex:       this._segmentParts.length,
+    segmentSequence: this._sequence,
+    final:           isFinal,
+    videoFrames:     0,
+    audioFrames:     0,
+    metadataEvents:  0,
+  };
+  this._segmentParts.push(partInfo);
+  this._firstPartOfSegmentIndependent = false;
+  this._partStartPtsUs = partEnd;
+  this._onPart(partInfo);
+  return true;
+};
+
+/**
+ * Does a part contain an independent frame? rfc8216bis §4.4.4.9: every
+ * Partial Segment containing one SHOULD carry INDEPENDENT=YES (clients
+ * join and switch renditions there). Only the first part of each segment
+ * was marked, so a part starting on a mid-segment keyframe (a GOP shorter
+ * than the segment) and every audio-only part after the first — each AAC /
+ * Opus frame decodes on its own — said INDEPENDENT=NO.
+ */
+function _hasIndependentFrame(hasVideo, video, audio) {
+  if (!hasVideo) return audio.length > 0;
+  for (var i = 0; i < video.length; i++) if (video[i].isKey) return true;
+  return false;
+}
+
+/**
  * Scan _videoBuf for an IDR that's already past the current
  * segment's duration and, if found, set it as the new pending
  * boundary. Used after a seal to handle cases where multiple
@@ -795,9 +949,44 @@ SegmentBuilder.prototype._isBoundary = function (ptsUs) {
   return ptsUs - this._segmentStartPtsUs >= d;
 };
 
+/** Would a segment from fromUs to toUs outgrow the explicit target? */
+SegmentBuilder.prototype._overTarget = function (fromUs, toUs) {
+  return this._targetDurationSec > 0 &&
+         Math.round((toUs - fromUs) / 1000000) > this._targetDurationSec;
+};
+
+/**
+ * Where a segment that would otherwise end at endUs closes: the latest
+ * chunk start in buf after the segment's start that keeps it within the
+ * target — a keyframe if one does (audio frames all are) —, else the
+ * first chunk after the start (the frame there alone is longer than the
+ * target), else endUs.
+ */
+SegmentBuilder.prototype._forcedBoundary = function (buf, endUs) {
+  var start = this._segmentStartPtsUs;
+  var key = null, any = null, first = null;
+  for (var i = 0; i < buf.length; i++) {
+    var p = buf[i].ptsUs;
+    if (p >= endUs) break;
+    if (p <= start) continue;
+    if (first === null) first = p;
+    if (this._overTarget(start, p)) break;
+    any = p;
+    if (buf[i].isKey !== false) key = p;
+  }
+  if (key !== null) return key;
+  if (any !== null) return any;
+  return first !== null ? first : endUs;
+};
+
 SegmentBuilder.prototype._maybeDetectNewBoundary = function () {
   for (var i = 1; i < this._videoBuf.length; i++) {
     var c = this._videoBuf[i];
+    if (this._overTarget(this._segmentStartPtsUs, c.ptsUs)) {
+      this._pendingBoundaryPtsUs = this._forcedBoundary(this._videoBuf, c.ptsUs);
+      this._maybeSealPending();
+      return;
+    }
     if (c.isKey && this._isBoundary(c.ptsUs)) {
       this._pendingBoundaryPtsUs = c.ptsUs;
       this._maybeSealPending();
@@ -866,6 +1055,11 @@ SegmentBuilder.prototype._emitInitOnce = function () {
 
 SegmentBuilder.prototype._emit = function (videoChunks, audioChunks, metadataChunks, startPtsUs, endPtsUs) {
   var w = this._writer;
+  // This segment's independence, and the next one's: it starts on the
+  // first frame left (a keyframe unless a forced cut put it there).
+  var segmentIndependent = this._segmentIndependent;
+  var nextIndependent = !(this._hasVideo && this._videoBuf.length > 0 && !this._videoBuf[0].isKey);
+  this._segmentIndependent = nextIndependent;
 
   // Emit init segment once. TSWriter.writeInit() returns null and
   // nothing is published; FMP4Writer.writeInit() returns ftyp+moov.
@@ -881,7 +1075,15 @@ SegmentBuilder.prototype._emit = function (videoChunks, audioChunks, metadataChu
     // are the leftover trailing chunks that didn't fill a full part —
     // we wrap them as the FINAL part. Edge case: if leftovers are
     // empty (the IDR fell right on a part boundary), no final part.
-    if (videoChunks.length > 0 || audioChunks.length > 0 || metadataChunks.length > 0) {
+    if (videoChunks.length === 0 && audioChunks.length === 0 &&
+        endPtsUs > this._partStartPtsUs) {
+      // Nothing starts in the rest of the segment (after a frame longer
+      // than PART-TARGET): a final GAP part; its metadata waits for the
+      // next segment.
+      for (var mi = metadataChunks.length - 1; mi >= 0; mi--) this._metadataBuf.unshift(metadataChunks[mi]);
+      metadataChunks = [];
+      this._emitGapPart(endPtsUs, true);
+    } else if (videoChunks.length > 0 || audioChunks.length > 0 || metadataChunks.length > 0) {
       var finalPartBytes = w.writeSegment(videoChunks, audioChunks, endPtsUs, metadataChunks);
       var finalPartInfo = {
         bytes:           finalPartBytes,
@@ -890,7 +1092,9 @@ SegmentBuilder.prototype._emit = function (videoChunks, audioChunks, metadataChu
         endPtsUs:        endPtsUs,
         byteOffset:      this._segmentByteCursor,
         byteLength:      finalPartBytes.length,
-        independent:     this._firstPartOfSegmentIndependent,
+        independent:     this._firstPartOfSegmentIndependent ||
+                         _hasIndependentFrame(this._hasVideo, videoChunks, audioChunks),
+        gap:             false,
         partIndex:       this._segmentParts.length,
         segmentSequence: this._sequence,
         final:           true,
@@ -917,8 +1121,10 @@ SegmentBuilder.prototype._emit = function (videoChunks, audioChunks, metadataChu
 
     // I-frame range (LL-HLS path): the first part of the segment is
     // INDEPENDENT (starts on a keyframe), so its byte range IS the
-    // I-frame's byte range. Free, no extra writer call.
-    if (this._iFramePlaylistEnabled && this._segmentParts.length > 0) {
+    // I-frame's byte range. Free, no extra writer call. (Not for a
+    // segment a forced cut started on another frame: a keyframe later in
+    // its first part would come after frames that need the one before.)
+    if (this._iFramePlaylistEnabled && segmentIndependent && this._segmentParts.length > 0) {
       var firstPart = this._segmentParts[0];
       if (firstPart.independent) {
         iFrameRange = {
@@ -934,9 +1140,9 @@ SegmentBuilder.prototype._emit = function (videoChunks, audioChunks, metadataChu
     this._segmentParts = [];
     this._segmentByteCursor = 0;
     this._partStartPtsUs = endPtsUs;
-    this._firstPartOfSegmentIndependent = true;  // next segment starts at IDR
+    this._firstPartOfSegmentIndependent = nextIndependent;
   } else if (this._iFramePlaylistEnabled && this._hasVideo &&
-             videoChunks.length > 1 && _writerIsFmp4(w)) {
+             videoChunks.length > 1 && videoChunks[0].isKey && _writerIsFmp4(w)) {
     // fMP4 + I-frame playlist + non-LL-HLS: split the segment into
     // two fragments. The first fragment carries only the keyframe (no
     // audio, no metadata); the second carries everything else. The
@@ -975,6 +1181,7 @@ SegmentBuilder.prototype._emit = function (videoChunks, audioChunks, metadataChu
     startPtsUs:     startPtsUs,
     endPtsUs:       endPtsUs,
     sequence:       this._sequence++,
+    independent:    segmentIndependent,
     videoFrames:    videoChunks.length,
     audioFrames:    audioChunks.length,
     metadataEvents: metadataChunks.length,
@@ -1038,28 +1245,42 @@ SegmentBuilder.prototype._processEncryptionQueue = function () {
   var self = this;
   enc.encryptor.encrypt(info.bytes, iv, function (err, ciphertext) {
     self._encryptionInProgress = false;
-    if (err) {
-      // One bad segment shouldn't halt the stream — but it must keep
-      // its place in the timeline. It used to be dropped outright: the
-      // playlist then renumbered every later segment (seg2.ts listed at
-      // MSN 1) while each had been encrypted with IV = its own sequence
-      // (2), so a player — which derives the IV from the MSN — decrypted
-      // every following segment with the wrong IV, and the media
-      // timeline jumped with no EXT-X-DISCONTINUITY. Now the segment is
-      // delivered as a gap (no bytes), which the playlist lists as
-      // EXT-X-GAP: MSNs and IVs stay aligned and players skip over it.
-      self._reportError(new Error(
-        'SegmentBuilder: segment encryption failed for sequence=' +
-        info.sequence + ': ' + ((err && err.message) || err)
-      ));
-      self._emitGap(info);
-    } else {
-      info.bytes = ciphertext;
-      self._onSegment(info);
+    // A throw from onSegment here has no caller to reach: it used to
+    // escape the encrypt callback as an uncaught exception (in Node, the
+    // end of the process; HLSEncoder: a segment URI the playlist refuses)
+    // and the queue stopped. It goes to onError, as the builder's other
+    // asynchronous failures do, and the queue moves on.
+    try {
+      self._deliverEncrypted(info, err, ciphertext);
+    } catch (e) {
+      self._reportError(e);
     }
     // Process next regardless of error so the queue keeps moving.
     self._processEncryptionQueue();
   });
+};
+
+/** The encrypt callback's delivery: the ciphertext, or a gap on failure. */
+SegmentBuilder.prototype._deliverEncrypted = function (info, err, ciphertext) {
+  if (err) {
+    // One bad segment shouldn't halt the stream — but it must keep
+    // its place in the timeline. It used to be dropped outright: the
+    // playlist then renumbered every later segment (seg2.ts listed at
+    // MSN 1) while each had been encrypted with IV = its own sequence
+    // (2), so a player — which derives the IV from the MSN — decrypted
+    // every following segment with the wrong IV, and the media
+    // timeline jumped with no EXT-X-DISCONTINUITY. Now the segment is
+    // delivered as a gap (no bytes), which the playlist lists as
+    // EXT-X-GAP: MSNs and IVs stay aligned and players skip over it.
+    this._reportError(new Error(
+      'SegmentBuilder: segment encryption failed for sequence=' +
+      info.sequence + ': ' + ((err && err.message) || err)
+    ));
+    this._emitGap(info);
+  } else {
+    info.bytes = ciphertext;
+    this._onSegment(info);
+  }
 };
 
 /**

@@ -13,11 +13,12 @@
 import {
   initCoder, configureCoder, resetCoder, wireReader, applyCoderPrototype,
   exitError, failCoder, notConfiguredError, detachCoderListeners, addPendingFlush, removePendingFlush, rejectPendingFlushes,
+  holdCalls, holdingCalls, holdCall, holdFlush, releaseCalls, failUnsupported, resetQueue, domex,
 } from './base_coder.js';
 import FFmpegProcess from './ffmpeg_process.js';
 import { frameByteSize, formatPlanes } from './core/frame_size.js';
 import { EncodedVideoChunk } from './encoded_chunk.js';
-import { getVideoCodec } from './codecs.js';
+import { getVideoCodec, checkVideoEncoderConfig, videoEncoderConfigSupported } from './codecs.js';
 import { markEncoderFailed } from './hw_accel.js';
 import { normalizeCodec, parseCodecDetails, buildCodecString } from './utils/codec_strings.js';
 import { getEncoderContainer, getContainer, getContainerFormat, getContainerExtra } from './containers.js';
@@ -174,7 +175,6 @@ function VideoEncoder(init) {
   // and let the old one drain. The naive design lets BOTH FFmpeg
   // readers emit to self._output in parallel, which produces:
   //   - out-of-order frames (new is faster than old's drain)
-  //   - frame loss if cap evicts a still-buffered old process
   //   - visible output gaps during new's startup
   //
   // The fix: retired processes form a chain, oldest first. Only the
@@ -207,8 +207,8 @@ function VideoEncoder(init) {
   // (multiple receivers losing video, or one receiver retrying) easily
   // produce 5-10 keyframe requests per second, which means:
   //   • 5-10 restarts/sec × ~1000ms transition window = constant freezing
-  //   • Eviction cap (MAX_PENDING_RESTARTS) drops P-frames to keep RAM
-  //     bounded, making the freeze WORSE
+  //   • retired processes draining at once (each one's frames still come
+  //     out: there is no cap, see _retireFFmpeg)
   //   • CPU/FD churn from spawning subprocesses
   //
   // Throttle behavior: if a keyframe-restart was performed within the
@@ -230,7 +230,6 @@ function VideoEncoder(init) {
   this._lastKeyframeRestart = 0;
   this.RESTART_COOLDOWN_MS = 1000;
   this._stats.keyframeThrottled = 0;
-  this._stats.evictedProcesses = 0;
 
   // ── Pre-warmed FFmpeg pool (MP-14 Layer 2) ──
   //
@@ -305,12 +304,14 @@ VideoEncoder.prototype.flush = function (cb) {
     if (typeof cb === 'function') { cb(stateErr); return; }
     return Promise.reject(stateErr);
   }
+  var run = function (done) { self._flushImpl(done); };
   if (typeof cb === 'function') {
-    self._flushImpl(cb);   // cb(err): err set when the flush was rejected
+    if (holdingCalls(self)) holdFlush(self, run, cb); else run(cb);   // cb(err): err set when rejected
     return;
   }
   return new Promise(function (resolve, reject) {
-    self._flushImpl(function (err) { if (err) reject(err); else resolve(); });
+    var done = function (err) { if (err) reject(err); else resolve(); };
+    if (holdingCalls(self)) holdFlush(self, run, done); else run(done);
   });
 };
 
@@ -331,10 +332,12 @@ VideoEncoder.prototype._flushImpl = function (cb) {
       self0._flushAllReaders();
       self0._releaseTransitionForFlush();
       self0._state = 'configured';
-      self0._queueSize = 0;
+      self0._queueSize = self0._heldWork || 0;
       cb();
+      releaseCalls(self0);
     });
     this._ffmpeg.endInput();
+    holdCalls(this);   // calls after this flush wait for it (base_coder holdCalls)
     return;
   }
 
@@ -367,13 +370,14 @@ VideoEncoder.prototype._flushImpl = function (cb) {
     self._releaseTransitionForFlush();
     self._ffmpeg.stop();
     for (var k = 0; k < self._oldProcesses.length; k++) {
-      try { self._oldProcesses[k].stop(); } catch (e) {}
+      try { self._oldProcesses[k]._stoppedByCoder = true; self._oldProcesses[k].stop(); } catch (e) {}
     }
     self._state = 'configured';
-    self._queueSize = 0;
+    self._queueSize = self._heldWork || 0;
     self._oldProcesses = [];
     removePendingFlush(self, onFail);
     if (cb) cb();
+    releaseCalls(self);
   }, FLUSH_TIMEOUT);
 
   function onOneDone() {
@@ -388,10 +392,11 @@ VideoEncoder.prototype._flushImpl = function (cb) {
       self._flushAllReaders();
       self._releaseTransitionForFlush();
       self._state = 'configured';
-      self._queueSize = 0;
+      self._queueSize = self._heldWork || 0;
       self._oldProcesses = [];
       removePendingFlush(self, onFail);
       if (cb) cb();
+      releaseCalls(self);
     }
   }
 
@@ -404,10 +409,17 @@ VideoEncoder.prototype._flushImpl = function (cb) {
         proc.on('output_end', function () { if (!oldDone) { oldDone = true; onOneDone(); } });
         proc.on('close', function () { if (!oldDone) { oldDone = true; onOneDone(); } });
       })(old);
-    } else {
-      pending--;  // already closed
     }
+    // An old process that has already exited is not waited for — and was
+    // not counted above. It was subtracted here as well, so with one in
+    // the list pending started at 0: calls after flush() were not held,
+    // and a frame encoded right after it went to the process whose input
+    // flush() had just ended (lost: keyFrame restart, flush, encode).
   }
+
+  // The calls made until this flush is done wait for it (base_coder
+  // holdCalls); released when it resolves.
+  if (pending > 0) holdCalls(self);
 
   // Wait for current FFmpeg to exit (its exit code decides)
   if (this._ffmpeg.running) {
@@ -458,7 +470,7 @@ VideoEncoder.prototype._flushAllReaders = function () {
 // drop the transition state. Shared by close() and reset().
 VideoEncoder.prototype._stopAuxiliary = function () {
   for (var i = 0; i < this._oldProcesses.length; i++) {
-    try { this._oldProcesses[i].stop(); } catch (e) {}
+    try { this._oldProcesses[i]._stoppedByCoder = true; this._oldProcesses[i].stop(); } catch (e) {}
   }
   this._oldProcesses = [];
   this._transitionPendingOld.clear();
@@ -478,6 +490,7 @@ VideoEncoder.prototype._stopAuxiliary = function () {
 // delivered after reset() returned, which W3C forbids (reset discards all
 // pending work). The current process's queues go with it.
 VideoEncoder.prototype.reset = function () {
+  if (this._state === 'closed') throw domex('Cannot reset a closed coder', 'InvalidStateError');
   this._stopAuxiliary();
   this._deferredKeyFrame = false;
   if (this._ffmpeg) {
@@ -491,6 +504,10 @@ VideoEncoder.prototype.reset = function () {
 
 // Override close to also stop old FFmpeg processes from keyframe restarts
 VideoEncoder.prototype.close = function () {
+  // W3C Close: final (a second close() is an InvalidStateError); the
+  // queue size goes to 0 with a dequeue event; held calls go.
+  if (this._state === 'closed') throw domex('Cannot close a closed coder', 'InvalidStateError');
+  resetQueue(this);
   // W3C: a pending flush() is rejected with an AbortError (base_coder).
   // failCoder rejects with its EncodingError first, so this finds none.
   if (typeof DOMException !== 'undefined') {
@@ -501,7 +518,7 @@ VideoEncoder.prototype.close = function () {
   }
   // Stop old processes
   for (var i = 0; i < this._oldProcesses.length; i++) {
-    try { this._oldProcesses[i].stop(); } catch (e) {}
+    try { this._oldProcesses[i]._stoppedByCoder = true; this._oldProcesses[i].stop(); } catch (e) {}
   }
   this._oldProcesses = [];
   // Drop any pending transition state — we're shutting down, no need
@@ -582,8 +599,8 @@ VideoEncoder.prototype._emitEncoded = function (chunk, metadata, producingFfmpeg
   // retired one. With restarts in quick succession (an HLSEncoder fed
   // faster than real time forces a segment-boundary keyframe several
   // times per wall-clock second) a second restart came while the first
-  // was still draining: the buffer was replaced (its chunks lost, before
-  // the eviction cap was relaxed) and the middle process's outputs went
+  // was still draining: the buffer was replaced (its chunks lost) and the
+  // middle process's outputs went
   // out live alongside the oldest's — 300 frames out of order, so the
   // HLS segmenter cut at the wrong keyframes (EXTINF 4.3 / 6.9 / 3.1 s
   // for 2 s segments).
@@ -686,8 +703,23 @@ VideoEncoder.prototype._flushTransition = function (reason) {
 VideoEncoder.prototype._forceFlushTransition = VideoEncoder.prototype._flushTransition;
 
 VideoEncoder.prototype.configure = function (config) {
-  if (!config || !config.codec) throw new TypeError('VideoEncoder.configure: codec required');
-  if (!config.width || !config.height) throw new TypeError('VideoEncoder.configure: width and height required');
+  // W3C: the WebIDL conversion and "valid VideoEncoderConfig" are
+  // TypeErrors, then a closed encoder an InvalidStateError (codecs.js).
+  config = checkVideoEncoderConfig(config, 'VideoEncoder.configure');
+  if (this._state === 'closed') throw domex('Cannot configure a closed coder', 'InvalidStateError');
+  if (holdingCalls(this)) {
+    // Queued behind a flush() in progress (base_coder holdCalls): the
+    // state and [[active orientation]] now, the configuration after it.
+    var self = this;
+    this._state = 'configured';
+    this._activeOrientation = null;
+    holdCall(this, function () { self._configureNow(config); }, false);
+    return;
+  }
+  this._configureNow(config);
+};
+
+VideoEncoder.prototype._configureNow = function (config) {
 
   // Reconfiguring a running encoder: the frames already passed to
   // encode() are encoded with the configuration they were submitted
@@ -734,21 +766,20 @@ VideoEncoder.prototype.configure = function (config) {
   var bitstreamFormat = null;
   if (bsDef) {
     var opt = config[bsDef.option];
-    var requested = (opt && opt.format !== undefined) ? opt.format : bsDef.option;
-    if (!bsDef.values[requested]) {
-      throw new TypeError('VideoEncoder.configure: ' + bsDef.option + '.format must be ' +
-        Object.keys(bsDef.values).map(function (v) { return "'" + v + "'"; }).join(' or ') +
-        " (got '" + requested + "')");
-    }
+    var requested = (opt && opt.format !== undefined) ? opt.format : bsDef.option;   // checked by codecs.js
     bitstreamFormat = requested === 'annexb' ? 'annexb' : 'length-prefixed';
   }
 
-  // latencyMode default per W3C WebCodecs — 'realtime' is the spec default
-  // and signals that the application manages keyframes (via encode(frame,
-  // {keyFrame:true}), typically in response to PLI/FIR in a WebRTC context).
-  // 'quality' signals a classic encode where the encoder inserts its own
-  // periodic keyframes to support seeking and random access.
-  var latencyMode = config.latencyMode || 'realtime';
+  // latencyMode: W3C VideoEncoderConfig "LatencyMode latencyMode =
+  // "quality";" (§7.8: "latencyMode, of type LatencyMode, defaulting to
+  // "quality""). 'quality' is a classic encode where the encoder inserts
+  // its own periodic keyframes (seeking, random access) and may look
+  // ahead; 'realtime' signals that the application manages keyframes
+  // (encode(frame, {keyFrame:true}), typically on a PLI/FIR in WebRTC).
+  // The default was 'realtime', which the comment here called the spec's;
+  // every caller in this library and webrtc-server that wants realtime
+  // (hls_encoder, media_recorder, media_pipeline) passes it explicitly.
+  var latencyMode = config.latencyMode || 'quality';
 
   // gopSize default depends on latencyMode. In 'realtime' we must not emit
   // unrequested keyframes — a 30-frame GOP at 30 fps produces one per second,
@@ -832,7 +863,6 @@ VideoEncoder.prototype.configure = function (config) {
   this._pendingWrites = [];
   this._deferredFlush = null;
   this._svcPattern = config.scalabilityMode ? SVC_PATTERNS[config.scalabilityMode] || null : null;
-  this._svcFrameIndex = 0;
 
   this.context.state = 'configured';
   this.context.codec = this._config.codec;
@@ -841,6 +871,14 @@ VideoEncoder.prototype.configure = function (config) {
   this.context.framerate = this._config.framerate;
   this.context.frameCount = 0;
   this.context.keyframeCount = 0;
+
+  // Check Configuration Support (codecs.js): unsupported closes the
+  // encoder with a NotSupportedError — after what a run retired above
+  // still has to output.
+  if (!videoEncoderConfigSupported(config)) {
+    failUnsupported(this, domex("VideoEncoder.configure: unsupported config (codec '" + config.codec + "')", 'NotSupportedError'),
+      this._oldProcesses);
+  }
 };
 
 VideoEncoder.prototype.encode = function (frame, options) {
@@ -889,9 +927,34 @@ VideoEncoder.prototype.encode = function (frame, options) {
     throw orientErr;
   }
 
+  // Production: frame dropping when queue exceeds limit
+  if (this._maxQueueSize > 0 && this._queueSize >= this._maxQueueSize) {
+    this._stats.droppedCount++;
+    return;  // drop frame silently
+  }
+  this._queueSize++;
+
+  if (holdingCalls(this)) {
+    // Queued behind a flush() in progress (base_coder holdCalls): the
+    // frame as it is now (the caller may close it).
+    var self = this;
+    var snap = {
+      data: frame.data, format: frame.format, codedWidth: frame.codedWidth, codedHeight: frame.codedHeight,
+      visibleRect: frame.visibleRect ? { x: frame.visibleRect.x, y: frame.visibleRect.y,
+        width: frame.visibleRect.width, height: frame.visibleRect.height } : null,
+      timestamp: frame.timestamp, duration: frame.duration, rotation: frame.rotation, flip: frame.flip,
+    };
+    holdCall(this, function () { self._encodeNow(snap, options); }, true);
+    return;
+  }
+  return this._encodeNow(frame, options);
+};
+
+VideoEncoder.prototype._encodeNow = function (frame, options) {
   // Auto-detect pixel format from frame (browser compat: accept any format)
   var fmt = (frame.format || 'I420').toUpperCase();
   if (!_FORMAT_TO_FFMPEG[fmt] || !formatPlanes(fmt)) {
+    this._queueSize--;   // counted by encode(); this frame will not come out
     this._error(new Error('VideoEncoder.encode: unsupported format "' + fmt + '"'));
     return;
   }
@@ -930,6 +993,7 @@ VideoEncoder.prototype.encode = function (frame, options) {
       inW = this._inputWidth;
       inH = this._inputHeight;
     } else {
+      this._queueSize--;
       this._error(new Error(
         'VideoEncoder.encode: frame has no codedWidth/codedHeight and its ' +
         'size (' + frame.data.length + ' bytes) does not match the ' +
@@ -942,6 +1006,7 @@ VideoEncoder.prototype.encode = function (frame, options) {
 
   var codedSize = frameByteSize(fmt, inW, inH);   // chroma rounded up (core/frame_size.js)
   if (frame.data.length !== codedSize) {
+    this._queueSize--;
     this._error(new Error(
       'VideoEncoder.encode: frame data length ' + frame.data.length +
       ' is inconsistent with its own ' + inW + 'x' + inH + ' ' + fmt +
@@ -1003,12 +1068,6 @@ VideoEncoder.prototype.encode = function (frame, options) {
   if (this._stats.encodeCount === 0) this._stats.startTime = Date.now();
   this._stats.encodeCount++;
   this._stats.lastEncodeTime = Date.now();
-
-  // Production: frame dropping when queue exceeds limit
-  if (this._maxQueueSize > 0 && this._queueSize >= this._maxQueueSize) {
-    this._stats.droppedCount++;
-    return;  // drop frame silently
-  }
 
   // Browser-compat: accept per-frame quantizer options
   // { keyFrame, vp9: { quantizer }, av1: { quantizer }, avc: { quantizer }, hevc: { quantizer } }
@@ -1088,9 +1147,7 @@ VideoEncoder.prototype.encode = function (frame, options) {
 
     // Let the running FFmpeg finish what it has and drain (its outputs
     // come first); the new process's outputs wait in the transition.
-    // A mandatory keyframe (bypassThrottle: an HLS segment boundary)
-    // never evicts a draining process — see the cap in _retireFFmpeg.
-    this._retireFFmpeg(!_kfMandatory);
+    this._retireFFmpeg();
 
     // Take a pre-warmed FFmpeg from the pool if available — saves the
     // ~50-100ms spawn + ~200ms FFmpeg startup window. If the pool is
@@ -1177,12 +1234,16 @@ VideoEncoder.prototype.encode = function (frame, options) {
     this._ffmpeg._totalInputs = 0;     // monotonic counter, never decreases
   }
   // {timestamp, duration}: W3C copies the frame's duration to its chunk;
-  // the chunk's was always null.
+  // the chunk's was always null. And its orientation, for the output's
+  // decoderConfig (W3C: [[rotation]] / [[flip]] of the VideoFrame
+  // associated with output): it was [[active orientation]] read when the
+  // chunk came out, so a key frame still in a run that a configure()
+  // retired (which resets it) lost its rotation.
   this._ffmpeg._inputPtsQueue.push({ timestamp: frame.timestamp,
-    duration: (typeof frame.duration === 'number') ? frame.duration : null });
+    duration: (typeof frame.duration === 'number') ? frame.duration : null,
+    rotation: frame.rotation || 0, flip: !!frame.flip });
   this._ffmpeg._totalInputs++;
 
-  this._queueSize++;
   var ok = this._ffmpeg.write(pixels);
   this._encodeCount++;
   this.context.frameCount = this._encodeCount;
@@ -1201,7 +1262,7 @@ VideoEncoder.prototype.encode = function (frame, options) {
 // output order is input order. Used by a keyframe restart and by a
 // configure() on a running encoder. The caller puts the next process in
 // this._ffmpeg.
-VideoEncoder.prototype._retireFFmpeg = function (allowEvict) {
+VideoEncoder.prototype._retireFFmpeg = function () {
   var oldFfmpeg = this._ffmpeg;
 
   // Let old FFmpeg finish processing — DON'T stop/kill yet.
@@ -1310,44 +1371,29 @@ VideoEncoder.prototype._retireFFmpeg = function (allowEvict) {
   // Already drained (every input has come out): nothing to wait for.
   if (oldFfmpeg._outputCount >= oldFfmpeg._drainTarget) onDrainOnce();
 
-  // MP-14 BAND-AID: cap pending old processes. Without this, a
-  // PLI/FIR storm accumulates FFmpeg subprocesses unboundedly.
-  // Each is ~30-50 MB RSS + a few file descriptors. Test
-  // test_ffmpeg_restart_behavior.js measured 101 active
-  // subprocesses after 100 keyframe requests with no cap.
-  //
-  // Frames buffered in evicted FFmpegs are lost — but losing a few
-  // P-frames is far better than OOM/FD exhaustion. The proper fix
-  // (cheap keyframe-on-demand without restart) is tracked in MP-14
-  // root cause; needs FFmpeg ZMQ/sendcmd integration or libav
-  // bindings. Both are days of architectural work.
-  //
-  // Only for restarts the caller can live without (a PLI, throttled to
-  // one per second anyway). A mandatory one — an HLS segment boundary,
-  // a configure() — must not cost frames: fed faster than real time, an
-  // HLSEncoder forced a boundary every 2 s of media, i.e. many per
-  // second of wall clock, the cap killed processes still draining, and
-  // 35 of 600 frames were lost with the IDRs landing at 6.4 / 12.5 s
-  // instead of 6 / 8 / 10 s. Those processes each end their input and
-  // exit once drained, so the count stays bounded by the input rate.
-  var MAX_PENDING_RESTARTS = 4;
-  while (allowEvict && this._oldProcesses.length > MAX_PENDING_RESTARTS) {
-    var victim = this._oldProcesses.shift();
-    // Eviction = keyframe requests faster than old FFmpegs can drain;
-    // their buffered P-frames are lost to keep memory bounded.
-    this._stats.evictedProcesses++;
-    // Also remove from pending-old set (won't get its output_end now)
-    this._transitionPendingOld.delete(victim);
-    var vi = this._chain.indexOf(victim);
-    if (vi >= 0) this._chain.splice(vi, 1);
-    try { victim.stop(); } catch (e) {}
-  }
+  // No cap on the processes draining at once. There was one
+  // (MAX_PENDING_RESTARTS = 4, a band-aid against a PLI/FIR storm piling
+  // up FFmpeg processes): a fifth restart killed the oldest still
+  // draining and its buffered frames were lost with no error, the queue
+  // size dropping as if they had come out. W3C WebCodecs has no such
+  // thing — every encode() is a control message that is run, and its
+  // output comes (§6.5 encode(), "Output EncodedVideoChunks"); work that
+  // waits shows in encodeQueueSize and the dequeue events, and the
+  // caller applies backpressure. So every retired process drains: memory
+  // is bounded by what the caller queues (the frames in flight), and a
+  // storm of keyFrame requests is the restart throttle's
+  // (RESTART_COOLDOWN_MS) to absorb, not frames' to pay for.
   this._advanceChain();
 };
 
 // ── Start FFmpeg ──
 
 VideoEncoder.prototype._startFFmpeg = function () {
+  // A new run reads the frames' geometry as it is now: a resize seen
+  // while no run was going (after a flush) is not one to restart for.
+  // It stayed pending, and the frame after the new run's first restarted
+  // it again — an extra key frame.
+  this._pendingResize = false;
   var codecDef = getVideoCodec(this._config.codec, this._config);
   if (!codecDef) { this._error(new Error('Unknown codec: ' + this._config.codec)); return; }
 
@@ -1527,6 +1573,9 @@ VideoEncoder.prototype._wireReader = function (codecDef) {
     // with their producing FFmpeg so _emitEncoded can decide
     // (current/new = maybe-buffer, old = always-direct).
     var producingFfmpeg = self._ffmpeg;
+    // The SVC pattern counts this run's frames (a process object hosts
+    // the next run after a flush, and its count carried over).
+    producingFfmpeg._svcFrameIndex = 0;
 
     reader.on('video', function (f) {
       if (self._hwProbing && !gotOutput) {
@@ -1545,11 +1594,12 @@ VideoEncoder.prototype._wireReader = function (codecDef) {
       // Fallback: if the queue is empty (rare — possible if FFmpeg
       // emits more frames than were fed, e.g. duplicates), fall back
       // to reader's counter-based PTS so we don't crash.
-      var realPts, realDur = null;
+      var realPts, realDur = null, orient = self._activeOrientation;
       if (producingFfmpeg._inputPtsQueue && producingFfmpeg._inputPtsQueue.length > 0) {
         var _in = producingFfmpeg._inputPtsQueue.shift();
         realPts = _in.timestamp;
         realDur = _in.duration;
+        orient = { rotation: _in.rotation, flip: _in.flip };
       } else {
         realPts = f.ptsUs;
       }
@@ -1570,11 +1620,19 @@ VideoEncoder.prototype._wireReader = function (codecDef) {
 
       // SVC: assign temporalLayerId from pattern
       var metadata = {};
+      // The pattern follows the producing run's own frame count: its
+      // -force_key_frames expression counts n from 0 in every run, so a
+      // restart (keyFrame request, resize) starts the pattern again on
+      // its key frame. A count across runs labelled the new run's key
+      // frame with a high layer and its next frame (which references
+      // it) with a lower one, so dropping the high layers dropped a
+      // reference the kept frames need.
       if (svcPat) {
-        var tid = svcPat.tid[self._svcFrameIndex % svcPat.tid.length];
+        var svcIdx = producingFfmpeg._svcFrameIndex || 0;
+        var tid = svcPat.tid[svcIdx % svcPat.tid.length];
         metadata.svc = { temporalLayerId: tid };
         chunk.metadata = metadata;
-        self._svcFrameIndex++;
+        producingFfmpeg._svcFrameIndex = svcIdx + 1;
       }
 
       // ── decoderConfig ──────────────────────────────────────────
@@ -1600,9 +1658,9 @@ VideoEncoder.prototype._wireReader = function (codecDef) {
         if (cfg.displayHeight) outputConfig.displayAspectHeight = cfg.displayHeight;
         // Orientation travels with the config, per the algorithm's
         // assignment of the frame's [[rotation]] / [[flip]].
-        if (self._activeOrientation) {
-          if (self._activeOrientation.rotation) outputConfig.rotation = self._activeOrientation.rotation;
-          if (self._activeOrientation.flip)     outputConfig.flip = true;
+        if (orient) {
+          if (orient.rotation) outputConfig.rotation = orient.rotation;
+          if (orient.flip)     outputConfig.flip = true;
         }
         // 'avc'/'hevc' format: the parameter sets travel out of band as
         // an avcC/hvcC record. 'annexb' keeps them in-band: no description.
@@ -1645,7 +1703,20 @@ VideoEncoder.prototype._wireReader = function (codecDef) {
       self._fallbackToSoftware();
       return;
     }
-    if (thisFfmpeg !== self._ffmpeg) return;   // a process we already replaced
+    if (thisFfmpeg !== self._ffmpeg) {
+      // A process already replaced (a keyframe restart, a reconfigure)
+      // still had frames to output: its failure is the encoder's too
+      // (W3C: an encoding error closes the encoder with an
+      // EncodingError). It was ignored — a corrupt frame followed by a
+      // keyFrame request lost the frames between them with no error, and
+      // encodeQueueSize stayed up by that many forever. One this encoder
+      // stopped itself (close, reset) is not a failure.
+      if (!thisFfmpeg._stoppedByCoder) {
+        var oldErr = exitError(code, signal, thisFfmpeg);
+        if (oldErr) failCoder(self, oldErr);
+      }
+      return;
+    }
     var err = exitError(code, signal, thisFfmpeg);
     if (err) failCoder(self, err);
   });
@@ -1906,12 +1977,16 @@ VideoEncoder.isConfigSupported = function (config) {
   // WebCodecs string — 'avc1.42001f', 'vp09.00.10.08', 'av01.0.04M.08',
   // 'hvc1.1.6.L93.B0' — reported supported:false although configure()
   // accepted it (C5).
-  var supported;
-  try { supported = !!(config && getVideoCodec(normalizeCodec(config.codec), config)); }
-  catch (e) { supported = false; }
+  //
+  // W3C: an invalid config rejects with a TypeError; supported is Check
+  // Configuration Support (codecs.js) — the codec string per its
+  // registration, the profile / size / scalability mode the codec can do.
+  var c;
+  try { c = checkVideoEncoderConfig(config, 'VideoEncoder.isConfigSupported'); }
+  catch (e) { return Promise.reject(e); }
   return Promise.resolve({
-    supported: supported,
-    config: _cloneEncoderConfig(config),
+    supported: videoEncoderConfigSupported(c),
+    config: _cloneEncoderConfig(c),
   });
 };
 
@@ -1926,7 +2001,13 @@ function _cloneEncoderConfig(config) {
   if (!config) return out;
   for (var i = 0; i < _ENCODER_CONFIG_KEYS.length; i++) {
     var k = _ENCODER_CONFIG_KEYS[i];
-    if (config[k] !== undefined) out[k] = config[k];
+    if (config[k] === undefined) continue;
+    // Nested dictionaries are cloned with their own members (Clone
+    // Configuration): avc / hevc { format }.
+    if ((k === 'avc' || k === 'hevc') && config[k]) {
+      out[k] = {};
+      if (config[k].format !== undefined) out[k].format = config[k].format;
+    } else out[k] = config[k];
   }
   return out;
 }

@@ -70,9 +70,12 @@
  *                                             for TS streams.
  */
 
-import { escapeQuoted, isValidVariableName, isValidIvHex,
+import { escapeQuoted, isValidVariableName, isValidIvHex, isValidKeyFormatVersions,
          isValidEncryptionMethod, parseAttributeList,
-         parseByteRange } from './utils/playlist_utils.js';
+         parseByteRange, decimalInteger as _decimalInteger,
+         decimalFloat as _decimalFloat, decimalNumber as _decimalNumber,
+         checkUriLine as _checkUriLine,
+         parseIsoDateTime as _parseIsoDateTime } from './utils/playlist_utils.js';
 
 function Playlist(opts) {
   if (!opts) opts = {};
@@ -86,6 +89,19 @@ function Playlist(opts) {
   this._windowSize = opts.windowSize || 6;
   // TARGETDURATION is a decimal-integer (RFC 8216 §4.3.3.1), so a
   // fractional value from the caller is rounded up, never down.
+  // A target that is not a positive finite number (-2, Infinity) used to
+  // be written as it was: TARGETDURATION:-2.
+  if (opts.targetDuration && !(isFinite(opts.targetDuration) && opts.targetDuration > 0)) {
+    throw new RangeError('Playlist: opts.targetDuration must be a finite number > 0, got ' +
+                         opts.targetDuration);
+  }
+  // A decimal-integer is at most 2^64-1 (RFC 8216 §4.2): from 1e21 the
+  // target was written with an exponent (TARGETDURATION:1e+21).
+  if (opts.targetDuration && Math.ceil(opts.targetDuration) >= _TWO_64) {
+    throw new RangeError('Playlist: opts.targetDuration must be below 2^64 ' +
+                         '(TARGETDURATION is a decimal-integer, RFC 8216 §4.2), got ' +
+                         opts.targetDuration);
+  }
   this._explicitTargetDuration = opts.targetDuration ? Math.ceil(opts.targetDuration) : 0;
   this._computedTargetDuration = 0;
   // Largest EXTINF rounded to the nearest integer — the quantity
@@ -104,11 +120,20 @@ function Playlist(opts) {
   this._version = opts.version || 3;
   this._independentSegments = opts.independentSegments !== false;
   this._initSegmentUri = opts.initSegmentUri || null;
+  // EXT-X-MAP's URI is a quoted-string (checked here, at the call that
+  // passed it, as every quoted-string of this module — see addDateRange).
+  if (this._initSegmentUri) escapeQuoted(this._initSegmentUri);
   // Optional BYTERANGE on EXT-X-MAP. When the init segment is part
   // of a larger file (single-file CMAF where init + media are
   // byteranges in one .mp4), the player needs to know which bytes
   // form the init. Format: { length, offset } or null.
   this._initSegmentByterange = opts.initSegmentByterange || null;
+  // EXT-X-MAP's BYTERANGE is "<n>@<o>" with the offset REQUIRED
+  // (rfc8216bis §4.4.4.5); both decimal-integers.
+  if (this._initSegmentByterange) {
+    _decimalInteger(this._initSegmentByterange.length, 'Playlist: opts.initSegmentByterange.length');
+    _decimalInteger(this._initSegmentByterange.offset, 'Playlist: opts.initSegmentByterange.offset');
+  }
 
   this._segments = [];
   this._mediaSequence = opts.startMediaSequence || 0;
@@ -146,6 +171,24 @@ function Playlist(opts) {
   this._partTargetDuration = opts.partTargetDuration || 0;
   this._partHoldBack = opts.partHoldBack ||
                        (this._partTargetDuration > 0 ? this._partTargetDuration * 3 : 0);
+  // rfc8216bis §4.4.3.8: PART-HOLD-BACK MUST be at least twice the Part
+  // Target Duration (a hold-back of 0.5 s for 1 s parts was written as it
+  // was), and PART-TARGET / PART-HOLD-BACK are decimal-floating-points
+  // (Infinity was written as "Infinity").
+  if (this._partTargetDuration > 0) {
+    if (!isFinite(this._partTargetDuration)) {
+      throw new RangeError('Playlist: opts.partTargetDuration must be finite, got ' +
+                           this._partTargetDuration);
+    }
+    if (!(this._partHoldBack >= 2 * this._partTargetDuration) || !isFinite(this._partHoldBack)) {
+      throw new RangeError('Playlist: opts.partHoldBack must be a finite number of at least ' +
+                           'twice partTargetDuration (RFC 8216bis §4.4.3.8), got ' + this._partHoldBack);
+    }
+    // Written by toFixed, which gives an exponent from 1e21 (PART-TARGET=
+    // 1e+21): a decimal-floating-point is positional (RFC 8216 §4.2).
+    _belowE21(this._partTargetDuration, 'partTargetDuration');
+    _belowE21(this._partHoldBack, 'partHoldBack');
+  }
   this._inProgressParts = [];   // parts of the segment currently being built
   this._inProgressUri = null;   // uri of that segment (placeholder)
 
@@ -163,6 +206,21 @@ function Playlist(opts) {
   // explicitly to opt into delta updates.
   this._canSkipUntil = (typeof opts.canSkipUntil === 'number') ?
                        opts.canSkipUntil : 0;
+  // NaN made serializeDelta skip every segment (accum < NaN is false) with
+  // no SERVER-CONTROL written; Infinity was written as "Infinity".
+  if (!isFinite(this._canSkipUntil)) {
+    throw new RangeError('Playlist: opts.canSkipUntil must be a finite number, got ' +
+                         this._canSkipUntil);
+  }
+  // The Skip Boundary MUST be at least six times the Target Duration
+  // (rfc8216bis §4.4.3.8): CAN-SKIP-UNTIL=6 was written with
+  // TARGETDURATION:4. Checked against the target as written (1 before
+  // any segment when it is not given), and again in addSegment when a
+  // segment sets or raises it.
+  if (this._canSkipUntil > 0) {
+    _belowE21(this._canSkipUntil, 'canSkipUntil');
+    this._checkCanSkipUntil(this._explicitTargetDuration || 1, 'Playlist: TARGETDURATION is');
+  }
   this._canSkipDateRanges = !!opts.canSkipDateRanges;
 
   // ── EXT-X-DATERANGE state ──
@@ -229,10 +287,13 @@ function Playlist(opts) {
   // a poll round-trip. The reports are externally fed in — in
   // multi-encoder setups, the caller wires up cross-encoder updates.
   //
-  // _renditionReports: { uri → { uri, lastMsn, lastPart? } }
-  // Map keyed by URI for O(1) update on repeated reports for the
-  // same rendition.
-  this._renditionReports = {};
+  // _renditionReports: Map uri → { uri, lastMsn, lastPart? }, for O(1)
+  // update on repeated reports for the same rendition (a repeated URI
+  // keeps its place). A Map, not a plain object: a report for the URI
+  // "__proto__" set the object's prototype (and was never written), and
+  // removeRenditionReport('toString') found Object.prototype's and
+  // returned true.
+  this._renditionReports = new Map();
 }
 
 /**
@@ -248,6 +309,12 @@ function Playlist(opts) {
  * @param {string|Date} [seg.programDateTime]  ISO 8601 string or Date.
  *                                        Emitted as EXT-X-PROGRAM-DATE-TIME.
  *                                        Anchors the segment to wall clock.
+ * @param {boolean} [seg.independent]     false: the segment does not start
+ *                                        on an independent frame (a
+ *                                        SegmentBuilder cut forced by its
+ *                                        targetDuration). Refused while
+ *                                        EXT-X-INDEPENDENT-SEGMENTS is
+ *                                        declared.
  */
 Playlist.prototype.addSegment = function (seg) {
   if (this._endlist) {
@@ -255,6 +322,56 @@ Playlist.prototype.addSegment = function (seg) {
   }
   if (!seg || typeof seg.uri !== 'string' || typeof seg.duration !== 'number') {
     throw new Error('Playlist.addSegment: requires { uri:string, duration:number }');
+  }
+  // Every value checked before any state changes: the URI is a line of
+  // its own, EXTINF's duration a decimal-floating-point (a NaN first
+  // segment pinned TARGETDURATION to NaN — written as 1 — and every later
+  // duration passed the check: TARGETDURATION:1 above EXTINF:10.000), the
+  // date-time a line's value, BYTERANGE and BITRATE decimal-integers.
+  _checkUriLine(seg.uri, 'Playlist.addSegment: uri');
+  _decimalFloat(seg.duration, 'Playlist.addSegment: duration');
+  // EXT-X-INDEPENDENT-SEGMENTS applies to every segment of the playlist
+  // (rfc8216bis §4.4.2.1) and cannot be taken back: a server MUST NOT
+  // change a playlist but to append to it (§6.2.1).
+  if (seg.independent === false && this._independentSegments) {
+    throw new TypeError('Playlist.addSegment: the segment does not start on an independent ' +
+                        'frame, and the playlist declares EXT-X-INDEPENDENT-SEGMENTS ' +
+                        '(RFC 8216bis §4.4.2.1); pass opts.independentSegments: false');
+  }
+  // TARGETDURATION covers it, and a decimal-integer is at most 2^64-1
+  // (from 1e21 EXTINF and TARGETDURATION were written with an exponent).
+  if (Math.ceil(seg.duration) >= _TWO_64) {
+    throw new RangeError('Playlist.addSegment: duration must be below 2^64 s ' +
+                         '(TARGETDURATION is a decimal-integer, RFC 8216 §4.2), got ' + seg.duration);
+  }
+  var pdt = _formatProgramDateTime(seg.programDateTime);
+  if (pdt && /[\r\n]/.test(pdt)) {
+    throw new TypeError('Playlist.addSegment: programDateTime must not contain CR/LF');
+  }
+  if (seg.byterange) {
+    _decimalInteger(seg.byterange.length, 'Playlist.addSegment: byterange.length');
+    // The offset is optional: without it the range continues where the
+    // previous segment's ended (it used to be written as "@undefined").
+    if (seg.byterange.offset !== undefined && seg.byterange.offset !== null) {
+      _decimalInteger(seg.byterange.offset, 'Playlist.addSegment: byterange.offset');
+    }
+  }
+  var bitrate = typeof seg.bitrate === 'number' ? Math.round(seg.bitrate) : null;
+  if (bitrate !== null) {
+    _decimalInteger(bitrate, 'Playlist.addSegment: bitrate');
+    // EXT-X-BITRATE applies to the segments after it that have no
+    // EXT-X-BYTERANGE (rfc8216bis §4.4.4.8): it cannot describe this one.
+    if (seg.byterange) {
+      throw new TypeError('Playlist.addSegment: bitrate cannot apply to a segment with ' +
+                          'byterange (RFC 8216bis §4.4.4.8)');
+    }
+  }
+
+  // The target this segment sets (live / event) or raises (VOD) must
+  // keep CAN-SKIP-UNTIL at six times it at least.
+  if (this._canSkipUntil > 0) {
+    this._checkCanSkipUntil(this._targetDurationWith(seg.duration),
+                            'Playlist.addSegment: duration ' + seg.duration + ' s makes TARGETDURATION');
   }
 
   // Live/event without an explicit targetDuration: the first segment
@@ -277,7 +394,7 @@ Playlist.prototype.addSegment = function (seg) {
   }
   if (rounded > this._maxRoundedDuration) this._maxRoundedDuration = rounded;
   if (this._pdtAnchorMs === null) {
-    var explicitPdt = seg.programDateTime ? Date.parse(_formatProgramDateTime(seg.programDateTime)) : NaN;
+    var explicitPdt = seg.programDateTime ? Date.parse(pdt) : NaN;
     this._pdtAnchorMs = isNaN(explicitPdt) ? Date.now() - seg.duration * 1000 : explicitPdt;
   }
 
@@ -285,7 +402,7 @@ Playlist.prototype.addSegment = function (seg) {
     uri: seg.uri,
     duration: seg.duration,
     discontinuity: !!seg.discontinuity,
-    programDateTime: _formatProgramDateTime(seg.programDateTime),
+    programDateTime: pdt,
     // Optional byterange — present on I-frame playlists (always),
     // and occasionally on regular playlists when the caller stores
     // multiple segments in a single file. Format: { length, offset }
@@ -302,7 +419,7 @@ Playlist.prototype.addSegment = function (seg) {
     // than relying on the variant's overall BANDWIDTH. Most useful
     // for VBR encodes where individual segments deviate from the
     // average. Number of kilobits per second; serialized as integer.
-    bitrate: typeof seg.bitrate === 'number' ? Math.round(seg.bitrate) : null,
+    bitrate: bitrate,
     // Attach the parts that were emitted while this segment was being
     // built. _inProgressParts is reset here so the next segment starts
     // fresh. Stored as an array (possibly empty for non-LL-HLS) — the
@@ -361,6 +478,11 @@ Playlist.prototype.addSegment = function (seg) {
  * @param {number}  part.byteLength   Length of this part's bytes.
  * @param {boolean} [part.independent] True if part starts on a keyframe;
  *                                     enables byte-range seek to it.
+ * @param {boolean} [part.gap]         True for a part that is not available
+ *                                     (GAP=YES).
+ *
+ * The duration as written (5 decimals) MUST NOT be above PART-TARGET
+ * (rfc8216bis §4.4.4.9): a RangeError.
  */
 Playlist.prototype.addPart = function (part) {
   if (this._endlist) {
@@ -369,6 +491,26 @@ Playlist.prototype.addPart = function (part) {
   if (!part || typeof part.uri !== 'string' || typeof part.duration !== 'number') {
     throw new Error('Playlist: addPart requires { uri, duration, byteOffset, byteLength }');
   }
+  // EXT-X-PART-INF is REQUIRED when there is an EXT-X-PART, and
+  // PART-HOLD-BACK with it (rfc8216bis §4.4.3.7, §4.4.3.8); both come from
+  // partTargetDuration, so without it the parts were written alone.
+  if (!(this._partTargetDuration > 0)) {
+    throw new Error('Playlist.addPart: opts.partTargetDuration must be set ' +
+                    '(EXT-X-PART requires EXT-X-PART-INF, RFC 8216bis §4.4.3.7)');
+  }
+  escapeQuoted(part.uri);   // quoted-string check, see addDateRange
+  _decimalFloat(part.duration, 'Playlist.addPart: duration');
+  // Compared as written: both with 5 decimals.
+  if (Number(part.duration.toFixed(5)) > Number(this._partTargetDuration.toFixed(5))) {
+    throw new RangeError('Playlist.addPart: duration ' + part.duration.toFixed(5) +
+                         ' is above PART-TARGET ' + this._partTargetDuration.toFixed(5) +
+                         ' (RFC 8216bis §4.4.4.9)');
+  }
+  // decimal-integers: `| 0` made 2^31 and above negative.
+  var byteOffset = (part.byteOffset === undefined || part.byteOffset === null) ? 0 :
+                   _decimalInteger(part.byteOffset, 'Playlist.addPart: byteOffset');
+  var byteLength = (part.byteLength === undefined || part.byteLength === null) ? 0 :
+                   _decimalInteger(part.byteLength, 'Playlist.addPart: byteLength');
   // Sanity-check uri continuity within an in-progress segment. All
   // parts of a single segment must share the same URI (they're byte
   // ranges of the same file).
@@ -381,9 +523,10 @@ Playlist.prototype.addPart = function (part) {
   this._inProgressParts.push({
     uri: part.uri,
     duration: part.duration,
-    byteOffset: part.byteOffset | 0,
-    byteLength: part.byteLength | 0,
+    byteOffset: byteOffset,
+    byteLength: byteLength,
     independent: !!part.independent,
+    gap: !!part.gap,
   });
 };
 
@@ -450,8 +593,12 @@ Playlist.prototype.addDateRange = function (opts) {
     classAttr:       opts.classAttr || null,
     startDate:       _formatProgramDateTime(opts.startDate),
     endDate:         _formatProgramDateTime(opts.endDate),
-    duration:        typeof opts.duration === 'number' ? opts.duration : null,
-    plannedDuration: typeof opts.plannedDuration === 'number' ? opts.plannedDuration : null,
+    // DURATION and PLANNED-DURATION MUST NOT be negative (RFC 8216
+    // §4.3.2.7.1); NaN / Infinity are no decimal-floating-point either.
+    duration:        typeof opts.duration === 'number' ?
+                     _decimalFloat(opts.duration, 'Playlist.addDateRange: duration') : null,
+    plannedDuration: typeof opts.plannedDuration === 'number' ?
+                     _decimalFloat(opts.plannedDuration, 'Playlist.addDateRange: plannedDuration') : null,
     scte35Out:       _normalizeHexValue(opts.scte35Out),
     scte35In:        _normalizeHexValue(opts.scte35In),
     scte35Cmd:       _normalizeHexValue(opts.scte35Cmd),
@@ -464,6 +611,40 @@ Playlist.prototype.addDateRange = function (opts) {
     cue:             _normalizeCue(opts.cue),
     custom:          opts.custom || null,
   };
+  // END-ON-NEXT=YES: the range ends where the next of its CLASS starts,
+  // so it MUST have a CLASS and MUST NOT have DURATION or END-DATE
+  // (rfc8216bis §4.4.5.1). Both were written as given.
+  // START-DATE / END-DATE are ISO 8601 date-times, END-DATE not before
+  // START-DATE, and with a DURATION too it MUST be START-DATE + DURATION
+  // (rfc8216bis §4.4.5.1). Any string was written ('not a date', an
+  // END-DATE an hour before the START-DATE).
+  var start = _dateRangeDate(entry.startDate, 'startDate');
+  if (entry.endDate) {
+    var endAt = _dateRangeDate(entry.endDate, 'endDate');
+    var span = (endAt.sec - start.sec) + (endAt.frac - start.frac);
+    if (endAt.sec < start.sec || (endAt.sec === start.sec && endAt.frac < start.frac)) {
+      throw new RangeError('Playlist.addDateRange: endDate ' + JSON.stringify(entry.endDate) +
+                           ' is before startDate ' + JSON.stringify(entry.startDate) +
+                           ' (RFC 8216bis §4.4.5.1)');
+    }
+    // Within a millisecond: the dates SHOULD carry milliseconds, so each
+    // may be half of one off the exact time.
+    if (entry.duration !== null && Math.abs(span - entry.duration) > 0.001) {
+      throw new RangeError('Playlist.addDateRange: endDate is ' + span + ' s after startDate, ' +
+                           'but duration is ' + entry.duration + ' s; with both, END-DATE ' +
+                           'must be START-DATE + DURATION (RFC 8216bis §4.4.5.1)');
+    }
+  }
+  if (entry.endOnNext) {
+    if (!entry.classAttr) {
+      throw new TypeError('Playlist.addDateRange: endOnNext requires classAttr ' +
+                          '(RFC 8216bis §4.4.5.1)');
+    }
+    if (entry.duration !== null || entry.endDate) {
+      throw new TypeError('Playlist.addDateRange: endOnNext excludes duration and endDate ' +
+                          '(RFC 8216bis §4.4.5.1)');
+    }
+  }
   // Render once now so a value that can't be a quoted-string (a '"' or
   // CR/LF — escapeQuoted throws) fails here, at the call that added it,
   // instead of inside every later serialize() of a running stream.
@@ -701,6 +882,15 @@ Playlist.prototype.define = function (def) {
     entry = { kind: 'queryparam', name: def.queryparam };
   }
 
+  // rfc8216bis §4.4.2.3: no two EXT-X-DEFINE tags of a playlist may
+  // declare the same Variable Name (a parser MUST fail on it), whatever
+  // their forms.
+  for (var di = 0; di < this._defines.length; di++) {
+    if (this._defines[di].name === entry.name) {
+      throw new TypeError('Playlist.define: variable "' + entry.name +
+                          '" is already defined (RFC 8216bis §4.4.2.3)');
+    }
+  }
   _serializeDefine(entry);   // quoted-string check, see addDateRange
   this._defines.push(entry);
   return this;
@@ -779,6 +969,13 @@ Playlist.prototype.setKey = function (opts) {
   if (opts.iv !== undefined && !isValidIvHex(String(opts.iv))) {
     throw new TypeError('Playlist.setKey: opts.iv must be 0x followed by 32 hex digits');
   }
+  // KEYFORMATVERSIONS: one or more positive integers separated by "/"
+  // (rfc8216bis §4.4.4.4); any string was written.
+  if (opts.keyFormatVersions !== undefined && !isValidKeyFormatVersions(String(opts.keyFormatVersions))) {
+    throw new TypeError('Playlist.setKey: opts.keyFormatVersions must be positive integers ' +
+                        'separated by "/" (RFC 8216bis §4.4.4.4), got ' +
+                        JSON.stringify(String(opts.keyFormatVersions)));
+  }
 
   var key = {
     method:            m,
@@ -805,6 +1002,7 @@ Playlist.prototype.setKey = function (opts) {
  * @param {string|null} uri  URI of the next segment, or null to clear.
  */
 Playlist.prototype.setNextSegmentUri = function (uri) {
+  if (uri) escapeQuoted(uri);   // PRELOAD-HINT's URI is a quoted-string
   this._nextSegmentUri = uri || null;
 };
 
@@ -842,11 +1040,14 @@ Playlist.prototype.setRenditionReport = function (opts) {
     throw new TypeError('Playlist.setRenditionReport: opts.lastMsn (number) required');
   }
   escapeQuoted(opts.uri);   // quoted-string check, see addDateRange
-  this._renditionReports[opts.uri] = {
+  // LAST-MSN / LAST-PART are decimal-integers: `| 0` wrote an MSN of
+  // 3e9 as LAST-MSN=-1294967296.
+  this._renditionReports.set(opts.uri, {
     uri:      opts.uri,
-    lastMsn:  opts.lastMsn | 0,
-    lastPart: typeof opts.lastPart === 'number' ? (opts.lastPart | 0) : null,
-  };
+    lastMsn:  _decimalInteger(opts.lastMsn, 'Playlist.setRenditionReport: lastMsn'),
+    lastPart: typeof opts.lastPart === 'number' ?
+              _decimalInteger(opts.lastPart, 'Playlist.setRenditionReport: lastPart') : null,
+  });
   return this;
 };
 
@@ -858,11 +1059,7 @@ Playlist.prototype.setRenditionReport = function (opts) {
  * @returns {boolean}   true if removed, false if no report existed.
  */
 Playlist.prototype.removeRenditionReport = function (uri) {
-  if (this._renditionReports[uri]) {
-    delete this._renditionReports[uri];
-    return true;
-  }
-  return false;
+  return this._renditionReports.delete(uri);
 };
 
 /**
@@ -905,6 +1102,11 @@ Playlist.prototype.serializeDelta = function () {
     // Delta updates not enabled, or nothing to skip — full playlist.
     return this.serialize();
   }
+  // A server MUST ignore _HLS_skip on a playlist with EXT-X-ENDLIST
+  // (rfc8216bis §6.2.5.1): an ended (or VOD) playlist is served whole.
+  if (this._endlist || this._mode === 'vod') {
+    return this.serialize();
+  }
 
   // Decide how many segments to retain at the tail. The kept tail
   // must cover at least CAN-SKIP-UNTIL seconds of duration. Walk
@@ -942,11 +1144,13 @@ Playlist.prototype._requiredVersion = function (skipCount) {
   }
   // 4: EXT-X-BYTERANGE, EXT-X-I-FRAMES-ONLY.
   if (hasByterange || this._iFramesOnly) v = Math.max(v, 4);
-  // 5: KEYFORMAT / KEYFORMATVERSIONS on EXT-X-KEY.
+  // 5: METHOD=SAMPLE-AES, KEYFORMAT / KEYFORMATVERSIONS on EXT-X-KEY
+  // (SAMPLE-AES was left at 3).
   for (var k = 0; k < keys.length; k++) {
     var key = keys[k];
     if (key && key.method !== 'NONE' &&
-        (key.keyFormat !== undefined || key.keyFormatVersions !== undefined)) {
+        (key.method === 'SAMPLE-AES' ||
+         key.keyFormat !== undefined || key.keyFormatVersions !== undefined)) {
       v = Math.max(v, 5);
     }
   }
@@ -1012,7 +1216,7 @@ Playlist.prototype._render = function (skipCount) {
   // NOT appear more than once — we enforce single value via setStart's
   // replace-not-append semantics.
   if (this._start) {
-    var startAttrs = 'TIME-OFFSET=' + this._start.timeOffset;
+    var startAttrs = 'TIME-OFFSET=' + _decimalNumber(this._start.timeOffset);
     if (this._start.precise) startAttrs += ',PRECISE=YES';
     lines.push('#EXT-X-START:' + startAttrs);
   }
@@ -1061,9 +1265,11 @@ Playlist.prototype._render = function (skipCount) {
       }
     }
     lines.push(sc + scAttrs.join(','));
+    // With the parts' own precision: at 3 decimals a target of 0.2334 s
+    // was written 0.233, below its parts' DURATION=0.23340 (§4.4.4.9).
     if (this._partTargetDuration > 0) {
       lines.push('#EXT-X-PART-INF:PART-TARGET=' +
-                 this._partTargetDuration.toFixed(3));
+                 this._partTargetDuration.toFixed(5));
     }
   }
 
@@ -1146,8 +1352,9 @@ Playlist.prototype._render = function (skipCount) {
     }
     if (s.discontinuity) {
       lines.push('#EXT-X-DISCONTINUITY');
-      // Per spec, EXT-X-BITRATE's effect ends at a discontinuity. Reset
-      // tracker so the next segment re-emits its bitrate explicitly.
+      // The next segment writes its bitrate again. (rfc8216bis-19 keeps
+      // EXT-X-BITRATE in effect across a discontinuity; earlier drafts
+      // ended it there. Repeating the tag is right under both.)
       lastBitrate = null;
     }
     if (s.programDateTime) {
@@ -1179,7 +1386,9 @@ Playlist.prototype._render = function (skipCount) {
     // entry points at a keyframe byte range within a parent media
     // file) and occasionally for byterange-packed media playlists.
     if (s.byterange) {
-      lines.push('#EXT-X-BYTERANGE:' + s.byterange.length + '@' + s.byterange.offset);
+      var hasOffset = s.byterange.offset !== undefined && s.byterange.offset !== null;
+      lines.push('#EXT-X-BYTERANGE:' + s.byterange.length +
+                 (hasOffset ? '@' + s.byterange.offset : ''));
     }
     // EXT-X-GAP applies to the URI on the very next line, so it must
     // come AFTER EXTINF/BYTERANGE and immediately before the URI.
@@ -1226,7 +1435,9 @@ Playlist.prototype._render = function (skipCount) {
       hintUri = this._nextSegmentUri;
       hintOffset = 0;
     }
-    if (hintUri && !this._endlist) {
+    // Not with EXT-X-ENDLIST (rfc8216bis §4.4.5.3), which a VOD playlist
+    // always has.
+    if (hintUri && !this._endlist && this._mode !== 'vod') {
       lines.push('#EXT-X-PRELOAD-HINT:TYPE=PART,URI="' + hintUri +
                  '",BYTERANGE-START=' + hintOffset);
     }
@@ -1236,9 +1447,9 @@ Playlist.prototype._render = function (skipCount) {
   // near the playlist tail (before ENDLIST). Each report tells a
   // player following THIS playlist about the live edge of OTHER
   // renditions, enabling sub-second rendition switches.
-  var reportUris = Object.keys(this._renditionReports);
-  for (var rri = 0; rri < reportUris.length; rri++) {
-    var rep = this._renditionReports[reportUris[rri]];
+  var reports = Array.from(this._renditionReports.values());
+  for (var rri = 0; rri < reports.length; rri++) {
+    var rep = reports[rri];
     var attrs = 'URI="' + escapeQuoted(rep.uri) + '"' +
                 ',LAST-MSN=' + rep.lastMsn;
     if (rep.lastPart !== null) {
@@ -1277,6 +1488,57 @@ Playlist.prototype.isEnded = function () {
 
 // ── Internal helpers ──────────────────────────────────────
 
+// 2^64: a decimal-integer is below it (RFC 8216 §4.2).
+var _TWO_64 = 18446744073709551616;
+
+// A decimal-floating-point the writer formats with toFixed, which uses an
+// exponent from 1e21.
+function _belowE21(v, what) {
+  if (v >= 1e21) {
+    throw new RangeError('Playlist: opts.' + what + ' must be below 1e21 (a ' +
+                         'decimal-floating-point is positional, RFC 8216 §4.2), got ' + v);
+  }
+}
+
+// START-DATE / END-DATE as an instant (see parseIsoDateTime), or a
+// TypeError naming the option.
+function _dateRangeDate(value, what) {
+  var at = _parseIsoDateTime(value);
+  if (!at) {
+    throw new TypeError('Playlist.addDateRange: ' + what + ' ' + JSON.stringify(value) +
+                        ' is not an ISO 8601 date-time (RFC 8216bis §4.4.5.1)');
+  }
+  return at;
+}
+
+/**
+ * CAN-SKIP-UNTIL against a target duration: at least six times it
+ * (rfc8216bis §4.4.3.8).
+ */
+Playlist.prototype._checkCanSkipUntil = function (target, what) {
+  if (this._canSkipUntil < 6 * target) {
+    throw new RangeError(what + ' ' + target + ', and opts.canSkipUntil ' + this._canSkipUntil +
+                         ' is below six times it (RFC 8216bis §4.4.3.8)');
+  }
+};
+
+/**
+ * TARGETDURATION as written once a segment of this duration is added
+ * (_currentTargetDuration with it).
+ */
+Playlist.prototype._targetDurationWith = function (duration) {
+  var td;
+  if (this._explicitTargetDuration) {
+    td = this._explicitTargetDuration;
+    if (this._mode === 'vod') td = Math.max(td, this._maxRoundedDuration, Math.round(duration));
+  } else if (this._mode === 'vod') {
+    td = Math.max(this._computedTargetDuration, Math.ceil(duration));
+  } else {
+    td = this._pinnedTargetDuration || Math.max(1, Math.ceil(duration));
+  }
+  return td || 1;
+};
+
 // A key object as written: null for clear (no key, or METHOD=NONE).
 function _effectiveKey(k) {
   return (k && k.method !== 'NONE') ? k : null;
@@ -1304,6 +1566,9 @@ function _serializePart(p) {
   if (p.independent) {
     attrs += ',INDEPENDENT=YES';
   }
+  if (p.gap) {
+    attrs += ',GAP=YES';
+  }
   return '#EXT-X-PART:' + attrs;
 }
 
@@ -1322,7 +1587,14 @@ function _serializePart(p) {
  */
 function _normalizeHexValue(v) {
   if (v === null || v === undefined) return null;
+  // A hexadecimal-sequence has at least one digit, and only [0-9A-F]
+  // after the prefix: a string was passed through as it was ('zz,Q'
+  // wrote SCTE35-OUT=0xZZ,Q, a second attribute), an empty Uint8Array
+  // gave a bare '0x'.
   if (v instanceof Uint8Array) {
+    if (v.length === 0) {
+      throw new TypeError('Playlist: SCTE-35/hex value must not be empty');
+    }
     var s = '0x';
     for (var i = 0; i < v.length; i++) {
       var b = v[i].toString(16).toUpperCase();
@@ -1333,6 +1605,10 @@ function _normalizeHexValue(v) {
   }
   if (typeof v === 'string') {
     var trimmed = v.replace(/^0x/i, '').toUpperCase();
+    if (!/^[0-9A-F]+$/.test(trimmed)) {
+      throw new TypeError('Playlist: SCTE-35/hex value ' + JSON.stringify(v) +
+                          ' is not a hexadecimal-sequence (RFC 8216 §4.2)');
+    }
     return '0x' + trimmed;
   }
   throw new TypeError('Playlist: SCTE-35/hex value must be Uint8Array or string');
@@ -1350,16 +1626,18 @@ function _serializeDateRange(d) {
   if (d.classAttr) {
     attrs += ',CLASS="' + escapeQuoted(d.classAttr) + '"';
   }
-  attrs += ',START-DATE="' + d.startDate + '"';
+  // START-DATE / END-DATE are quoted-strings too (they were written
+  // unchecked: START-DATE="2024"" from a '"').
+  attrs += ',START-DATE="' + escapeQuoted(d.startDate) + '"';
   // CUE is positioned right after START-DATE per Apple's
   // documented examples — gives PRE/POST hints early in the line
   // for parsers that scan attribute-by-attribute.
   if (d.cue) {
     attrs += ',CUE="' + d.cue + '"';
   }
-  if (d.endDate)         attrs += ',END-DATE="' + d.endDate + '"';
-  if (d.duration !== null)        attrs += ',DURATION=' + d.duration;
-  if (d.plannedDuration !== null) attrs += ',PLANNED-DURATION=' + d.plannedDuration;
+  if (d.endDate)         attrs += ',END-DATE="' + escapeQuoted(d.endDate) + '"';
+  if (d.duration !== null)        attrs += ',DURATION=' + _decimalNumber(d.duration);
+  if (d.plannedDuration !== null) attrs += ',PLANNED-DURATION=' + _decimalNumber(d.plannedDuration);
   if (d.scte35Cmd) attrs += ',SCTE35-CMD=' + d.scte35Cmd;
   if (d.scte35Out) attrs += ',SCTE35-OUT=' + d.scte35Out;
   if (d.scte35In)  attrs += ',SCTE35-IN='  + d.scte35In;
@@ -1375,11 +1653,22 @@ function _serializeDateRange(d) {
         // hostile mid-stream error for what's usually a typo.
         continue;
       }
+      // An X- name is still an AttributeName: [A-Z0-9-] only (RFC 8216
+      // §4.2; 'X-a b' or 'X-A=1,B' broke the attribute list).
+      if (!/^X-[A-Z0-9-]+$/.test(key)) {
+        throw new TypeError('Playlist.addDateRange: custom attribute name "' + key +
+                            '" must match X-[A-Z0-9-]+ (RFC 8216 §4.2 AttributeName)');
+      }
       var val = d.custom[key];
       if (val instanceof Uint8Array) {
         attrs += ',' + key + '=' + _normalizeHexValue(val);
       } else if (typeof val === 'number') {
-        attrs += ',' + key + '=' + val;
+        // signed-decimal-floating-point: NaN / Infinity were written as such.
+        if (!isFinite(val)) {
+          throw new RangeError('Playlist.addDateRange: custom attribute ' + key +
+                               ' must be a finite number, got ' + val);
+        }
+        attrs += ',' + key + '=' + _decimalNumber(val);
       } else {
         attrs += ',' + key + '="' + escapeQuoted(String(val)) + '"';
       }
@@ -1396,7 +1685,7 @@ function _serializeDateRange(d) {
 function _serializeDefine(entry) {
   if (entry.kind === 'literal') {
     return '#EXT-X-DEFINE:NAME="' + escapeQuoted(entry.name) +
-           '",VALUE="' + escapeQuoted(entry.value) + '"';
+           '",VALUE="' + escapeQuoted(entry.value, true) + '"';
   }
   if (entry.kind === 'import') {
     return '#EXT-X-DEFINE:IMPORT="' + escapeQuoted(entry.name) + '"';
@@ -1446,6 +1735,11 @@ function _normalizeCue(cue) {
                           '" must be PRE, POST, or ONCE');
     }
     arr[i] = token;
+  }
+  // rfc8216bis §4.4.5.1: a CUE MUST NOT include both PRE and POST.
+  if (arr.indexOf('PRE') >= 0 && arr.indexOf('POST') >= 0) {
+    throw new TypeError('Playlist.addDateRange: cue must not include both PRE and POST ' +
+                        '(RFC 8216bis §4.4.5.1)');
   }
   return arr.join(',');
 }
@@ -1512,6 +1806,11 @@ export function parseMediaPlaylist(text) {
   var currentMap = null;     // EXT-X-MAP applies to all following segments
   var currentKey = null;     // EXT-X-KEY applies to all following segments
   var byteCursor = 0;        // running offset for BYTERANGE without '@offset'
+  // EXT-X-BITRATE applies to every following segment up to the next one,
+  // except segments with an EXT-X-BYTERANGE (rfc8216bis §4.4.4.8). It was
+  // put on the next segment only, so a run the writer gave one tag (it
+  // writes it when the rate changes) read back as 500, null, null.
+  var currentBitrate = null;
 
   function fresh() {
     return {
@@ -1532,6 +1831,7 @@ export function parseMediaPlaylist(text) {
       seg.uri = line;
       if (!seg.map && currentMap) seg.map = currentMap;
       if (!seg.key && currentKey) seg.key = currentKey;
+      seg.bitrate = seg.byterange ? null : currentBitrate;
       pl.segments.push(seg);
       pending = null;
       continue;
@@ -1554,7 +1854,7 @@ export function parseMediaPlaylist(text) {
     } else if (line === '#EXT-X-GAP') {
       need().gap = true;
     } else if (line.indexOf('#EXT-X-BITRATE:') === 0) {
-      need().bitrate = parseInt(line.slice(15), 10);
+      currentBitrate = parseInt(line.slice(15), 10);
     } else if (line.indexOf('#EXT-X-MAP:') === 0) {
       var ma = parseAttributeList(line.slice(11));
       currentMap = {
@@ -1569,6 +1869,8 @@ export function parseMediaPlaylist(text) {
         uri: ka.URI || null,
         iv: ka.IV || null,
         keyFormat: ka.KEYFORMAT || null,
+        // It was not read (an EXT-X-KEY written with it came back without).
+        keyFormatVersions: ka.KEYFORMATVERSIONS || null,
       };
     } else if (line.indexOf('#EXT-X-VERSION:') === 0) {
       pl.version = parseInt(line.slice(15), 10);
