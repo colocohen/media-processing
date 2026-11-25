@@ -65,7 +65,7 @@ import FileWindow from './core/file_window.js';
 import { toAscii, concat } from './core/bytes.js';
 import { codecStringFromAvcC, codecStringFromHvcC } from './utils/nalu_utils.js';
 import { parseAudioSpecificConfig } from './utils/aac_utils.js';
-import { codecStringFromAv1C, buildCodecString } from './utils/codec_strings.js';
+import { codecStringFromAv1C, buildCodecString, vp9Level } from './utils/codec_strings.js';
 import { colorSpaceFromCicp } from './video_color_space.js';
 
 var HEAD = 12;                     // the longest element header: 4-byte ID + 8-byte size
@@ -789,9 +789,10 @@ function _vp9FromFrame(t, f) {
   if (profile >= 2) depth = b() ? 12 : 10;
   var level = t.vp9 && t.vp9.level != null ? t.vp9.level : 10;
   if (!(t.vp9 && t.vp9.level != null)) {
-    // not in the frame (nor the CodecPrivate): a safe level for the size
-    var px = (t.codedWidth || 0) * (t.codedHeight || 0);
-    if (px > 1920 * 1080) level = 51; else if (px > 1280 * 720) level = 41; else if (px > 640 * 360) level = 31; else if (px) level = 21;
+    // not in the frame (nor the CodecPrivate): the VP9 level table's for
+    // the size and the DefaultDuration's rate (codec_strings' vp9Level —
+    // it was guessed from the size alone by steps of its own: 8K got 5.1)
+    level = vp9Level(t.codedWidth, t.codedHeight, t.defaultDurationUs ? 1e6 / t.defaultDurationUs : 0);
   }
   t.codec = _vp9String(profile, level, depth);
 }

@@ -29,8 +29,10 @@ ADTSReader.prototype.feed = function (chunk) {
   while (true) {
     var hdr = this._q.peek(7);
     if (!hdr) return;
-    // Sync word check: 0xFFF
-    if (hdr[0] !== 0xFF || (hdr[1] & 0xF0) !== 0xF0) {
+    // Sync word 0xFFF and layer '00' (ISO/IEC 14496-3 §1.A.2.2.1). The
+    // layer was not checked: an MP3 stream (FF FB: MPEG-1 layer III)
+    // came out as ADTS frames — 7 of them from a 1 s libmp3lame file.
+    if (hdr[0] !== 0xFF || (hdr[1] & 0xF6) !== 0xF0) {
       this._q.discard(1);
       continue;
     }

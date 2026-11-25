@@ -31,10 +31,16 @@ IVFReader.prototype.feed = function (chunk) {
   var avail = this._end - this._start;
 
   if (!this._gotHeader) {
-    if (avail < 32) return;
+    if (avail < 4) return;
     var b = this._buf;
     var s = this._start;
-    if (b[s] !== 0x44 || b[s+1] !== 0x4B || b[s+2] !== 0x49 || b[s+3] !== 0x46) return; // 'DKIF'
+    // Not 'DKIF': not an IVF stream (as reader_flv). It used to return
+    // and wait for more bytes — forever, silently: an encoder whose
+    // FFmpeg wrote another container gave no frame and no error.
+    if (b[s] !== 0x44 || b[s+1] !== 0x4B || b[s+2] !== 0x49 || b[s+3] !== 0x46) {
+      throw new Error('IVFReader: not an IVF stream');
+    }
+    if (avail < 32) return;
     // The header says its own length (bytes 6-7). It is 32 in every file
     // written today, but a longer one was read as frames from byte 32 on.
     var hdrLen = readU16LE(b, s + 6);
@@ -70,7 +76,6 @@ IVFReader.prototype.feed = function (chunk) {
     var frameSize = readU32LE(b2, s2);
     var tsLo = readU32LE(b2, s2 + 4);
     var tsHi = readU32LE(b2, s2 + 8);
-    var ts = tsHi * 0x100000000 + tsLo;
 
     if (avail < 12 + frameSize) break;
 
@@ -78,11 +83,7 @@ IVFReader.prototype.feed = function (chunk) {
     var payload = this._buf.slice(this._start, this._start + frameSize);
     this._start += frameSize;
 
-    // PTS in microseconds. Use Math.floor (NOT `| 0`): the bitwise
-    // operator coerces to a 32-bit signed int, which overflows after
-    // ~35 minutes (2^31 µs). Math.floor stays in JS Number's 53-bit
-    // safe range — at 48 kHz that's >280 years before precision loss.
-    var ptsUs = Math.floor(ts * 1000000 * this._timebaseNum / this._timebaseDen);
+    var ptsUs = _ptsUs(tsHi, tsLo, this._timebaseNum, this._timebaseDen);
     var isKey = false;
     if (this._fourcc === 'VP80') isKey = _keyVP8(payload);
     else if (this._fourcc === 'VP90') isKey = _keyVP9(payload);
@@ -113,6 +114,19 @@ IVFReader.prototype._append = function (chunk) {
   this._buf.set(chunk, this._end);
   this._end += chunk.length;
 };
+
+// The frame's time in µs: ts × num / den seconds, to the NEAREST µs (half
+// up), as FFmpeg's av_rescale_q (AV_ROUND_NEAR_INF) — ffprobe's pts_time.
+// It was floored: frame 1 of a 1001/30000 stream at 33366 µs, ffprobe
+// 0.033367 s. Exact integers (BigInt): the product of a 64-bit timestamp,
+// 10^6 and the numerator is past 2^53 (a Number lost the low digits). A
+// 0 denominator (no time base) keeps the Number division (Infinity / NaN).
+// (Math.floor, not `| 0`, before: the bitwise form overflowed at 2^31 µs.)
+function _ptsUs(tsHi, tsLo, num, den) {
+  if (!den) return Math.round((tsHi * 0x100000000 + tsLo) * 1000000 * num / den);
+  var d = BigInt(den);
+  return Number(((BigInt(tsHi) << 32n | BigInt(tsLo)) * 1000000n * BigInt(num) + d / 2n) / d);
+}
 
 // ── Keyframe detection ──
 

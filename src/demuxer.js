@@ -20,15 +20,34 @@
  * 'pcm-u8' blocks of whole samples.
  *
  * How the packets are read:
- *  - MP4 / MOV / WebM / MKV files with codecs those readers know: read
- *    directly by FileDemuxer (reader_mp4 / reader_webm), off the disk.
+ *  - Read directly by FileDemuxer, off the disk, when the container and
+ *    the codecs are ones its readers know: MP4 / MOV and WebM / MKV
+ *    (reader_mp4 / reader_webm), MPEG-TS (H.264 / H.265 / AAC), FLV
+ *    (H.264 / H.265 / AV1 / VP9, AAC / MP3), ADTS AAC, Ogg Opus, IVF
+ *    (VP8 / VP9 / AV1), raw Annex-B H.264 / H.265 (opts.fps, default 25),
+ *    MP3, FLAC and WAV (PCM, float, A-law / µ-law) — see file_demuxer.js.
  *  - Anything else: FFmpeg copies the streams (-c copy -copyts) into a
  *    container that keeps every packet's timestamp and keyframe flag, on
- *    stdout. H.264 / H.265 / AAC (MPEG-TS, FLV, ADTS, …): MPEG-TS, read by
- *    reader_ts (90 kHz times, as the source has them). The rest (Ogg, MP3,
- *    FLAC, WAV, …): Matroska, read by reader_webm, which also carries the
- *    codec headers (Matroska times are in ms). PCM that WebCodecs has no
- *    name for (big-endian, 64-bit float, A-law, …) is converted.
+ *    stdout. H.264 / H.265 / AAC: MPEG-TS, read by reader_ts (90 kHz
+ *    times, as the source has them). The rest (Ogg Vorbis / FLAC, …):
+ *    Matroska, read by reader_webm, which also carries the codec headers
+ *    (Matroska times are in ms). PCM that WebCodecs has no name for
+ *    (big-endian, 64-bit float, …) is converted.
+ *
+ * The formats read natively since FileDemuxer reads them, against what
+ * the FFmpeg path gave for them (each a fault of that path, or nothing
+ * a decoder sees): times to the µs where Matroska rounded them to the ms
+ * (Ogg, MP3, FLAC, WAV, IVF: 26122 µs MP3 frames came out as 26000 /
+ * 27000; ADTS / FLV audio through TS: 90 kHz rounding, and FLV audio was
+ * re-timed by sample count where the file says 57, 80, 103 ms); the last
+ * Opus packet keeps its trimmed duration (was none), the first its 20 ms
+ * (was 21); TS / FLV video chunks have a duration (the frame interval;
+ * was none); an FLV's AAC
+ * description is the file's AudioSpecificConfig (was rebuilt from ADTS:
+ * 2 bytes, no SBR signalling); WAV A-law / µ-law go out as 'alaw' /
+ * 'ulaw' (were converted to 'pcm-s16'), as from MP4; IVF VP9 / AV1 have
+ * no colorSpace of nulls; raw H.264 / H.265 is read at all (FFmpeg can't
+ * mux it without timestamps: it failed).
  *
  * Before, video went out as raw Annex-B / IVF and audio as ADTS / Ogg /
  * a WAV byte stream, and the readers numbered frames in arrival order:
@@ -78,6 +97,21 @@ var NATIVE_AUDIO_MP4 = { aac: 1, opus: 1, mp3: 1, flac: 1, pcm_mulaw: 1, pcm_ala
 // 'twos' 16-bit big-endian (swapped here), 'raw ' unsigned 8-bit. Others
 // (ipcm, in24, lpcm, 8-bit 'twos', …) go through FFmpeg.
 var NATIVE_PCM_MP4 = { sowt: 'pcm_s16le', twos: 'pcm_s16be', 'raw ': 'pcm_u8' };
+// The other containers FileDemuxer reads (ffprobe's format name → the
+// codecs read natively).
+var H26X = { h264: 1, h265: 1 };
+var NATIVE_STREAM = {
+  mpegts: { video: H26X, audio: { aac: 1 } },
+  flv:    { video: { h264: 1, h265: 1, av1: 1, vp9: 1 }, audio: { aac: 1, mp3: 1 } },
+  aac:    { audio: { aac: 1 } },
+  ogg:    { audio: { opus: 1 } },
+  ivf:    { video: { vp8: 1, vp9: 1, av1: 1 } },
+  h264:   { video: { h264: 1 } },
+  hevc:   { video: { h265: 1 } },
+  mp3:    { audio: { mp3: 1 } },
+  flac:   { audio: { flac: 1 } },
+  wav:    { audio: { pcm_s16le: 1, pcm_u8: 1, pcm_s24le: 1, pcm_s32le: 1, pcm_f32le: 1, pcm_alaw: 1, pcm_mulaw: 1 } },
+};
 // Matroska can carry these as is; WebCodecs names them (see header).
 var PCM_COPY = { pcm_s16le: 'pcm-s16', pcm_s24le: 'pcm-s24', pcm_s32le: 'pcm-s32', pcm_f32le: 'pcm-f32', pcm_u8: 'pcm-u8' };
 
@@ -319,7 +353,7 @@ Demuxer.prototype._startNative = function (run, info) {
     this._ee.emit('error', e);
     return;
   }
-  var r = new FileDemuxer({ size: size });
+  var r = new FileDemuxer({ size: size, fps: this._opts.fps });
   var pos = 0, need = null, closed = false, readerEnded = false;
   function closeFile() {
     if (closed) return;
@@ -641,14 +675,24 @@ function _normalizeCodecName(name) {
 function _nativeReadable(info) {
   var f = info.format || '';
   var mp4 = /(^|,)(mov|mp4)(,|$)/.test(f), mkv = /(^|,)(matroska|webm)(,|$)/.test(f);
-  if (!mp4 && !mkv) return false;
   var v = info.video && NATIVE_VIDEO[info.video.codec], a = info.audio && _audioReadable(info.audio.codec);
   if (!v && !a) return false;
-  if (a) {
-    var c = info.audio.codec;
-    if (mkv && !NATIVE_AUDIO_MKV[c]) return false;
-    if (mp4 && !NATIVE_AUDIO_MP4[c] && NATIVE_PCM_MP4[info.audio.tag] !== c) return false;
+  if (mp4 || mkv) {
+    if (a) {
+      var c = info.audio.codec;
+      if (mkv && !NATIVE_AUDIO_MKV[c]) return false;
+      if (mp4 && !NATIVE_AUDIO_MP4[c] && NATIVE_PCM_MP4[info.audio.tag] !== c) return false;
+    }
+    return true;
   }
+  // The stream containers: the codecs their readers turn into WebCodecs
+  // chunks (another stream there — MPEG-2 video, AC-3, Vorbis in Ogg, … —
+  // makes FFmpeg read the file; one in a codec WebCodecs has no name for
+  // isn't read either way).
+  var name = f.split(',')[0], kinds = NATIVE_STREAM[name];
+  if (!kinds) return false;
+  if (info.video && !(kinds.video && kinds.video[info.video.codec]) && v) return false;
+  if (info.audio && !(kinds.audio && kinds.audio[info.audio.codec]) && a) return false;
   return true;
 }
 

@@ -26,6 +26,7 @@ function TSReader(opts) {
   this._videoPid = null;
   this._videoType = 0;     // the PMT stream_type of _videoPid (0x1B H.264, 0x24 H.265)
   this._audioPid = null;
+  this._streams = null;    // the elementary streams of the last PMT applied: [{ pid, streamType }]
 
   this._pesBuf = {};
   this._psi = {};          // PAT / PMT section being assembled: { pat: Uint8Array|null, pmt: … }
@@ -48,6 +49,16 @@ function TSReader(opts) {
 
 TSReader.prototype.on = function (ev, fn) { this._ee.on(ev, fn); };
 TSReader.prototype.off = function (ev, fn) { this._ee.off(ev, fn); };
+
+// What the PSI said, for a reader built on this one (reader_ts_file read
+// the fields themselves): the PMT PID (from the PAT), the video and audio
+// PIDs chosen and the video's stream_type (0x1B H.264, 0x24 H.265; 0
+// before), and the streams of the PMT (null until one is applied).
+TSReader.prototype.pmtPid = function () { return this._pmtPid; };
+TSReader.prototype.videoPid = function () { return this._videoPid; };
+TSReader.prototype.videoStreamType = function () { return this._videoType; };
+TSReader.prototype.audioPid = function () { return this._audioPid; };
+TSReader.prototype.streams = function () { return this._streams; };
 
 TSReader.prototype.feed = function (chunk) {
   this._q.push(chunk);
@@ -196,10 +207,12 @@ TSReader.prototype._parsePMTSection = function (sec) {
   var progInfoLen = ((sec[10] & 0x0F) << 8) | sec[11];
   var i = 12 + progInfoLen;
   var endPos = Math.min(3 + secLen - 4, sec.length);
+  var streams = [];
   while (i + 5 <= endPos) {
     var streamType = sec[i];
     var elemPid = ((sec[i + 1] & 0x1F) << 8) | sec[i + 2];
     var esInfoLen = ((sec[i + 3] & 0x0F) << 8) | sec[i + 4];
+    streams.push({ pid: elemPid, streamType: streamType });
     // Video: H.264=0x1B, H.265=0x24
     if ((streamType === 0x1B || streamType === 0x24) && this._videoPid === null) { this._videoPid = elemPid; this._videoType = streamType; }
     // Audio: AAC in ADTS (0x0F). 0x11 is AAC in LATM/LOAS, which this
@@ -209,6 +222,7 @@ TSReader.prototype._parsePMTSection = function (sec) {
     if (streamType === 0x0F && this._audioPid === null) this._audioPid = elemPid;
     i += 5 + esInfoLen;
   }
+  this._streams = streams;
 };
 
 TSReader.prototype._accumPES = function (pid, payload, pusi, kind) {
@@ -243,7 +257,7 @@ TSReader.prototype._flushPES = function (pid, kind) {
 
   var flags = pes[7];
   var headerDataLen = pes[8];
-  var pts = null;
+  var pts = null, dts = null;
 
   if (pes.length < 9 + headerDataLen) return;
   if ((flags & 0x80) === 0x80 && headerDataLen >= 5) {
@@ -268,13 +282,19 @@ TSReader.prototype._flushPES = function (pid, kind) {
     var ptsLo  = ((pes[12] & 0xFF) << 7) | ((pes[13] & 0xFE) >> 1);   // PTS[14:0]
     pts = (ptsHi * 1073741824) + (ptsMid * 32768) + ptsLo;
     pts = this._unwrap(pts);
+    // PTS_DTS_flags '11': the DTS follows (§2.4.3.7), unwrapped against
+    // the PTS just read. It was never read: with B-frames every access
+    // unit went out with its PTS alone (libx264 -bf 2: ffprobe's dts
+    // 1.40 s for pts 1.48 s), and a consumer could not tell the decode
+    // order's times.
+    if ((flags & 0xC0) === 0xC0 && headerDataLen >= 10) dts = this._unwrap(_readTs(pes, 14));
   }
 
   var payloadStart = 9 + headerDataLen;
   if (payloadStart > pes.length) return;
   var es = pes.subarray(payloadStart);
 
-  if (kind === 'video') this._processVideoES(es, pts);
+  if (kind === 'video') this._processVideoES(es, pts, dts);
   else if (kind === 'audio') this._processAudioES(es, pts);
 };
 
@@ -293,7 +313,7 @@ TSReader.prototype._unwrap = function (pts) {
   return pts;
 };
 
-TSReader.prototype._processVideoES = function (es, pts) {
+TSReader.prototype._processVideoES = function (es, pts, dts) {
   // AU splitting strategy: PES boundary = AU boundary.
   //
   // Background: in MPEG-TS, the demux layer (PSI + PES accumulation
@@ -336,11 +356,14 @@ TSReader.prototype._processVideoES = function (es, pts) {
   var ptsUs = pts !== null
     ? Math.round(pts * (1000000 / 90000))
     : Math.floor(this._index * 1000000 / this._fps);
+  // The DTS the same way; without one it is the PTS (§2.4.3.7).
+  var dtsUs = dts !== null ? Math.round(dts * (1000000 / 90000)) : ptsUs;
 
   this._ee.emit('video', {
     payload: au,
     isKeyframe: isKey,
     ptsUs: ptsUs,
+    dtsUs: dtsUs,
     index: this._index++,
     groupId: this._groupId,
   });
@@ -363,7 +386,10 @@ TSReader.prototype._processAudioES = function (es, pts) {
   var ptsUsed = pts === null;
   var pos = 0;
   while (pos + 7 <= es.length) {
-    if (es[pos] !== 0xFF || (es[pos + 1] & 0xF0) !== 0xF0) { pos++; continue; }
+    // syncword 0xFFF and layer '00' (ISO/IEC 14496-3 §1.A.2.2.1): the
+    // layer was not checked, so an MPEG-1/2 audio frame header (MP3: FF FB,
+    // layer '01') was read as ADTS.
+    if (es[pos] !== 0xFF || (es[pos + 1] & 0xF6) !== 0xF0) { pos++; continue; }
 
     // Parse the ADTS header for this frame. parseAdtsHeader does the
     // same validation we used to do inline (sync, protection_absent,
@@ -417,6 +443,12 @@ TSReader.prototype._processAudioES = function (es, pts) {
   // for the next PES.
   if (pos < es.length && es.length - pos < 8192) this._aCarry = es.slice(pos);
 };
+
+// A 33-bit PES time stamp (PTS or DTS: 5 bytes with marker bits) at b[o..].
+function _readTs(b, o) {
+  return ((b[o] & 0x0E) >> 1) * 1073741824 + (((b[o + 1] & 0xFF) << 7) | ((b[o + 2] & 0xFE) >> 1)) * 32768 +
+    (((b[o + 3] & 0xFF) << 7) | ((b[o + 4] & 0xFE) >> 1));
+}
 
 // Is this packet the same bytes as the last one of its PID?
 function _same(a, b) {

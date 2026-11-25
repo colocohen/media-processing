@@ -548,8 +548,17 @@ AudioEncoder.prototype._startFFmpeg = function () {
 
   if (containerDef && containerDef.createReader) {
     var reader = containerDef.createReader({ sampleRate: cfg.sampleRate });
+    // reader_ogg's times are presentation times (RFC 7845 §4.3: granule −
+    // pre-skip), so FFmpeg's first Opus packet is at −6.5 ms (libopus'
+    // 312 samples), where reader_adts / reader_ts start at 0. A browser's
+    // AudioEncoder stamps the first chunk with the first input's
+    // timestamp, the pre-skip being the decoder's business (OpusHead in
+    // the description): positions in the run's stream are counted from
+    // the first packet.
+    var origin = null;
     wireReader(self, reader, {
       audio: function (f) {
+        if (origin === null) origin = f.ptsUs;
         // Surface the real OpusHead (captured by reader_ogg from the
         // ogg stream) so the first chunk's decoderConfig carries it —
         // browser-faithful, with the correct libopus pre-skip.
@@ -560,7 +569,7 @@ AudioEncoder.prototype._startFFmpeg = function () {
           type: 'key',
           // Reader pts are positions in this run's stream (from 0) —
           // mapped back to the input timeline (_inputTimestampAt).
-          timestamp: self._inputTimestampAt(f.ptsUs),
+          timestamp: self._inputTimestampAt(f.ptsUs - origin),
           duration: f.durationUs, data: payload,
         }), meta);
       },

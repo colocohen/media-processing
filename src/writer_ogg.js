@@ -301,3 +301,5 @@ OggWriter.prototype._buildOnePage = function (segments, body, flags, granule) {
 
 
 export default OggWriter;
+// Ogg's page CRC (RFC 3533 §6), also checked by reader_ogg.
+export { _crc32 as oggCrc32 };

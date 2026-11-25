@@ -363,4 +363,32 @@ function codecStringFromAv1C(rec) {
   return 'av01.' + profile + '.' + _pad2(level) + (tier ? 'H' : 'M') + '.' + _pad2(depth);
 }
 
-export { parseCodecString, normalizeCodec, parseCodecDetails, buildCodecString, codecStringFromAv1C };
+/**
+ * The VP9 level of a stream (webmproject.org/vp9/levels: the lowest
+ * level whose luma picture size, width / height and luma sample rate
+ * hold it), as level × 10 for 'vp09.PP.LL.DD' — for a container that
+ * does not say (a VP9 frame has no level). fps: 0 when not known (the
+ * sample rate is not checked then — FFmpeg's vpcC does the same). No
+ * size: 10. The readers guessed from the size alone with their own
+ * steps (160×120 at 30 fps: 2.1 where the table gives 1; 3840×2160:
+ * 5.1, 8K too, where the table needs 6).
+ */
+var VP9_LEVELS = [
+  // level, max luma sample rate, max luma picture size, max width / height
+  [10, 829440, 36864, 512], [11, 2764800, 73728, 768], [20, 4608000, 122880, 960], [21, 9216000, 245760, 1344],
+  [30, 20736000, 552960, 2048], [31, 36864000, 983040, 2752], [40, 83558400, 2228224, 4160], [41, 160432128, 2228224, 4160],
+  [50, 311951360, 8912896, 8384], [51, 588251136, 8912896, 8384], [52, 1176502272, 8912896, 8384],
+  [60, 1176502272, 35651584, 16832], [61, 2353004544, 35651584, 16832], [62, 4706009088, 35651584, 16832],
+];
+function vp9Level(width, height, fps) {
+  var px = (width || 0) * (height || 0), side = Math.max(width || 0, height || 0);
+  if (!px) return 10;
+  var rate = fps > 0 ? px * fps : 0;
+  for (var i = 0; i < VP9_LEVELS.length; i++) {
+    var l = VP9_LEVELS[i];
+    if (rate <= l[1] && px <= l[2] && side <= l[3]) return l[0];
+  }
+  return 62;                                     // past the table: its highest
+}
+
+export { parseCodecString, normalizeCodec, parseCodecDetails, buildCodecString, codecStringFromAv1C, vp9Level };
