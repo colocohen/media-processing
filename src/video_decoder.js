@@ -5,15 +5,18 @@
 
 import { frameByteSize } from './core/frame_size.js';
 import { initCoder, configureCoder, applyCoderPrototype, watchExit, detachCoderListeners,
-  addPendingFlush, removePendingFlush, holdingCalls, holdCall, failUnsupported, domex } from './base_coder.js';
+  addPendingFlush, removePendingFlush, holdingCalls, holdCall, failUnsupported, domex, failEmptyChunk } from './base_coder.js';
 import { checkVideoDecoderConfig, videoDecoderConfigSupported } from './codecs.js';
 import { normalizeCodec } from './utils/codec_strings.js';
 import FrameQueue from './core/frame_queue.js';
 import { writeU16LE, writeU32LE, fromAscii } from './core/bytes.js';
 import VideoFrame from './video_frame.js';
 import { getDefaultContainer, getContainer, getContainerFormat } from './containers.js';
-import { avccToAnnexb, bitstreamFromDescription } from './utils/nalu_utils.js';
-import { toUint8Array } from './core/buffer_source.js';
+import { avccToAnnexb, bitstreamFromDescription, splitNALUs } from './utils/nalu_utils.js';
+import { findSequenceHeader, parseSequenceHeader } from './utils/av1_utils.js';
+import { parseH264Sps, parseH265Sps, h264VideoSignal, h265VideoSignal } from './utils/h26x_parse.js';
+import { colorSpaceFromCicp } from './video_color_space.js';
+import { toUint8Array, copyBufferSource } from './core/buffer_source.js';
 
 function VideoDecoder(init) {
   if (!init) throw new TypeError('VideoDecoder: init required');
@@ -62,21 +65,14 @@ VideoDecoder.prototype.configure = function (config) {
   // in VideoDecoderConfig (the spec defaults them from the decoded
   // stream). The previous implementation made them required.
   //
-  // For our FFmpeg-backed decoder we still need a target output size
-  // for the scale filter. Strategy:
-  //   - If caller provides codedWidth/codedHeight, use them as the
-  //     locked output size — every emitted VideoFrame will be at this
-  //     size regardless of input stream resolution (handled by an
-  //     `-vf scale=W:H` filter in FFmpeg, MP-9). This is what most
-  //     WebRTC pipelines want: receiver-side fixed render target.
-  //   - If not provided, default to 1920x1080. The decoder still
-  //     scales any input to fit. (A future MP-9b will detect actual
-  //     stream dimensions and emit accordingly; tracked separately.)
-  //
-  // The scale filter side-effect: when an upstream sender's quality
-  // scaler drops resolution mid-stream, the FrameQueue stays in lock
-  // step with our configured byte size — no corrupted frames. This
-  // is the CORE BUG MP-9 was reporting.
+  // They are a hint (W3C: "used when selecting a [[codec
+  // implementation]]"): the frames have the stream's own size (Output
+  // VideoFrames creates them from the decoder's output; Chrome 158 gives
+  // a 64x48 stream as 64x48 under codedWidth 96 / 32, measured). The
+  // configured size (or 1920x1080) is only the provisional geometry until
+  // FFmpeg reports the stream's (_watchStreamDimensions) and the IVF
+  // header's size for VP9 / AV1. It used to lock the output to the
+  // config's size with `-vf scale=W:H` (MP-9's "fixed render target").
   var w = config.codedWidth || config.width || 1920;
   var h = config.codedHeight || config.height || 1080;
 
@@ -128,12 +124,6 @@ VideoDecoder.prototype.configure = function (config) {
     probesize:        (config.probesize        != null) ? config.probesize        : 32,
     analyzeduration:  (config.analyzeduration  != null) ? config.analyzeduration  : 100000,
     threads:          (config.threads          != null) ? config.threads          : 0,
-    // MP-9: track whether dimensions were caller-supplied. If yes, we
-    // lock output to those dims (scale-to-fit). If no (defaulted), we
-    // still scale but flag this so callers / context.* reflects the
-    // assumption.
-    dimensionsExplicit: !!(config.codedWidth || config.width) &&
-                        !!(config.codedHeight || config.height),
   };
 
   this._headerSent = false;
@@ -241,13 +231,17 @@ VideoDecoder.prototype.close = function () {
 };
 
 VideoDecoder.prototype.decode = function (chunk) {
+  // WebIDL: `chunk` is converted to an EncodedVideoChunk before the method
+  // steps run, so a missing one is a TypeError even when the state is not
+  // "configured" (it was checked after the state and the key-chunk check).
+  if (!chunk || !chunk.data) {
+    throw new TypeError('VideoDecoder.decode: chunk must be an EncodedVideoChunk');
+  }
   // Per W3C WebCodecs §6.4: throw InvalidStateError synchronously
   // if state isn't 'configured'. Mirrors MP-19's fix for VideoEncoder.
   if (this._state !== 'configured') {
-    var stateErr = new Error(
-      'VideoDecoder.decode: state is "' + this._state + '", not "configured"'
-    );
-    stateErr.name = 'InvalidStateError';
+    var stateErr = domex(
+      'VideoDecoder.decode: state is "' + this._state + '", not "configured"', 'InvalidStateError');
     throw stateErr;
   }
   // W3C WebCodecs §6.4 [[key chunk required]]: the first chunk after
@@ -258,20 +252,13 @@ VideoDecoder.prototype.decode = function (chunk) {
   // where a loud one belongs.
   if (this._keyChunkRequired) {
     if (!chunk || chunk.type !== 'key') {
-      var keyErr = new Error(
+      var keyErr = domex(
         'VideoDecoder.decode: a key chunk is required first (got ' +
         ((chunk && chunk.type) || 'no chunk') + '). Decoding cannot start ' +
-        'from a delta chunk.'
-      );
-      keyErr.name = 'DataError';
+        'from a delta chunk.', 'DataError');
       throw keyErr;
     }
     this._keyChunkRequired = false;
-  }
-  if (!chunk || !chunk.data || !chunk.data.length) {
-    var inputErr = new Error('VideoDecoder.decode: chunk.data required');
-    inputErr.name = 'TypeError';
-    throw inputErr;
   }
 
   this._queueSize++;
@@ -291,7 +278,8 @@ VideoDecoder.prototype.decode = function (chunk) {
 
 VideoDecoder.prototype._decodeNow = function (chunk) {
   if (this._draining) { this._draining.items.push({ chunk: chunk }); return; }
-  if (!this._ffmpeg.running) this._startFFmpeg();
+  if (!chunk.data.length) { failEmptyChunk(this, 'VideoDecoder.decode'); return; }
+  if (!this._ffmpeg.running) this._startFFmpeg(chunk);
 
   var containerName = getDefaultContainer(this._config.codec);
 
@@ -392,7 +380,114 @@ function _stripLeadingAud(data, isHevc) {
   return data.subarray(data.length); // the chunk was only an AUD
 }
 
-VideoDecoder.prototype._startFFmpeg = function () {
+// ── The output format: the decoded picture's own (W3C Output VideoFrames) ──
+//
+// A browser's VideoFrame has the format the stream decodes to: I420P10 for
+// VP9 profile 2 or 10-bit AV1, I444 / I422 for 4:4:4 / 4:2:2 (Chrome 158,
+// measured). Every stream was converted to yuv420p — 10-bit streams lost
+// their two low bits, 4:4:4 three quarters of its chroma. The format is
+// read from the run's first chunk (a key chunk: VP9's uncompressed header,
+// AV1's sequence header, the H.264 / H.265 SPS of the description or the
+// chunk), and FFmpeg is asked for exactly that pix_fmt — the decoder's own,
+// so nothing is converted. Only what WebCodecs has no format for is
+// converted, to the nearest one that loses nothing it can keep:
+//   - 4:4:0 (VP9 profile 1 / 3)              → I444 (chroma doubled vertically)
+//   - monochrome (AV1, H.264 / H.265 4:0:0)   → I420 with mid-grey chroma (Chrome's)
+//   - 9-bit (H.264 / H.265)                   → the P10 format
+//   - 13- to 16-bit (H.264 High 4:4:4, HEVC RExt) → the P12 format
+// VP9 / AV1 4:4:4 with the identity matrix (GBR planes: FFmpeg's gbrp) is
+// I444 with colorSpace matrix 'rgb' (H.273: Y = G, Cb = B, Cr = R).
+// A stream the parse does not read (a damaged key chunk) is yuv420p, as before.
+var _NATIVE = {
+  '420': { 8: ['I420', 'yuv420p'], 10: ['I420P10', 'yuv420p10le'], 12: ['I420P12', 'yuv420p12le'] },
+  '422': { 8: ['I422', 'yuv422p'], 10: ['I422P10', 'yuv422p10le'], 12: ['I422P12', 'yuv422p12le'] },
+  '444': { 8: ['I444', 'yuv444p'], 10: ['I444P10', 'yuv444p10le'], 12: ['I444P12', 'yuv444p12le'] },
+  'gbr': { 8: ['I444', 'gbrp'], 10: ['I444P10', 'gbrp10le'], 12: ['I444P12', 'gbrp12le'] },
+};
+// VP9 color_space (§7.2.2) → the H.273 matrix: BT.601 is FFmpeg's bt470bg
+var _VP9_MATRIX = [2, 5, 1, 6, 7, 9, 2, 0];
+
+/**
+ * The output of a stream: { format, pixFmt, colorSpace } from its first
+ * key chunk (Annex-B for H.264 / H.265, `paramSets` the description's).
+ * colorSpace: what the bitstream says (W3C: "as detected by the codec
+ * implementation"; null members where it says nothing) — VP9: the matrix
+ * and range;
+ * AV1: color_config's primaries, transfer, matrix and range; H.264 /
+ * H.265: the SPS VUI's video signal type (colour description and
+ * video_full_range_flag; H.273 code points). VP8 has none detected. The
+ * config's colorSpace wins over it (_applyFrameMeta).
+ */
+function _nativeOutput(codec, data, paramSets) {
+  var depth = 8, sub = '420', cs = null, info;
+  if (codec === 'vp9') info = _vp9ColorConfig(data);
+  else if (codec === 'av1') {
+    var sh = findSequenceHeader(data);
+    var seq = sh && parseSequenceHeader(sh.payload);
+    if (seq) {
+      info = { depth: seq.bitDepth, sub: seq.mono ? '420' : seq.subX ? (seq.subY ? '420' : '422') : (seq.matrix === 0 ? 'gbr' : '444'), mono: !!seq.mono };
+      info.cs = colorSpaceFromCicp(seq.colorPrimaries, seq.transfer, seq.matrix, seq.fullRange);
+    }
+  } else if (codec === 'h264' || codec === 'h265') {
+    var isH265 = codec === 'h265';
+    var all = paramSets ? [].concat(splitNALUs(paramSets, isH265), splitNALUs(data, isH265)) : splitNALUs(data, isH265);
+    for (var i = 0; i < all.length && !info; i++) {
+      if (all[i].type !== (isH265 ? 33 : 7)) continue;
+      var sps = isH265 ? parseH265Sps(all[i].data) : parseH264Sps(all[i].data);
+      if (sps) {
+        info = { depth: sps.bitDepth, sub: sps.chroma === 2 ? '422' : sps.chroma === 3 ? '444' : '420', mono: sps.chroma === 0 };
+        // The VUI's video signal type (H.264 §E.1.1, H.265 §E.2.1).
+        var vs = isH265 ? h265VideoSignal(all[i].data) : h264VideoSignal(all[i].data);
+        if (vs) info.cs = colorSpaceFromCicp(vs.primaries, vs.transfer, vs.matrix, vs.fullRange);
+      }
+    }
+  }
+  if (info) {
+    depth = info.depth <= 8 ? 8 : info.depth <= 10 ? 10 : 12;
+    sub = info.sub;
+    cs = info.cs || null;
+    if (cs && !cs.primaries && !cs.transfer && !cs.matrix && cs.fullRange === null) cs = null;
+  }
+  var f = _NATIVE[sub][depth];
+  return { format: f[0], pixFmt: f[1], colorSpace: cs, mono: !!(info && info.mono) };
+}
+
+/**
+ * A VP9 key frame's color_config (VP9 bitstream §6.2): { depth, sub, cs }
+ * — sub '420' | '422' | '444' | 'gbr' (4:4:0 is '444': converted), or
+ * null when the frame is not a key frame it can read.
+ */
+function _vp9ColorConfig(frame) {
+  if (!frame || frame.length < 10) return null;
+  var pos = 0;
+  var bit = function () { var b = (frame[pos >> 3] >> (7 - (pos & 7))) & 1; pos++; return b; };
+  var bits = function (n) { var v = 0; for (var k = 0; k < n; k++) v = (v << 1) | bit(); return v; };
+  if (bits(2) !== 2) return null;                          // frame_marker
+  var profile = bit() | (bit() << 1);
+  if (profile === 3) bit();                                // reserved_zero
+  if (bit()) return null;                                  // show_existing_frame
+  if (bit() !== 0) return null;                            // frame_type: KEY_FRAME
+  bits(2);                                                 // show_frame, error_resilient_mode
+  if (bits(24) !== 0x498342) return null;                  // frame_sync_code
+  var depth = profile >= 2 ? (bit() ? 12 : 10) : 8;
+  var space = bits(3);
+  var sub = '420', full;
+  if (space !== 7) {                                       // CS_RGB
+    full = bit();
+    if (profile === 1 || profile === 3) {
+      var sx = bit(), sy = bit();
+      sub = sx ? (sy ? '420' : '422') : '444';             // 4:4:0 (sx 0, sy 1): '444'
+    }
+  } else {
+    full = 1;
+    if (profile !== 1 && profile !== 3) return null;       // RGB needs 4:4:4
+    sub = 'gbr';
+  }
+  if ((pos >> 3) >= frame.length) return null;
+  return { depth: depth, sub: sub, cs: colorSpaceFromCicp(2, 2, _VP9_MATRIX[space], full) };
+}
+
+VideoDecoder.prototype._startFFmpeg = function (firstChunk) {
   // One run's listeners at a time (see base_coder detachCoderListeners):
   // after a flush() this starts a new run on the same process object.
   detachCoderListeners(this._ffmpeg);
@@ -407,6 +502,13 @@ VideoDecoder.prototype._startFFmpeg = function () {
   this._decodeIndex = 0;
   var self = this;
   var cfg = this._config;
+  // The decoded picture's format (see _nativeOutput).
+  var chunkData = firstChunk && firstChunk.data;
+  if (chunkData && this._lengthSize) chunkData = avccToAnnexb(chunkData, this._lengthSize);
+  var native = _nativeOutput(cfg.codec, chunkData, this._paramSets);
+  this._outFormat = native.format;
+  this._streamColorSpace = native.colorSpace;
+  this._bytesPerFrame = frameByteSize(native.format, cfg.width, cfg.height);
   var containerName = getDefaultContainer(cfg.codec);
   var containerDef = getContainer(containerName);
 
@@ -443,13 +545,13 @@ VideoDecoder.prototype._startFFmpeg = function () {
   // hosts (e.g. h264_v4l2m2m, h264_qsv) which can be 5-10x faster than
   // the software path. The `-f <demuxer>` hint above is enough to skip
   // probesize-based format detection without locking us into software.
-  // In auto-size mode we need FFmpeg's stream report, which is only
+  // We need FFmpeg's stream report (the stream's size), which is only
   // printed at 'info' or above. Callers who set an explicit loglevel
   // keep it; the default 'error' is raised just enough to see the one
   // line we parse. The extra output is a handful of startup lines,
   // routed to the existing ffmpeg:log event rather than the console.
   var effectiveLoglevel = cfg.loglevel || 'error';
-  if (!cfg.dimensionsExplicit && (effectiveLoglevel === 'error' ||
+  if ((effectiveLoglevel === 'error' ||
       effectiveLoglevel === 'fatal' || effectiveLoglevel === 'panic' ||
       effectiveLoglevel === 'quiet')) {
     effectiveLoglevel = 'info';
@@ -474,35 +576,23 @@ VideoDecoder.prototype._startFFmpeg = function () {
   if (fmt) args.push('-f', fmt);
   args.push('-i', 'pipe:0');
 
-  // MP-9 / spec alignment: the scale filter is now CONDITIONAL.
+  // No scale filter: W3C's frames are the stream's size, whatever the
+  // config's codedWidth / codedHeight (a hint; see configure). Dimensions
+  // are read from FFmpeg's own stream report (see _watchStreamDimensions)
+  // and the FrameQueue is resized to match before any frame is cut. (It
+  // scaled to the config's size when one was given — MP-9's fixed render
+  // target — and, before that, to an invented 1920x1080.) A size change
+  // in the middle of a run is FFmpeg's autoscale to the run's first size
+  // (the rawvideo output keeps one size).
   //
-  // Per W3C WebCodecs, VideoDecoderConfig.codedWidth/codedHeight
-  // describe the stream; they are optional, and a conforming decoder
-  // emits frames at whatever size the stream actually contains. The
-  // previous code always applied `scale=cfg.width:cfg.height` with an
-  // invented 1920x1080 default, so decoding a 320x240 stream without
-  // an explicit config produced 3,110,400-byte frames instead of
-  // 115,200 — a 27x inflation, 89 MB/s of upscaled pixels at 30fps,
-  // plus a 9 MB FrameQueue buffer per decoder instance.
-  //
-  //   - dimensionsExplicit (caller supplied codedWidth/codedHeight):
-  //     keep locking output to those dimensions. This is what WebRTC
-  //     receive pipelines want — a fixed render target that survives
-  //     an upstream Quality Scaler dropping resolution mid-stream —
-  //     and it is what every current consumer already relies on.
-  //
-  //   - not explicit: follow the stream. Dimensions are read from
-  //     FFmpeg's own stream report (see _watchStreamDimensions) and
-  //     the FrameQueue is resized to match before any frame is cut.
-  //
-  // The format filter stays in both paths so output is always planar
-  // yuv420p even when the input is 4:2:2 or 4:4:4.
-  var autoSize = !cfg.dimensionsExplicit;
-  if (autoSize) {
-    args.push('-vf', 'format=yuv420p');
-  } else {
-    args.push('-vf', 'scale=' + cfg.width + ':' + cfg.height + ',format=yuv420p');
-  }
+  // The format filter: the stream's own pix_fmt
+  // (_nativeOutput), so FFmpeg converts only what WebCodecs cannot
+  // express (and a hardware decoder's NV12 / P010 back to it).
+  // Monochrome (gray → yuv420p): one range in and out, or swscale
+  // stretches a full-range luma to studio range — the luma is the
+  // decoder's as it is, the chroma mid-grey.
+  var range = native.mono ? 'in_range=pc:out_range=pc' : '';
+  args.push('-vf', (range ? 'scale=' + range + ',' : '') + 'format=' + native.pixFmt);
 
   // '-threads 1' here is the OUTPUT side: the rawvideo "encoder" that
   // writes the decoded frames to pipe:3 supports frame threading, and
@@ -517,13 +607,12 @@ VideoDecoder.prototype._startFFmpeg = function () {
   // — see base_coder's failCoder. It used to fail silently.
   watchExit(self);
 
-  // Output geometry actually in effect. In locked mode it is the
-  // configured size; in auto mode it starts as a provisional guess and
-  // is corrected by _watchStreamDimensions before the first frame is
-  // cut (data is held back until then).
+  // Output geometry actually in effect: a provisional guess, corrected
+  // by _watchStreamDimensions before the first frame is cut (data is
+  // held back until then).
   self._outWidth = cfg.width;
   self._outHeight = cfg.height;
-  self._sizeKnown = !autoSize;
+  self._sizeKnown = false;
   self._pendingData = [];
   self._pendingBytes = 0;
 
@@ -543,12 +632,15 @@ VideoDecoder.prototype._startFFmpeg = function () {
     }
     var init = {
       data: frameBuf,
-      format: 'I420',
+      format: self._outFormat,
       codedWidth: self._outWidth,
       codedHeight: self._outHeight,
       timestamp: ts,
       duration: dur,
     };
+    // W3C Output VideoFrames: the colour space the stream says, unless
+    // the config gives one (_applyFrameMeta).
+    if (self._streamColorSpace) init.colorSpace = self._streamColorSpace;
     _applyFrameMeta(init, self._frameMeta, self._outWidth, self._outHeight);
     var vf = new VideoFrame(init);
     self._frameIndex++;
@@ -556,7 +648,7 @@ VideoDecoder.prototype._startFFmpeg = function () {
     self._output(vf);
   });
 
-  if (autoSize) self._watchStreamDimensions();
+  self._watchStreamDimensions();
 
   self._ffmpeg.on('data', function (chunk) {
     if (!self._sizeKnown) {
@@ -607,9 +699,8 @@ var MAX_PENDING_BYTES = 3 * 1024 * 1024;
 // FFmpeg reports each stream during startup, e.g.
 //   Stream #0:0: Video: h264 (High), yuv444p, 320x240 [SAR 1:1 DAR 4:3] ...
 //   Stream #0:0: Video: rawvideo (I420 / 0x30323449), yuv420p, 320x240 ...
-// We take the FIRST Video line, which is the input stream. In auto-size
-// mode no scale filter is applied, so the rawvideo output carries the
-// same geometry — and the input line arrives first, which shortens the
+// We take the FIRST Video line, which is the input stream. No scale
+// filter is applied, so the rawvideo output carries the same geometry — and the input line arrives first, which shortens the
 // window during which output bytes have to be held back.
 //
 // The {2,5} digit bounds matter: they stop the pattern from matching
@@ -645,7 +736,7 @@ VideoDecoder.prototype._applyStreamDimensions = function (w, h, source) {
   this._outWidth = w;
   this._outHeight = h;
   this._dimensionSource = source;
-  this._bytesPerFrame = frameByteSize('I420', w, h);
+  this._bytesPerFrame = frameByteSize(this._outFormat || 'I420', w, h);
 
   this.context.width = w;
   this.context.height = h;
@@ -743,7 +834,19 @@ function _cloneDecoderConfig(config) {
   if (!config) return out;
   for (var i = 0; i < _DECODER_CONFIG_KEYS.length; i++) {
     var k = _DECODER_CONFIG_KEYS[i];
-    if (config[k] !== undefined) out[k] = config[k];
+    if (config[k] === undefined) continue;
+    if (k === 'description') out[k] = copyBufferSource(config[k]);
+    else if (k === 'colorSpace' && config[k] !== null && typeof config[k] === 'object') {
+      // A nested dictionary (VideoColorSpaceInit), cloned member by member
+      // with its IDL defaults (null): it was the caller's object.
+      var cs = config[k];
+      out[k] = {
+        primaries: cs.primaries !== undefined ? cs.primaries : null,
+        transfer:  cs.transfer  !== undefined ? cs.transfer  : null,
+        matrix:    cs.matrix    !== undefined ? cs.matrix    : null,
+        fullRange: cs.fullRange !== undefined ? cs.fullRange : null,
+      };
+    } else out[k] = config[k];
   }
   return out;
 }

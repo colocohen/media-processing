@@ -7,6 +7,9 @@
  *                                     the spec's SelectSettings: pick a
  *                                     device + settings, or report the
  *                                     constraint that cannot be met
+ *   fitnessDistance(cs, cand, props, bareExact)
+ *                                     the fitness distance of one
+ *                                     constraint set to one candidate
  *   overconstrainedError(name, msg)   OverconstrainedError (DOMException)
  */
 
@@ -33,11 +36,14 @@ function resolveConstraint(value, opts) {
   if (value == null) return undefined;
   // Plain primitives — the most common case
   if (typeof value !== 'object') return _round(value, opts);
-  // ConstrainXxx object form
-  if ('exact' in value) return _round(value.exact, opts);
+  // ConstrainXxx object form. An empty list is no constraint (W3C
+  // SelectSettings: "If an empty list has been given as the value for a
+  // constraint, it MUST be interpreted as if the constraint were not
+  // specified"): {exact: []} set the setting to [].
+  if ('exact' in value && !_emptyList(value.exact)) return _round(value.exact, opts);
   var hasMin = ('min' in value) && value.min != null;
   var hasMax = ('max' in value) && value.max != null;
-  if ('ideal' in value && value.ideal != null) {
+  if ('ideal' in value && value.ideal != null && !_emptyList(value.ideal)) {
     var ideal = value.ideal;
     if (typeof ideal === 'number') {
       if (hasMin && ideal < value.min) ideal = value.min;
@@ -62,6 +68,8 @@ function resolveConstraint(value, opts) {
   if (hasMax) return _round(value.max, opts);
   return undefined;
 }
+
+function _emptyList(v) { return Array.isArray(v) && v.length === 0; }
 
 function _round(v, opts) {
   if (opts && opts.integer && typeof v === 'number' && Number.isFinite(v)) return Math.round(v);
@@ -125,8 +133,10 @@ function _numRange(spec, cap) {
   return [lo, hi];
 }
 
+// An empty list is no constraint (see resolveConstraint): it gave
+// {exact: []} an infinite distance and {ideal: []} a distance of 1.
 function _strList(v) {
-  if (v == null) return null;
+  if (v == null || _emptyList(v)) return null;
   return Array.isArray(v) ? v.map(String) : [String(v)];
 }
 
@@ -136,7 +146,10 @@ function _strSpec(cv, bareExact) {
     if (!l) return null;
     return bareExact ? { exact: l } : { ideal: l };
   }
-  return { exact: _strList(cv.exact), ideal: _strList(cv.ideal) };
+  var ex = _strList(cv.exact) || undefined, id = _strList(cv.ideal) || undefined;
+  // {exact: []} / {ideal: []} alone: no constraint at all.
+  if (ex === undefined && id === undefined && (_emptyList(cv.exact) || _emptyList(cv.ideal))) return null;
+  return { exact: ex, ideal: id };
 }
 
 function _boolSpec(cv, bareExact) {
@@ -162,7 +175,11 @@ function _isRequired(spec) {
 function _distance(type, spec, cap, capKnown, matchFn) {
   if (!spec) return 0;
   if (!capKnown) return 0;
-  if (cap === undefined) return _isRequired(spec) ? Infinity : 0;
+  // A device without the property: W3C "If the settings dictionary's
+  // constraintName member does not exist, the fitness distance is 1"
+  // (infinity when required). It was 0, so a device lacking the property
+  // tied with one meeting the ideal exactly, and the first probed won.
+  if (cap === undefined) return _isRequired(spec) ? Infinity : 1;
 
   if (type === 'ulong' || type === 'double') {
     var r = _numRange(spec, cap);
@@ -206,10 +223,12 @@ function _specFor(type, cv, bareExact) {
 
 /**
  * Fitness distance of a whole constraint set; { d, failed } where failed
- * is the first constraint name with an infinite distance.
+ * lists every constraint name with an infinite distance, in order (the
+ * spec's failedConstraint is one that fails for every candidate, so each
+ * one is needed, not only the first).
  */
 function _setDistance(cs, cand, props, bareExact) {
-  var total = 0;
+  var total = 0, failed = [];
   for (var name in cs) {
     if (!Object.prototype.hasOwnProperty.call(cs, name)) continue;
     var p = props[name];
@@ -218,10 +237,15 @@ function _setDistance(cs, cand, props, bareExact) {
     var capKnown = cand.caps !== null;
     var cap = capKnown ? cand.caps[name] : undefined;
     var d = _distance(p.type, spec, cap, capKnown, p.match ? function (want) { return p.match(cand.device, want); } : null);
-    if (d === Infinity) return { d: Infinity, failed: name };
+    if (d === Infinity) failed.push(name);
     total += d;
   }
-  return { d: total, failed: null };
+  return { d: failed.length ? Infinity : total, failed: failed };
+}
+
+/** The fitness distance of constraint set `cs` (no 'advanced') to one candidate. */
+function fitnessDistance(cs, cand, props, bareExact) {
+  return _setDistance(_isObj(cs) ? cs : {}, cand, props, !!bareExact);
 }
 
 /**
@@ -244,22 +268,25 @@ function selectSettings(cs, candidates, props) {
   // Required constraints of the basic set: drop candidates that fail.
   var feasible = [];
   var failCount = {};
-  var firstFailed = null;
   for (var i = 0; i < candidates.length; i++) {
     var r = _setDistance(basic, candidates[i], props, false);
     if (r.d === Infinity) {
-      failCount[r.failed] = (failCount[r.failed] || 0) + 1;
-      if (!firstFailed) firstFailed = r.failed;
+      for (var fi = 0; fi < r.failed.length; fi++) failCount[r.failed[fi]] = (failCount[r.failed[fi]] || 0) + 1;
     } else {
       feasible.push({ cand: candidates[i], d: r.d });
     }
   }
   if (!feasible.length) {
-    // Spec: name a required constraint that failed for every candidate
-    // if there is one.
-    var failed = firstFailed;
-    for (var f in failCount) if (failCount[f] === candidates.length) { failed = f; break; }
-    return { failed: failed || '' };
+    // W3C ApplyConstraints: "let failedConstraint be any required
+    // constraint whose fitness distance was infinity for all settings
+    // dictionaries examined while executing the SelectSettings
+    // algorithm, or "" if there isn't one". It was the first candidate's
+    // first failure when none failed for all — a constraint another
+    // candidate met — and counted only each candidate's first failure.
+    for (var f in basic) {
+      if (Object.prototype.hasOwnProperty.call(basic, f) && failCount[f] === candidates.length) return { failed: f };
+    }
+    return { failed: '' };
   }
 
   // Advanced sets, in order: each one that leaves at least one candidate
@@ -331,4 +358,4 @@ function _settingsFor(basic, applied, cand, props) {
   return out;
 }
 
-export { resolveConstraint, selectSettings, overconstrainedError };
+export { resolveConstraint, selectSettings, fitnessDistance, overconstrainedError };

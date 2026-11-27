@@ -25,20 +25,7 @@ var _hasBuffer = typeof Buffer !== 'undefined';
 export function takeBufferSource(name, source, transfer) {
   var view = requireBufferSource(source, name);
   var asBuffer = _hasBuffer && Buffer.isBuffer(view);
-  var list = [];
-  if (transfer !== undefined && transfer !== null) {
-    if (typeof transfer[Symbol.iterator] !== 'function') {
-      throw new TypeError(name + ': transfer must be a sequence of ArrayBuffer');
-    }
-    list = Array.from(transfer);
-    for (var i = 0; i < list.length; i++) {
-      if (!(list[i] instanceof ArrayBuffer)) {
-        throw new TypeError(name + ': transfer may only contain ArrayBuffer');
-      }
-      if (list[i].detached) throw domException(name + ': transfer contains a detached ArrayBuffer', 'DataCloneError');
-      if (list.indexOf(list[i]) !== i) throw domException(name + ': transfer lists the same ArrayBuffer twice', 'DataCloneError');
-    }
-  }
+  var list = checkTransfer(name, transfer);
   var out;
   var own = list.indexOf(view.buffer);
   if (own !== -1) {
@@ -57,4 +44,32 @@ export function takeBufferSource(name, source, transfer) {
   }
   for (var j = 0; j < list.length; j++) list[j].transfer(0);   // detach the rest
   return out;
+}
+
+/**
+ * The `transfer` member's checks (AudioData / VideoFrame / chunk /
+ * ImageDecoder constructors): a sequence of ArrayBuffer (TypeError), none
+ * detached and none twice (DataCloneError). The list, as an array.
+ */
+export function checkTransfer(name, transfer) {
+  var list = [];
+  if (transfer !== undefined && transfer !== null) {
+    if (typeof transfer[Symbol.iterator] !== 'function') {
+      throw new TypeError(name + ': transfer must be a sequence of ArrayBuffer');
+    }
+    list = Array.from(transfer);
+    for (var i = 0; i < list.length; i++) {
+      if (!(list[i] instanceof ArrayBuffer)) {
+        throw new TypeError(name + ': transfer may only contain ArrayBuffer');
+      }
+      if (list[i].detached) throw domException(name + ': transfer contains a detached ArrayBuffer', 'DataCloneError');
+      if (list.indexOf(list[i]) !== i) throw domException(name + ': transfer lists the same ArrayBuffer twice', 'DataCloneError');
+    }
+  }
+  return list;
+}
+
+/** "For each transferable in init.transfer: Perform DetachArrayBuffer". */
+export function detachAll(list) {
+  for (var j = 0; j < list.length; j++) if (!list[j].detached) list[j].transfer(0);
 }

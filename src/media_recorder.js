@@ -25,17 +25,26 @@
  *   new MediaRecorder(stream, { mimeType: 'video/mp4; codecs=h264,aac', outputFile: 'rec.mp4' });
  *
  * Per the spec:
- *   - the constructor throws NotSupportedError for an unsupported mimeType;
- *     mimeType stays as given ('' when none) until start() picks one
+ *   - the constructor throws NotSupportedError for an unsupported mimeType
+ *     ("is type supported" with deferNewerCodecsCheck: a codec identifier
+ *     that is not synchronously exposed is left to start());
+ *     mimeType stays as given ('' when none) until start() picks one;
+ *     start() completes the codecs the type did not name for the kinds the
+ *     stream has, and throws NotSupportedError when a track cannot be
+ *     recorded in the type
  *   - start/pause/resume/stop/dataavailable/error events are dispatched as
  *     queued tasks (never synchronously inside the call), in spec order
  *   - dataavailable's `data` is always a Blob of type mimeType (possibly
  *     empty), `timecode` is 0 for the first one
  *   - pause()/resume()/requestData() throw InvalidStateError when inactive
  *   - recording stops by itself (dataavailable, stop) when every recorded
- *     track has ended
+ *     track has ended; with an InvalidModificationError when a track is
+ *     added to or removed from the stream
  *   - a failure (FFmpeg exits, an encoder fails) fires error, then
  *     dataavailable, then stop
+ *   - timeslice: a dataavailable once timeslice ms of data were gathered
+ *     (paused time does not count; at least MIN_TIMESLICE_MS)
+ *   - bitsPerSecond shared out between the recorded kinds
  */
 
 import fs from 'node:fs';
@@ -46,6 +55,8 @@ import MediaEncoder from './media_encoder.js';
 import VideoEncoder from './video_encoder.js';
 import AudioEncoder from './audio_encoder.js';
 import Muxer from './muxer.js';
+import VideoFrame from './video_frame.js';
+import AudioData from './audio_data.js';
 
 // type → what it can hold. `muxer` is FFmpeg's muxer name.
 var CONTAINERS = {
@@ -64,6 +75,17 @@ var CONTAINERS = {
 var MIME_CODEC_NAME = { h264: 'avc1', h265: 'hev1', aac: 'mp4a.40.2' };
 
 var DEFAULT_SLICE_MS = 1000;   // fragment / cluster length when no timeslice
+var DEFAULT_VIDEO_BPS = 2000000;
+var DEFAULT_AUDIO_BPS = 128000;
+// "or some minimum time slice imposed by the UA, whichever is greater"
+var MIN_TIMESLICE_MS = 10;
+
+// mediacapture-record: "The list of synchronously exposed codec
+// identifiers" — and the codec each names.
+var EXPOSED = {
+  vp8: 'vp8', vp9: 'vp9', h264: 'h264', avc1: 'h264', avc3: 'h264',
+  av1: 'av1', av01: 'av1', hvc1: 'h265', hev1: 'h265', opus: 'opus', pcm: 'pcm',
+};
 
 /**
  * @param {MediaStream} stream
@@ -80,8 +102,10 @@ function MediaRecorder(stream, options) {
 
   var type = options.mimeType ? String(options.mimeType) : '';
   // W3C: an unsupported type throws here. It was accepted and silently
-  // recorded as something else.
-  if (type && !_resolveType(type)) {
+  // recorded as something else. "is type supported" with
+  // deferNewerCodecsCheck true: a codec identifier that is not
+  // synchronously exposed ('mp4a.40.2', 'vp09.…') is start()'s to decide.
+  if (type && !_resolveType(type, true)) {
     throw domException('MediaRecorder: mimeType "' + type + '" is not supported', 'NotSupportedError');
   }
 
@@ -90,8 +114,18 @@ function MediaRecorder(stream, options) {
   this._constrainedMimeType = type;
   this.mimeType = type;
   this.state = 'inactive';
-  this.videoBitsPerSecond = options.videoBitsPerSecond || options.bitsPerSecond || 2000000;
-  this.audioBitsPerSecond = options.audioBitsPerSecond || 128000;
+  // W3C: the given values, else the UA's; a bitsPerSecond overrides both,
+  // shared out ("such that the sum of videoBitsPerSecond and
+  // audioBitsPerSecond is close to" it). It went to the video only, the
+  // audio's 128 kb/s added on top.
+  this._constrainedBitsPerSecond = options.bitsPerSecond !== undefined ? _ulong(options.bitsPerSecond) : null;
+  this.videoBitsPerSecond = options.videoBitsPerSecond !== undefined ? _ulong(options.videoBitsPerSecond) : DEFAULT_VIDEO_BPS;
+  this.audioBitsPerSecond = options.audioBitsPerSecond !== undefined ? _ulong(options.audioBitsPerSecond) : DEFAULT_AUDIO_BPS;
+  if (this._constrainedBitsPerSecond !== null) this._splitBitrate(true, true);
+  // W3C: "variable" unless the recorder supports the one asked (both are).
+  this.audioBitrateMode = options.audioBitrateMode === 'constant' ? 'constant' : 'variable';
+  this._keyFrameIntervalDuration = options.videoKeyFrameIntervalDuration !== undefined ? Number(options.videoKeyFrameIntervalDuration) : null;
+  this._keyFrameIntervalCount = options.videoKeyFrameIntervalCount !== undefined ? _ulong(options.videoKeyFrameIntervalCount) : null;
   this.outputFile = options.outputFile || null;
 
   this._reset();
@@ -113,8 +147,16 @@ MediaRecorder.prototype._reset = function () {
   this._file = null;          // fs.WriteStream (muxer mode)
   this._mode = null;          // 'pipe' | 'muxer'
   this._plan = null;          // { muxer, video, audio, mime }
-  this._timeslice = 0;
+  this._timeslice = 0;          // 0: none
   this._timesliceTimer = null;
+  this._sliceGathered = 0;      // ms of data gathered into the current Blob (recording time)
+  this._sliceSince = -1;        // when the current stretch of recording began (-1: not recording)
+  this._sliceDue = false;       // timeslice reached with nothing gathered: cut at the next data
+  this._ending = false;         // the recording is ending by itself (tracks, a failure)
+  this._pausedAt = -1;
+  this._offsetUs = 0;           // paused time taken out of the timestamps (muxer mode)
+  this._framesSinceKey = 0;
+  this._lastKeyTs = null;
   this._chunks = [];
   this._chunksStartMs = 0;    // when the first chunk of the current blob arrived
   this._firstChunkMs = -1;    // when the first chunk of the recording arrived (timecode 0)
@@ -151,6 +193,18 @@ MediaRecorder.prototype._queue = function (type, data) {
   setImmediate(function () { self._dispatch(type, data); });
 };
 
+// Bitrates for the kinds recorded, from [[ConstrainedBitsPerSecond]]:
+// audio a tenth (at most 128 kb/s) when both are, all of it to the one
+// kind otherwise (audio at most 510 kb/s, Opus' ceiling).
+MediaRecorder.prototype._splitBitrate = function (video, audio) {
+  var bps = this._constrainedBitsPerSecond;
+  if (video && !audio) { this.videoBitsPerSecond = bps; this.audioBitsPerSecond = 0; return; }
+  if (audio && !video) { this.videoBitsPerSecond = 0; this.audioBitsPerSecond = Math.min(bps, 510000); return; }
+  var a = Math.min(Math.floor(bps / 10), 128000);
+  this.videoBitsPerSecond = bps - a;
+  this.audioBitsPerSecond = a;
+};
+
 // ── start ──
 
 /**
@@ -164,19 +218,32 @@ MediaRecorder.prototype.start = function (timeslice) {
   if (this.stream.active === false) {
     throw domException('MediaRecorder: the stream is inactive', 'NotSupportedError');
   }
+  if (this._keyFrameIntervalDuration !== null && this._keyFrameIntervalCount !== null) {
+    throw domException('MediaRecorder: videoKeyFrameIntervalDuration and videoKeyFrameIntervalCount cannot both be given', 'NotSupportedError');
+  }
 
   var videoTracks = _live(this.stream.getVideoTracks());
   var audioTracks = _live(this.stream.getAudioTracks());
+  // W3C: "For each track in tracks, if the User Agent cannot record the
+  // track using the current configuration, then throw a NotSupportedError".
+  // A track the type could not hold was left out ('audio/webm' recorded
+  // the audio of a video stream), and one the codecs list did not name
+  // ('video/webm;codecs=vp9' with audio) was dropped.
   var plan = _plan(this._constrainedMimeType, videoTracks.length > 0, audioTracks.length > 0);
   if (!plan) {
-    throw domException('MediaRecorder: nothing in this stream can be recorded as "' +
+    throw domException('MediaRecorder: this stream cannot be recorded as "' +
       (this._constrainedMimeType || 'default') + '"', 'NotSupportedError');
   }
 
   this._reset();
   this._plan = plan;
-  this._timeslice = (timeslice && timeslice > 0) ? timeslice : 0;
+  if (this._constrainedBitsPerSecond !== null) this._splitBitrate(!!plan.video, !!plan.audio);
+  // WebIDL `optional unsigned long`: undefined is no timeslice; 0 (or
+  // what converts to it) is a timeslice too — the UA's minimum. It was
+  // taken as none, and a negative value as none instead of 2^32 - n.
+  this._timeslice = timeslice === undefined ? 0 : Math.max(_ulong(timeslice), MIN_TIMESLICE_MS);
   this.state = 'recording';
+  this._sliceSince = _nowMs();
 
   var vTrack = plan.video ? videoTracks[0] : null;
   var aTrack = plan.audio ? audioTracks[0] : null;
@@ -194,13 +261,38 @@ MediaRecorder.prototype.start = function (timeslice) {
     self._dispatch('start', {});
   });
 
-  if (this._timeslice) {
-    this._timesliceTimer = setInterval(function () {
-      // Only once data has been collected (spec: "once a minimum of
-      // timeslice milliseconds of data have been collected").
-      if (self._chunks.length) self._queueData();
-    }, this._timeslice);
-  }
+  this._scheduleSlice();
+};
+
+// ── timeslice ──
+//
+// W3C: "once a minimum of timeslice milliseconds of data have been
+// collected … start gathering data into a new Blob blob, and queue a task
+// … that fires … dataavailable". A setInterval of wall time counted the
+// paused time as data: 200 ms recorded, 800 ms paused, and a 1000 ms
+// slice came out with 200 ms in it (while paused). The time gathered is
+// recording time; the timer runs only while recording.
+
+MediaRecorder.prototype._scheduleSlice = function () {
+  if (this._timesliceTimer) { clearTimeout(this._timesliceTimer); this._timesliceTimer = null; }
+  if (!this._timeslice || this.state !== 'recording' || this._ending) return;
+  var gathered = this._sliceGathered + (this._sliceSince >= 0 ? _nowMs() - this._sliceSince : 0);
+  var self = this;
+  this._timesliceTimer = setTimeout(function () {
+    self._timesliceTimer = null;
+    if (self.state !== 'recording' || self._ending) return;
+    // Nothing gathered yet: the Blob is cut with the next data.
+    if (self._chunks.length) self._cutBlob(); else self._sliceDue = true;
+  }, Math.max(0, this._timeslice - gathered));
+};
+
+// A new Blob: the current one goes out (dataavailable), the slice restarts.
+MediaRecorder.prototype._cutBlob = function () {
+  this._queueData();
+  this._sliceGathered = 0;
+  this._sliceDue = false;
+  this._sliceSince = this.state === 'recording' ? _nowMs() : -1;
+  this._scheduleSlice();
 };
 
 // ── Muxer mode: VideoEncoder + AudioEncoder → Muxer → Blob (+ file) ──
@@ -272,15 +364,26 @@ MediaRecorder.prototype._wireTracks = function (vTrack, aTrack) {
   // track.stop() the recorder stayed 'recording' with FFmpeg running.
   // '_stopped' fires on any end of the track (its own stop() fires no
   // 'ended'); 'ended' covers a track without the internal event.
+  // The recorder stays in its state until the task that ends it (W3C:
+  // "stop gathering data, and queue a task … Inactivate the recorder"); it
+  // went inactive at once.
   var onEnded = function () {
     for (var i = 0; i < self._recorded.length; i++) {
       if (self._recorded[i].readyState !== 'ended') return;
     }
-    if (self.state !== 'inactive') self.stop();
+    self._end(null);
   };
   for (var i = 0; i < this._recorded.length; i++) {
     var t = this._recorded[i];
     on(t, t._source ? '_stopped' : 'ended', onEnded);
+  }
+  // W3C: "If at any point, a track is added to or removed from stream's
+  // track set, the UA MUST stop gathering data, and queue a task … Fire an
+  // error event named InvalidModificationError". Not watched at all.
+  if (typeof this.stream.on === 'function') {
+    on(this.stream, '_trackset', function () {
+      self._end(domException("MediaRecorder: the stream's track set changed", 'InvalidModificationError'));
+    });
   }
 };
 
@@ -312,13 +415,17 @@ MediaRecorder.prototype._onMedia = function (kind, item) {
   }
 
   if (this._mode === 'muxer') {
+    // The encoders keep the timestamps: the paused time is taken out of
+    // them (the pipe mode's FFmpeg times by count, so it has no gap).
+    var it = this._offsetUs ? _retimed(kind, item, item.timestamp - this._offsetUs) : item;
     if (kind === 'video') {
       if (this._videoEncoder.state === 'unconfigured') this._configureVideoEncoder();
-      this._videoEncoder.encode(item);
+      this._videoEncoder.encode(it, { keyFrame: this._wantKey(it.timestamp) });
     } else {
       if (this._audioEncoder.state === 'unconfigured') this._configureAudioEncoder();
-      this._audioEncoder.encode(item);
+      this._audioEncoder.encode(it);
     }
+    if (it !== item) it.close();
     return;
   }
 
@@ -332,6 +439,18 @@ MediaRecorder.prototype._onMedia = function (kind, item) {
   this._write(kind, item);
 };
 
+// videoKeyFrameIntervalDuration / Count (W3C start(): "the video encoder
+// produces a keyframe on the first frame arriving after …"). Muxer mode;
+// the pipe mode's FFmpeg picks its own.
+MediaRecorder.prototype._wantKey = function (ts) {
+  var d = this._keyFrameIntervalDuration, n = this._keyFrameIntervalCount;
+  if (d === null && n === null) return false;
+  var key = this._lastKeyTs === null ||
+    (d !== null ? ts - this._lastKeyTs >= d * 1000 : this._framesSinceKey >= n);
+  if (key) { this._lastKeyTs = ts; this._framesSinceKey = 1; } else { this._framesSinceKey++; }
+  return key;
+};
+
 MediaRecorder.prototype._configureVideoEncoder = function () {
   var vs = _settings(this._recorded, 'video');
   this._videoEncoder.configure({
@@ -339,7 +458,7 @@ MediaRecorder.prototype._configureVideoEncoder = function () {
     width: this._firstVideo.width,
     height: this._firstVideo.height,
     framerate: vs.frameRate || 30,
-    bitrate: this.videoBitsPerSecond,
+    bitrate: this.videoBitsPerSecond || undefined,
     latencyMode: 'realtime',
   });
 };
@@ -349,7 +468,8 @@ MediaRecorder.prototype._configureAudioEncoder = function () {
     codec: this._plan.audio,
     sampleRate: this._firstAudio.sampleRate,
     numberOfChannels: this._firstAudio.numberOfChannels,
-    bitrate: this.audioBitsPerSecond,
+    bitrate: this.audioBitsPerSecond || undefined,
+    bitrateMode: this.audioBitrateMode,
   });
 };
 
@@ -418,18 +538,23 @@ MediaRecorder.prototype._onData = function (data) {
   this._chunks.push(bytes);
   this._bytesWritten += bytes.length;
   if (this._file) this._file.write(bytes);
+  if (this._sliceDue) this._cutBlob();
 };
 
 // Queue a dataavailable with everything collected since the last one.
 // The Blob is cut now (spec: "start a new Blob"), dispatched in a task.
 MediaRecorder.prototype._queueData = function () {
+  this._queue('dataavailable', this._blobEvent());
+};
+
+MediaRecorder.prototype._blobEvent = function () {
   var parts = this._chunks;
   var timecode = parts.length && this._firstChunkMs >= 0 ? this._chunksStartMs - this._firstChunkMs : 0;
   this._chunks = [];
   // W3C: data is a Blob of type mimeType, never null. It was a
   // Uint8Array (and null in muxer mode).
   var blob = new Blob(parts, { type: this._plan ? this._plan.mime : this.mimeType });
-  this._queue('dataavailable', { data: blob, timecode: timecode, bytesWritten: this._bytesWritten });
+  return { data: blob, timecode: timecode, bytesWritten: this._bytesWritten };
 };
 
 // ── stop / pause / resume / requestData ──
@@ -439,7 +564,11 @@ MediaRecorder.prototype._queueData = function () {
  */
 MediaRecorder.prototype.stop = function () {
   if (this.state === 'inactive') return;
+  var ending = this._ending;
   this._inactivate();
+  if (ending) return;            // ending by itself already: that sequence fires
+  this._ending = true;
+  this._detachTracks();
   var self = this;
   this._flushEncoders(function () { self._finish(null); });
 };
@@ -448,6 +577,10 @@ MediaRecorder.prototype.pause = function () {
   if (this.state === 'inactive') throw domException('MediaRecorder: not recording', 'InvalidStateError');
   if (this.state === 'paused') return;
   this.state = 'paused';
+  var now = _nowMs();
+  if (this._sliceSince >= 0) { this._sliceGathered += now - this._sliceSince; this._sliceSince = -1; }
+  this._pausedAt = now;
+  if (this._timesliceTimer) { clearTimeout(this._timesliceTimer); this._timesliceTimer = null; }
   this._queue('pause', {});
 };
 
@@ -455,7 +588,11 @@ MediaRecorder.prototype.resume = function () {
   if (this.state === 'inactive') throw domException('MediaRecorder: not recording', 'InvalidStateError');
   if (this.state === 'recording') return;
   this.state = 'recording';
+  var now = _nowMs();
+  if (this._pausedAt >= 0) { this._offsetUs += Math.round((now - this._pausedAt) * 1000); this._pausedAt = -1; }
+  if (!this._ending) this._sliceSince = now;
   this._queue('resume', {});
+  this._scheduleSlice();
 };
 
 /**
@@ -464,7 +601,9 @@ MediaRecorder.prototype.resume = function () {
  */
 MediaRecorder.prototype.requestData = function () {
   if (this.state === 'inactive') throw domException('MediaRecorder: not recording', 'InvalidStateError');
-  this._queueData();
+  // "Create a new Blob and gather subsequent data into it": the slice
+  // starts again.
+  this._cutBlob();
 };
 
 // W3C "inactivate the recorder": state inactive, mimeType back to the
@@ -472,11 +611,24 @@ MediaRecorder.prototype.requestData = function () {
 MediaRecorder.prototype._inactivate = function () {
   this.state = 'inactive';
   this.mimeType = this._constrainedMimeType;
-  this._detachTracks();
+  if (this._constrainedBitsPerSecond !== null) this._splitBitrate(true, true);
+  this._sliceSince = -1;
   if (this._timesliceTimer) {
-    clearInterval(this._timesliceTimer);
+    clearTimeout(this._timesliceTimer);
     this._timesliceTimer = null;
   }
+};
+
+// The recording ends by itself (err null: its tracks ended; a DOMException:
+// the track set changed): stop gathering now, write what was gathered,
+// then one task: inactivate, error, dataavailable, stop.
+MediaRecorder.prototype._end = function (err) {
+  if (this._ending || this._finished || this.state === 'inactive') return;
+  this._ending = true;
+  this._detachTracks();
+  if (this._timesliceTimer) { clearTimeout(this._timesliceTimer); this._timesliceTimer = null; }
+  var self = this;
+  this._flushEncoders(function () { self._finish(err); });
 };
 
 MediaRecorder.prototype._flushEncoders = function (done) {
@@ -516,13 +668,22 @@ MediaRecorder.prototype._closeFile = function (done) {
 
 // The end of a recording, normal (err null) or failed: error (if any),
 // dataavailable with the rest, stop — each in its own task, once.
+// One task (W3C: "queue a task … that runs the following steps:
+// Inactivate the recorder … Fire an error event … Fire a blob event named
+// dataavailable … Fire an event named stop"): the recorder becomes
+// inactive in that task when it ended by itself.
 MediaRecorder.prototype._finish = function (err) {
   if (this._finished) return;
   this._finished = true;
-  if (err) this._queue('error', { error: _asDomError(err) });
-  this._queueData();
+  var data = this._blobEvent();
   this._cleanup();
-  this._queue('stop', {});
+  var self = this;
+  setImmediate(function () {
+    if (self.state !== 'inactive') self._inactivate();
+    if (err) self._dispatch('error', { error: _asDomError(err) });
+    self._dispatch('dataavailable', data);
+    self._dispatch('stop', {});
+  });
 };
 
 // A failure while recording: FFmpeg exited, an encoder failed, a frame
@@ -532,13 +693,16 @@ MediaRecorder.prototype._fail = function (e) {
   if (this._failed || this._finished) return;
   this._failed = true;
   var self = this;
-  if (this.state === 'inactive') {
+  if (this.state === 'inactive' || this._ending) {
     // Already stopping: the error goes out ahead of the dataavailable
     // and stop that the stop sequence queues.
     this._queue('error', { error: _asDomError(e) });
     return;
   }
-  this._inactivate();
+  // Stop gathering; the recorder becomes inactive in _finish's task.
+  this._ending = true;
+  this._detachTracks();
+  if (this._timesliceTimer) { clearTimeout(this._timesliceTimer); this._timesliceTimer = null; }
   // Keep whatever the process still delivers before it is gone.
   setImmediate(function () { self._closeFile(function () { self._finish(e); }); });
 };
@@ -566,7 +730,11 @@ MediaRecorder.prototype._cleanup = function () {
 MediaRecorder.isTypeSupported = function (mimeType) {
   var s = String(mimeType === undefined ? '' : mimeType);
   if (s === '') return true;
-  return !!_resolveType(s);
+  // W3C "is type supported" with deferNewerCodecsCheck false: a codec
+  // identifier that is not synchronously exposed makes it false
+  // ('video/mp4;codecs=avc1,mp4a.40.2', 'video/webm;codecs=vp09.00.10.08'
+  // were true; Chrome says false too).
+  return !!_resolveType(s, false);
 };
 
 // ── Helpers ──
@@ -609,48 +777,69 @@ function _parseMime(str) {
 }
 
 // The container and codecs a type names, or null when unsupported:
-// { type, container, video, audio, explicit } (codecs null = not named).
-function _resolveType(str) {
+// { type, container, video, audio, videoString, audioString, explicit,
+// unknown } (codecs null = not named). mediacapture-record's "is type
+// supported": a synchronously exposed identifier (the part before the
+// first '.') must fit the container; another one makes the answer
+// `defer` (the constructor's true: start() decides — `unknown` when this
+// recorder does not know it at all).
+function _resolveType(str, defer) {
   var m = _parseMime(str);
   if (!m) return null;
   var c = CONTAINERS[m.type];
   if (!c) return null;
-  var out = { type: m.type, container: c, video: null, audio: null, explicit: false };
+  var out = { type: m.type, container: c, video: null, audio: null, videoString: null, audioString: null,
+              explicit: false, unknown: false };
   if (m.params.codecs === undefined) return out;
   out.explicit = true;
   var list = m.params.codecs.split(',');
   for (var i = 0; i < list.length; i++) {
-    var id = list[i].trim().toLowerCase();
+    var raw = list[i].trim();
+    var id = raw.toLowerCase();
     if (!id) return null;
-    var name = parseCodecString(id);
-    if (name && c.video.indexOf(name) >= 0) {
+    var identifier = id.split('.')[0];
+    var isExposed = Object.prototype.hasOwnProperty.call(EXPOSED, identifier);
+    var name;
+    if (isExposed) name = EXPOSED[identifier];
+    else if (!defer) return null;
+    else name = parseCodecString(id);
+    if (!name) { out.unknown = true; continue; }
+    if (c.video.indexOf(name) >= 0) {
       if (out.video) return null;              // more than one video codec
-      out.video = name;
-    } else if (name && c.audio.indexOf(name) >= 0) {
+      out.video = name; out.videoString = raw;
+    } else if (c.audio.indexOf(name) >= 0) {
       if (out.audio) return null;              // more than one audio codec
-      out.audio = name;
-    } else {
+      out.audio = name; out.audioString = raw;
+    } else if (isExposed) {
       return null;
+    } else {
+      out.unknown = true;
     }
   }
   return out;
 }
 
 // What start() records: the type (given, or the default for the
-// stream's tracks), its codecs, and the reported mimeType.
+// stream's tracks), its codecs, and the reported mimeType. The kinds the
+// stream has and the codecs list did not name get the container's
+// defaults (W3C: "If the container and codecs to use for the recording
+// have not yet been fully specified, the User Agent specifies them"; the
+// extendedMimeType names them); a kind the container cannot hold: null.
 function _plan(constrained, hasVideo, hasAudio) {
-  var r = constrained ? _resolveType(constrained)
-    : _resolveType(hasVideo ? 'video/webm' : 'audio/webm');
-  if (!r) return null;
+  var r = constrained ? _resolveType(constrained, true)
+    : _resolveType(hasVideo ? 'video/webm' : 'audio/webm', true);
+  if (!r || r.unknown) return null;
   var c = r.container;
-  var video = hasVideo ? (r.explicit ? r.video : (c.defaults.video || null)) : null;
-  var audio = hasAudio ? (r.explicit ? r.audio : (c.defaults.audio || null)) : null;
+  var video = hasVideo ? (r.video || c.defaults.video || null) : null;
+  var audio = hasAudio ? (r.audio || c.defaults.audio || null) : null;
+  if ((hasVideo && !video) || (hasAudio && !audio)) return null;
   if (!video && !audio) return null;
+  var completed = (hasVideo && !r.video) || (hasAudio && !r.audio);
   var mime = constrained;
-  if (!r.explicit) {
+  if (!r.explicit || completed) {
     var names = [];
-    if (video) names.push(MIME_CODEC_NAME[video] || video);
-    if (audio) names.push(MIME_CODEC_NAME[audio] || audio);
+    if (video) names.push(r.video ? r.videoString : (MIME_CODEC_NAME[video] || video));
+    if (audio) names.push(r.audio ? r.audioString : (MIME_CODEC_NAME[audio] || audio));
     mime = r.type + ';codecs=' + names.join(',');
   }
   return { muxer: c.muxer, video: video, audio: audio, mime: mime };
@@ -671,6 +860,31 @@ function _streamingArgs(muxer, sliceMs) {
     return ['-page_duration', String(Math.round(Math.min(sliceMs, 1000) * 1000))];
   }
   return [];
+}
+
+// WebIDL unsigned long (no [EnforceRange]): ToNumber, NaN / ±Infinity → 0,
+// truncated, modulo 2^32.
+function _ulong(v) {
+  var n = Number(v);
+  if (!isFinite(n)) return 0;
+  n = Math.trunc(n) % 4294967296;
+  return n < 0 ? n + 4294967296 : n;
+}
+
+// A VideoFrame / AudioData at another timestamp (theirs are read-only).
+function _retimed(kind, item, ts) {
+  if (kind === 'video') return new VideoFrame(item, { timestamp: ts });
+  var planes = item.format && item.format.indexOf('planar') >= 0 ? item.numberOfChannels : 1;
+  var size = 0, parts = [];
+  for (var p = 0; p < planes; p++) {
+    var b = new Uint8Array(item.allocationSize({ planeIndex: p }));
+    item.copyTo(b, { planeIndex: p });
+    parts.push(b); size += b.length;
+  }
+  var data = new Uint8Array(size), off = 0;
+  for (var q = 0; q < parts.length; q++) { data.set(parts[q], off); off += parts[q].length; }
+  return new AudioData({ format: item.format, sampleRate: item.sampleRate, numberOfFrames: item.numberOfFrames,
+                         numberOfChannels: item.numberOfChannels, timestamp: ts, data: data });
 }
 
 function _live(tracks) {

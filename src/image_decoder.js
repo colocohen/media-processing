@@ -10,7 +10,11 @@
  *   dec.close();
  *
  * Supports JPEG, PNG (incl. APNG), WebP (incl. animated), GIF, BMP, AVIF.
- * Frames are I420 VideoFrames at the image's true size (odd sizes too).
+ * Frames are I420 VideoFrames at the image's true size (odd sizes too),
+ * BT.601 limited range and tagged so; AVIF in its own format and colour
+ * space; the EXIF orientation as the frame's rotation / flip. A
+ * ReadableStream's GIF is decoded as it arrives (other types once the
+ * stream ends).
  *
  * What this replaced (a sync, browser-incompatible subset):
  *   - decode() returned { image, complete } synchronously and handed out
@@ -40,7 +44,7 @@ import os from 'node:os';
 import path from 'node:path';
 import VideoFrame from './video_frame.js';
 import { frameByteSize } from './core/frame_size.js';
-import { isBufferSource } from './core/buffer_source.js';
+import { isBufferSource, toUint8Array } from './core/buffer_source.js';
 import { takeBufferSource } from './core/take_buffer.js';
 import { domException } from './core/dom_exception.js';
 
@@ -161,9 +165,14 @@ function ImageDecoder(init) {
   }
   this._desired = null;
   if (init.desiredWidth !== undefined) {
-    var dw = Math.floor(Number(init.desiredWidth)), dh = Math.floor(Number(init.desiredHeight));
-    if (!(dw > 0) || !(dh > 0)) throw new TypeError('ImageDecoder: desiredWidth/desiredHeight must be positive');
-    this._desired = { width: dw, height: dh };
+    // [EnforceRange] unsigned long: 0 is a valid value (Chrome decodes at
+    // the image's size then); a negative / non-finite one a TypeError.
+    var dw = Number(init.desiredWidth), dh = Number(init.desiredHeight);
+    if (!Number.isFinite(dw) || !Number.isFinite(dh) || dw < 0 || dh < 0 || dw > 0xffffffff || dh > 0xffffffff) {
+      throw new TypeError('ImageDecoder: desiredWidth/desiredHeight must be unsigned longs');
+    }
+    dw = Math.trunc(dw); dh = Math.trunc(dh);
+    if (dw > 0 && dh > 0) this._desired = { width: dw, height: dh };
   }
 
   this._type = init.type;
@@ -177,23 +186,28 @@ function ImageDecoder(init) {
   this._framesPromise = null; // Promise<VideoFrame[]> (cached decode)
   this._frames = null;
   this._pending = [];         // decode() deferreds, for reset()/close()
+  this._chain = Promise.resolve();   // decode requests, one after another
+  this._waiters = [];         // decodes waiting for more stream data
+  this._probing = false;
+  this._essence = _mimeEssence(init.type);
 
   var self = this;
-  var dataReady;
+  var stream = null;
   if (_isReadableStream(init.data)) {
-    dataReady = this._readStream(init.data);
+    stream = init.data;
   } else if (isBufferSource(init.data)) {
+    // Empty data is a TypeError before anything is detached (the transfer
+    // happens with the copy, last).
+    if (toUint8Array(init.data).length === 0) throw new TypeError('ImageDecoder: data is empty');
     var bytes = takeBufferSource('ImageDecoder: data', init.data, init.transfer);
-    if (bytes.length === 0) throw new TypeError('ImageDecoder: data is empty');
     this._data = bytes;
     this._complete = true;
     _settle(this._completed, true, undefined);
-    dataReady = Promise.resolve();
   } else {
     throw new TypeError('ImageDecoder: data must be a BufferSource or ReadableStream');
   }
 
-  var entry = SUPPORTED[_mimeEssence(init.type)];
+  var entry = SUPPORTED[this._essence];
   if (!entry) {
     // Spec: not a constructor throw — the decoder closes itself with
     // NotSupportedError (tracks.ready / decode() reject with it).
@@ -202,17 +216,12 @@ function ImageDecoder(init) {
     });
     return;
   }
+  this._entry = entry;
 
-  dataReady.then(function () {
-    if (self._closed) return null;
-    return self._probe(entry);
-  }).then(function (info) {
-    if (self._closed || !info) return;
-    self._info = info;
-    self._tracks._establish(info);
-  }, function (err) {
-    self._fatal(err);
-  });
+  // W3C Fetch Stream Data Loop: the tracks are established, and frames
+  // decoded, as the data comes (Establish Tracks / Update Tracks).
+  if (stream) this._readStream(stream);
+  else queueMicrotask(function () { self._onData(); });
 }
 
 Object.defineProperty(ImageDecoder.prototype, 'type', { get: function () { return this._type; }, enumerable: true });
@@ -249,27 +258,34 @@ ImageDecoder.prototype.decode = function (options) {
     _settle(d, ok, v);
   };
 
-  this._tracks.ready.then(function () {
-    if (d.settled) return null;
-    if (self._closed) throw domException('ImageDecoder: decoder is closed', 'InvalidStateError');
-    if (self._tracks.selectedIndex === -1) {
-      throw domException('ImageDecoder: no track selected', 'InvalidStateError');
-    }
-    if (idx >= self._info.frameCount) {
-      throw new RangeError('ImageDecoder: frameIndex ' + idx + ' out of range (0-' + (self._info.frameCount - 1) + ')');
-    }
-    return self._decodeFrames();
-  }).then(function (frames) {
-    if (d.settled || !frames) return;
-    if (self._closed) throw domException('ImageDecoder: decoder is closed', 'InvalidStateError');
-    if (idx >= frames.length) {
-      throw new RangeError('ImageDecoder: frameIndex ' + idx + ' out of range (0-' + (frames.length - 1) + ')');
-    }
-    // A clone: the caller closes it without touching our cached frame.
-    done(true, { image: frames[idx].clone(), complete: true });
-  }).catch(function (err) {
-    if (err && err.name === 'EncodingError') self._fatal(err);
-    done(false, err);
+  var run = function () {
+    return self._tracks.ready.then(function () {
+      if (d.settled) return false;
+      if (self._closed) throw domException('ImageDecoder: decoder is closed', 'InvalidStateError');
+      if (self._tracks.selectedIndex === -1) {
+        throw domException('ImageDecoder: no track selected', 'InvalidStateError');
+      }
+      return self._whenFrame(idx, d);
+    }).then(function (ok) {
+      if (!ok || d.settled) return null;
+      return self._decodeFrames();
+    }).then(function (frames) {
+      if (d.settled || !frames) return;
+      if (self._closed) throw domException('ImageDecoder: decoder is closed', 'InvalidStateError');
+      if (idx >= frames.length) {
+        throw new RangeError('ImageDecoder: frameIndex ' + idx + ' out of range (0-' + (frames.length - 1) + ')');
+      }
+      // A clone: the caller closes it without touching our cached frame.
+      done(true, { image: frames[idx].clone(), complete: true });
+    }).catch(function (err) {
+      if (err && err.name === 'EncodingError') self._fatal(err);
+      done(false, err);
+    });
+  };
+  // W3C: decode requests are control messages, run one after another.
+  this._chain = this._chain.then(function () {
+    run();
+    return d.promise.then(function () {}, function () {});
   });
   return d.promise;
 };
@@ -307,6 +323,7 @@ ImageDecoder.prototype._fatal = function (err) {
   }
   this._frames = null;
   this._data = null;
+  this._wake();
 };
 
 ImageDecoder.prototype._readStream = function (stream) {
@@ -319,35 +336,117 @@ ImageDecoder.prototype._readStream = function (stream) {
       if (self._closed) return;
       if (r.done) {
         self._reader = null;
-        var all = Buffer.concat(chunks);
-        if (all.length === 0) throw domException('ImageDecoder: stream was empty', 'EncodingError');
-        self._data = all;
+        self._data = Buffer.concat(chunks);
         self._complete = true;
         _settle(self._completed, true, undefined);
+        self._onData();
         return;
       }
-      if (!isBufferSource(r.value)) {
-        throw domException('ImageDecoder: stream chunk is not a BufferSource', 'DataError');
+      // W3C Fetch Stream Data Loop: a chunk that is not a Uint8Array closes
+      // the decoder with a DataError.
+      if (!(r.value instanceof Uint8Array)) {
+        self._fatal(domException('ImageDecoder: stream chunk is not a Uint8Array', 'DataError'));
+        return;
       }
-      var v = r.value instanceof ArrayBuffer ? new Uint8Array(r.value)
-        : new Uint8Array(r.value.buffer, r.value.byteOffset, r.value.byteLength);
-      chunks.push(Buffer.from(v));   // copy: the producer may reuse its buffer
+      chunks.push(Buffer.from(r.value));   // copy: the producer may reuse its buffer
+      self._data = Buffer.concat(chunks);
+      self._onData();
       return pump();
     }, function (err) {
-      throw domException('ImageDecoder: stream error: ' + (err && err.message || err), 'NotReadableError');
+      self._fatal(domException('ImageDecoder: stream error: ' + (err && err.message || err), 'NotReadableError'));
     });
   }
-  return pump();
+  pump();
+};
+
+/**
+ * New data (or its end): W3C Establish Tracks / Update Tracks. The tracks
+ * come once the header is in: a GIF's at once, its frames counted as
+ * they arrive (a frame decodes once its data is whole); other types'
+ * once the data is complete (FFmpeg probes them whole). Without enough
+ * data for the header once it is complete: InvalidStateError.
+ */
+ImageDecoder.prototype._onData = function () {
+  var self = this;
+  if (this._closed || this._probing) return;
+  var data = this._data || Buffer.alloc(0);
+  if (!this._info) {
+    var hdr = _sniffHeader(data, this._essence);
+    if (!hdr) {
+      if (this._complete) this._fatal(domException('ImageDecoder: cannot read the image header', 'InvalidStateError'));
+      return;
+    }
+    if (!this._complete && this._essence !== 'image/gif') return;
+    this._probing = true;
+    var p = this._complete ? this._probe(this._entry, hdr) : Promise.resolve(_gifStreamInfo(data, false));
+    p.then(function (info) {
+      self._probing = false;
+      if (self._closed || !info) return;
+      self._info = info;
+      self._tracks._establish(info);
+      self._onData();   // what came in the meantime
+    }, function (err) {
+      self._probing = false;
+      self._fatal(err);
+    });
+    return;
+  }
+  if (this._info.kind === 'gif-stream') {
+    var next = _gifStreamInfo(data, this._complete);
+    if (next) {
+      this._info = next;
+      var t = this._tracks._tracks[0];
+      if (t) { t.frameCount = next.frameCount; t.animated = next.animated; t.repetitionCount = next.repetitionCount; }
+    }
+  }
+  this._wake();
+};
+
+/** Re-check the decodes waiting for data. */
+ImageDecoder.prototype._wake = function () {
+  var w = this._waiters;
+  this._waiters = [];
+  for (var i = 0; i < w.length; i++) w[i]();
+};
+
+/**
+ * Resolves true once frame `idx` can be decoded (W3C Decode Complete
+ * Frame: wait for its data), rejects RangeError past the last frame of
+ * complete data; false when the request was settled meanwhile.
+ */
+ImageDecoder.prototype._whenFrame = function (idx, d) {
+  var self = this;
+  return new Promise(function (resolve, reject) {
+    (function check() {
+      if (d.settled || self._closed) return resolve(false);
+      var n = self._info.frameCount;
+      if (idx < n) return resolve(true);
+      if (self._complete) {
+        return reject(new RangeError('ImageDecoder: frameIndex ' + idx + ' out of range (0-' + (n - 1) + ')'));
+      }
+      self._waiters.push(check);
+    })();
+  });
 };
 
 // ── Probe: frame count, timing, loop count ──
 
-ImageDecoder.prototype._probe = function (entry) {
+// A header that reads but data FFmpeg cannot decode: one track of one
+// frame, whose decode() is the EncodingError (W3C: the tracks come from
+// the header; Fatally Reject Bad Data when the frame is decoded). Was an
+// EncodingError of tracks.ready.
+function _broken(hdr, why) {
+  return { kind: 'broken', width: hdr.width, height: hdr.height, frameCount: 1, animated: false,
+    repetitionCount: 0, timing: [{ timestamp: 0, duration: null }], why: why };
+}
+
+ImageDecoder.prototype._probe = function (entry, hdr) {
   var data = this._data;
   var fmt = entry.fmt;
+  var essence = this._essence;
   if (fmt === 'webp_pipe' && _isAnimatedWebp(data)) {
     var anim = _parseAnimatedWebp(data);
-    if (!anim) return Promise.reject(domException('ImageDecoder: invalid animated WebP', 'EncodingError'));
+    if (!anim) return Promise.resolve(_broken(hdr, 'invalid animated WebP'));
     var t = 0;
     var timing = anim.frames.map(function (f) {
       var r = { timestamp: t * 1000, duration: f.duration * 1000 };
@@ -359,7 +458,7 @@ ImageDecoder.prototype._probe = function (entry) {
       frameCount: anim.frames.length, animated: anim.frames.length > 1,
       // WebP loop count = total plays (0 = forever); spec wants repeats.
       repetitionCount: anim.loopCount === 0 ? Infinity : anim.loopCount - 1,
-      timing: timing,
+      timing: timing, orientation: 1,
     });
   }
   var apng = fmt === 'png_pipe' ? _apngPlays(data) : null;
@@ -367,7 +466,7 @@ ImageDecoder.prototype._probe = function (entry) {
 
   return _runFfmpeg('ffprobe', ['-hide_banner', '-v', 'error'], fmt, data, [
     '-select_streams', 'v:0',
-    '-show_entries', 'stream=width,height:frame=best_effort_timestamp_time,duration_time',
+    '-show_entries', 'stream=width,height,pix_fmt,color_range,color_space,color_transfer,color_primaries:frame=best_effort_timestamp_time,duration_time',
     '-of', 'json',
   ]).then(function (res) {
     var j = null;
@@ -375,8 +474,7 @@ ImageDecoder.prototype._probe = function (entry) {
     var st = j && j.streams && j.streams[0];
     var frames = (j && j.frames) || [];
     if (res.code !== 0 || !st || !(st.width > 0) || !(st.height > 0) || frames.length === 0) {
-      throw domException('ImageDecoder: cannot decode image' +
-        (res.stderr ? ': ' + res.stderr.trim().split('\n').pop() : ''), 'EncodingError');
+      return _broken(hdr, 'cannot decode image' + (res.stderr ? ': ' + res.stderr.trim().split('\n').pop() : ''));
     }
     var animated = frames.length > 1;
     var t0 = parseFloat(frames[0].best_effort_timestamp_time) || 0;
@@ -395,57 +493,96 @@ ImageDecoder.prototype._probe = function (entry) {
       // GIF NETSCAPE2.0 loop count = extra plays; 0 = forever.
       var loops = _gifLoopCount(data);
       rep = loops === null ? 0 : (loops === 0 ? Infinity : loops);
+      // The delays as the file has them (FFmpeg's gif demuxer turns a 0
+      // delay into 100 ms; Chrome reports 0): from our own block walk.
+      var g = _gifWalk(data);
+      if (g && g.frames.length === frames.length) timing = _gifTiming(g.frames, animated);
     } else if (fmt === 'apng') {
       rep = apng === 0 ? Infinity : apng - 1;   // num_plays = total plays
     }
-    return {
+    var info = {
       kind: 'ffmpeg', fmt: fmt, width: st.width, height: st.height,
       frameCount: frames.length, animated: animated,
       repetitionCount: animated ? rep : 0, timing: timing,
+      orientation: _exifOrientation(data, essence),
     };
+    // AVIF in its own format and colour space (W3C: the decoded image's;
+    // was always I420), as Chrome gives it; the rest as before, I420.
+    var own = essence === 'image/avif' && AVIF_FORMATS[st.pix_fmt];
+    if (own) { info.pixFmt = st.pix_fmt; info.format = own; info.colorSpace = _avifColorSpace(data, st); }
+    // an AVIF's 'irot' (quarter turns anticlockwise): the frame's rotation
+    if (essence === 'image/avif') info.turn = _avifTurn(data);
+    return info;
   });
 };
 
-// ── Decode all frames once (cached), as I420 VideoFrames ──
+// ── Decode all frames once (cached per data length), as I420 VideoFrames (AVIF: its own format) ──
 
 ImageDecoder.prototype._decodeFrames = function () {
-  if (this._framesPromise) return this._framesPromise;
   var self = this;
   var info = this._info;
+  if (info.kind === 'broken') {
+    return Promise.reject(domException('ImageDecoder: ' + info.why, 'EncodingError'));
+  }
   var w = this._desired ? this._desired.width : info.width;
   var h = this._desired ? this._desired.height : info.height;
-  var scale = this._desired ? ['-vf', 'scale=' + w + ':' + h] : [];
-  var out = ['-map', '0:v:0', '-fps_mode', 'passthrough'].concat(scale,
-    ['-pix_fmt', 'yuv420p', '-f', 'rawvideo', 'pipe:1']);
+  var format = info.format || 'I420';
+  // The frames are tagged with the colour space their bytes are in (they
+  // were tagged as the VideoFrame default, BT.709 limited, while FFmpeg
+  // writes BT.601, and a JPEG's yuvj420p full range, as is): FFmpeg is
+  // told to write BT.601 limited range, and the frames say so.
+  var cs = info.colorSpace || { primaries: 'bt709', transfer: 'iec61966-2-1', matrix: 'smpte170m', fullRange: false };
+  var vf = info.format ? (this._desired ? ['-vf', 'scale=' + w + ':' + h] : [])
+    : ['-vf', 'scale=' + (this._desired ? w + ':' + h + ':' : '') + 'out_color_matrix=bt601:out_range=tv'];
+  var out = ['-map', '0:v:0', '-fps_mode', 'passthrough'].concat(vf,
+    ['-pix_fmt', info.pixFmt || 'yuv420p', '-f', 'rawvideo', 'pipe:1']);
+  var rot = info.turn || ORIENTATION[info.orientation] || ORIENTATION[1];
 
   var run;
-  if (info.kind === 'webp-anim') {
+  var key = (this._data ? this._data.length : 0) + (this._complete ? 'c' : '');
+  if (this._framesPromise && this._framesKey === key) return this._framesPromise;
+  this._framesKey = key;
+  if (info.kind === 'gif-stream') {
+    // Data still coming: the frames whole so far, and a trailer.
+    var input = Buffer.concat([this._data.subarray(0, info.end), Buffer.from([0x3b])]);
+    run = _runFfmpeg('ffmpeg', ['-hide_banner', '-v', 'error'], 'gif', input, out);
+  } else if (info.kind === 'webp-anim') {
     run = _compositeAnimatedWebp(this._data, info.anim).then(function (rgba) {
       return _runFfmpeg('ffmpeg', ['-hide_banner', '-v', 'error'], 'rawvideo', rgba,
         out, ['-pix_fmt', 'rgba', '-s', info.width + 'x' + info.height]);
     });
   } else {
-    run = _runFfmpeg('ffmpeg', ['-hide_banner', '-v', 'error'], info.fmt, this._data, out);
+    // -noautorotate: FFmpeg turns an EXIF-oriented JPEG's pixels itself
+    // (its width and height swapped for 5-8), which were then cut as the
+    // unturned size (scrambled frames); the orientation is the frame's
+    // rotation / flip instead.
+    run = _runFfmpeg('ffmpeg', ['-hide_banner', '-v', 'error', '-noautorotate'], info.fmt, this._data, out);
   }
 
   this._framesPromise = run.then(function (res) {
     // Real size with ceil chroma: 101x75 → 7575 + 2*51*38 = 11451 bytes.
-    var size = frameByteSize('I420', w, h);
+    var size = frameByteSize(format, w, h);
     var n = Math.min(info.frameCount, Math.floor(res.stdout.length / size));
     if (res.code !== 0 || n === 0) {
       throw domException('ImageDecoder: FFmpeg decode failed' +
         (res.stderr ? ': ' + res.stderr.trim().split('\n').pop() : ''), 'EncodingError');
     }
     if (self._closed) return [];
+    if (self._frames) for (var k = 0; k < self._frames.length; k++) self._frames[k].close();
     var frames = [];
     for (var i = 0; i < n; i++) {
       var tm = info.timing[i] || { timestamp: 0, duration: null };
       var init = {
         data: res.stdout.subarray(i * size, (i + 1) * size),
-        format: 'I420',
+        format: format,
         codedWidth: w,
         codedHeight: h,
         timestamp: tm.timestamp,
+        colorSpace: cs,
+        // EXIF orientation (JPEG APP1, PNG eXIf): the frame's rotation /
+        // flip, W3C ImageDecoder output (was ignored).
+        rotation: rot[0],
+        flip: rot[1],
       };
       if (tm.duration !== null) init.duration = tm.duration;
       frames.push(new VideoFrame(init));
@@ -515,6 +652,206 @@ function _runFfmpeg(cmd, pre, fmt, input, post, inOpts) {
       child.stdin.end(input);
     }
   });
+}
+
+// ── Native header reading (what FFmpeg cannot say about partial data) ──
+
+/**
+ * The image's size from its header, or null when the header is not all
+ * there (or is not of this type): W3C Establish Tracks needs "enough data
+ * to determine the number of tracks"; without it once the data is
+ * complete, InvalidStateError.
+ */
+function _sniffHeader(d, essence) {
+  var b = Buffer.from(d.buffer, d.byteOffset, d.byteLength);
+  var n = b.length;
+  var ok = function (w, h) { return w > 0 && h > 0 ? { width: w, height: h } : null; };
+  switch (essence) {
+    case 'image/png': case 'image/apng':
+      if (n < 24 || b.readUInt32BE(0) !== 0x89504e47 || b.toString('latin1', 12, 16) !== 'IHDR') return null;
+      return ok(b.readUInt32BE(16), b.readUInt32BE(20));
+    case 'image/gif':
+      if (n < 13 || !/^GIF8[79]a$/.test(b.toString('latin1', 0, 6))) return null;
+      return ok(b.readUInt16LE(6), b.readUInt16LE(8));
+    case 'image/bmp':
+      if (n < 26 || b[0] !== 0x42 || b[1] !== 0x4d) return null;
+      return ok(Math.abs(b.readInt32LE(18)), Math.abs(b.readInt32LE(22)));
+    case 'image/jpeg': {
+      if (n < 4 || b[0] !== 0xff || b[1] !== 0xd8) return null;
+      var p = 2;
+      while (p + 4 <= n) {
+        if (b[p] !== 0xff) return null;
+        var m = b[p + 1];
+        if (m === 0xff) { p++; continue; }
+        if (m === 0xd8 || m === 0x01 || (m >= 0xd0 && m <= 0xd7)) { p += 2; continue; }
+        var len = b.readUInt16BE(p + 2);
+        if ((m >= 0xc0 && m <= 0xcf) && m !== 0xc4 && m !== 0xc8 && m !== 0xcc) {
+          return p + 9 <= n ? ok(b.readUInt16BE(p + 7), b.readUInt16BE(p + 5)) : null;
+        }
+        if (m === 0xda || m === 0xd9) return null;
+        p += 2 + len;
+      }
+      return null;
+    }
+    case 'image/webp': {
+      if (n < 30 || b.toString('latin1', 0, 4) !== 'RIFF' || b.toString('latin1', 8, 12) !== 'WEBP') return null;
+      var cc = b.toString('latin1', 12, 16);
+      if (cc === 'VP8X') return ok(1 + _u24(b, 24), 1 + _u24(b, 27));
+      if (cc === 'VP8L') { var v = b.readUInt32LE(21); return ok((v & 0x3fff) + 1, ((v >>> 14) & 0x3fff) + 1); }
+      if (cc === 'VP8 ') return ok(b.readUInt16LE(26) & 0x3fff, b.readUInt16LE(28) & 0x3fff);
+      return null;
+    }
+    case 'image/avif': {
+      if (n < 12 || b.toString('latin1', 4, 8) !== 'ftyp') return null;
+      var i = b.indexOf('ispe', 0, 'latin1');
+      return i > 0 && i + 16 <= n ? ok(b.readUInt32BE(i + 8), b.readUInt32BE(i + 12)) : null;
+    }
+  }
+  return null;
+}
+
+/**
+ * GIF blocks as far as they have come: the loop count, each frame whole
+ * so far (its graphic control extension's delay, null without one; where
+ * it ends), whether the trailer was read. Null when the header is not in
+ * or a block is unknown.
+ */
+function _gifWalk(d) {
+  var b = Buffer.from(d.buffer, d.byteOffset, d.byteLength);
+  if (b.length < 13 || !/^GIF8[79]a$/.test(b.toString('latin1', 0, 6))) return null;
+  var p = 13 + (b[10] & 0x80 ? 3 << ((b[10] & 7) + 1) : 0);
+  var res = { loops: null, frames: [], ended: false, end: p };
+  var delay = null;
+  function subBlocks(q) {
+    for (;;) { if (q >= b.length) return -1; var k = b[q]; q += 1 + k; if (k === 0) return q <= b.length ? q : -1; }
+  }
+  while (p < b.length) {
+    var t = b[p];
+    if (t === 0x3b) { res.ended = true; break; }
+    if (t === 0x00) { p++; continue; }
+    if (t === 0x21) {
+      if (p + 2 > b.length) break;
+      var e = subBlocks(p + 2);
+      if (e < 0) break;
+      if (b[p + 1] === 0xf9 && b[p + 2] === 4) delay = b.readUInt16LE(p + 4);
+      if (b[p + 1] === 0xff && b[p + 2] === 11 && p + 18 <= b.length &&
+          /^(NETSCAPE2\.0|ANIMEXTS1\.0)$/.test(b.toString('latin1', p + 3, p + 14)) && b[p + 14] === 3 && b[p + 15] === 1) {
+        res.loops = b.readUInt16LE(p + 16);
+      }
+      p = e;
+      continue;
+    }
+    if (t === 0x2c) {
+      if (p + 10 > b.length) break;
+      var q = p + 10 + (b[p + 9] & 0x80 ? 3 << ((b[p + 9] & 7) + 1) : 0) + 1;
+      var e2 = subBlocks(q);
+      if (e2 < 0) break;
+      res.frames.push({ delay: delay });
+      delay = null;
+      p = res.end = e2;
+      continue;
+    }
+    return res.frames.length ? res : null;
+  }
+  return res;
+}
+
+/** Times from GIF delays (centiseconds), as Chrome: a 0 delay is 0. */
+function _gifTiming(frames, animated) {
+  var t = 0;
+  return frames.map(function (f) {
+    var du = (f.delay || 0) * 10000;
+    var r = { timestamp: t, duration: animated ? du : null };
+    t += du;
+    return r;
+  });
+}
+
+/** The track of a GIF still arriving (or complete), from its blocks. */
+function _gifStreamInfo(d, complete) {
+  var g = _gifWalk(d);
+  if (!g) return null;
+  var n = g.frames.length;
+  var animated = n > 1 || (!complete && g.loops !== null);
+  var rep = g.loops === null ? 0 : (g.loops === 0 ? Infinity : g.loops);
+  return {
+    kind: 'gif-stream', fmt: 'gif', width: b16(d, 6), height: b16(d, 8), frameCount: n, animated: animated,
+    repetitionCount: animated ? rep : 0, timing: _gifTiming(g.frames, animated), end: g.end, orientation: 1,
+  };
+  function b16(x, o) { return x[o] | (x[o + 1] << 8); }
+}
+
+// EXIF orientation → [rotation, flip] (Chrome's: 5 and 7 are flips plus a
+// rotation; the image's frame keeps its coded size).
+var ORIENTATION = { 1: [0, false], 2: [0, true], 3: [180, false], 4: [180, true],
+  5: [90, true], 6: [90, false], 7: [270, true], 8: [270, false] };
+
+/** The TIFF orientation tag (IFD0 0x0112) of a JPEG's Exif APP1 or a PNG's eXIf; 1 without. */
+function _exifOrientation(d, essence) {
+  var b = Buffer.from(d.buffer, d.byteOffset, d.byteLength);
+  var tiff = null;
+  if (essence === 'image/jpeg') {
+    var p = 2;
+    while (p + 4 <= b.length && b[p] === 0xff) {
+      var m = b[p + 1];
+      if (m === 0xda || m === 0xd9) break;
+      var len = b.readUInt16BE(p + 2);
+      if (m === 0xe1 && b.toString('latin1', p + 4, p + 10) === 'Exif\0\0') { tiff = b.subarray(p + 10, p + 2 + len); break; }
+      p += 2 + len;
+    }
+  } else if (essence === 'image/png' || essence === 'image/apng') {
+    var q = 8;
+    while (q + 8 <= b.length) {
+      var l = b.readUInt32BE(q), type = b.toString('latin1', q + 4, q + 8);
+      if (type === 'eXIf') { tiff = b.subarray(q + 8, q + 8 + l); break; }
+      if (type === 'IDAT') break;
+      q += 12 + l;
+    }
+  }
+  if (!tiff || tiff.length < 8) return 1;
+  var le = tiff[0] === 0x49;
+  var u16 = function (o) { return o + 2 <= tiff.length ? (le ? tiff.readUInt16LE(o) : tiff.readUInt16BE(o)) : 0; };
+  var u32 = function (o) { return o + 4 <= tiff.length ? (le ? tiff.readUInt32LE(o) : tiff.readUInt32BE(o)) : 0; };
+  var ifd = u32(4), count = u16(ifd);
+  for (var i = 0; i < count; i++) {
+    var e = ifd + 2 + i * 12;
+    if (u16(e) === 0x0112) { var o = u16(e + 8); return o >= 1 && o <= 8 ? o : 1; }
+  }
+  return 1;
+}
+
+/** An AVIF's first 'irot' property as [rotation clockwise, flip], or null ('imir' is not read). */
+function _avifTurn(d) {
+  var b = Buffer.from(d.buffer, d.byteOffset, d.byteLength);
+  var i = b.indexOf('irot', 0, 'latin1');
+  if (i < 4 || i + 5 > b.length || b.readUInt32BE(i - 4) !== 9) return null;
+  return [(360 - 90 * (b[i + 4] & 3)) % 360, false];
+}
+
+// AVIF: FFmpeg's pix_fmt → the frame's own format.
+var AVIF_FORMATS = {
+  yuv420p: 'I420', yuv422p: 'I422', yuv444p: 'I444',
+  yuv420p10le: 'I420P10', yuv422p10le: 'I422P10', yuv444p10le: 'I444P10',
+  yuv420p12le: 'I420P12', yuv422p12le: 'I422P12', yuv444p12le: 'I444P12',
+};
+
+/**
+ * An AVIF's colour space: its nclx 'colr' box (FFmpeg reports only the
+ * range of an AVIF), CICP codes as W3C names.
+ */
+function _avifColorSpace(d, st) {
+  var b = Buffer.from(d.buffer, d.byteOffset, d.byteLength);
+  var P = { 1: 'bt709', 5: 'bt470bg', 6: 'smpte170m', 9: 'bt2020', 12: 'smpte432' };
+  var T = { 1: 'bt709', 6: 'smpte170m', 8: 'linear', 13: 'iec61966-2-1', 16: 'pq', 18: 'hlg' };
+  var M = { 0: 'rgb', 1: 'bt709', 5: 'bt470bg', 6: 'smpte170m', 9: 'bt2020-ncl' };
+  var range = st.color_range === 'pc' ? true : (st.color_range === 'tv' ? false : null);
+  var i = b.indexOf('colrnclx', 0, 'latin1');
+  // without one (or unspecified codes), Chrome's defaults: sRGB, BT.601
+  if (i < 0 || i + 15 > b.length) return { primaries: 'bt709', transfer: 'iec61966-2-1', matrix: 'smpte170m', fullRange: range };
+  return {
+    primaries: P[b.readUInt16BE(i + 8)] || 'bt709', transfer: T[b.readUInt16BE(i + 10)] || 'iec61966-2-1',
+    matrix: M[b.readUInt16BE(i + 12)] || 'smpte170m', fullRange: (b[i + 14] & 0x80) !== 0,
+  };
 }
 
 // ── Container peeking (loop counts, animation) ──

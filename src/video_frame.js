@@ -26,6 +26,7 @@
 import { rgbaToI420, rgb24ToI420, nv12ToI420, i420ToNv12 } from './pixel_utils.js';
 import VideoColorSpace from './video_color_space.js';
 import { isBufferSource as _isBufferSource, toUint8Array as _bufferSourceToBuffer } from './core/buffer_source.js';
+import { checkTransfer, detachAll } from './core/take_buffer.js';
 import { domException as _domex } from './core/dom_exception.js';
 import { planeSpecs, formatPlanes } from './core/frame_size.js';
 import { enforceRange } from './core/webidl.js';
@@ -235,7 +236,7 @@ function VideoFrame(source, init) {
         timestamp: _absent(init.timestamp) ? source.timestamp : init.timestamp };
       var dur = _absent(init.duration) ? source.duration : init.duration;
       if (dur !== null) bi.duration = dur;
-      ['visibleRect', 'rotation', 'flip', 'displayWidth', 'displayHeight', 'colorSpace'].forEach(function (k) {
+      ['visibleRect', 'rotation', 'flip', 'displayWidth', 'displayHeight', 'colorSpace', 'metadata'].forEach(function (k) {
         if (!_absent(init[k])) bi[k] = init[k];
       });
       return _fromBuffer(this, copy, bi);
@@ -301,6 +302,11 @@ function _fromBuffer(self, data, init) {
   // check and truncates to an empty visible region (and a 0 display size);
   // refused like a 0 one.
   if (vw === 0 || vh === 0) throw new TypeError('VideoFrame: rect has a zero width or height');
+  // W3C steps 3-4: init.transfer holds no buffer twice and none detached
+  // (DataCloneError); its buffers are detached once the frame is made (the
+  // last steps). `transfer` was ignored.
+  var transferList = checkTransfer('VideoFrame', init.transfer);
+  var metadata = _copyMetadata(init.metadata, W);
 
   // The resource: a copy of the VISIBLE rectangle only, tightly packed —
   // W3C step "the User Agent MAY use visibleRect to copy only the visible
@@ -334,6 +340,8 @@ function _fromBuffer(self, data, init) {
     rotation: rotation, flip: flip, displayWidth: displayWidth, displayHeight: displayHeight,
     timestamp: timestamp, duration: duration, colorSpace: _pickColorSpace(csInit, format),
   });
+  self._metadata = metadata;
+  detachAll(transferList);
   return self;
 }
 
@@ -399,7 +407,24 @@ function _fromFrame(self, other, init) {
     duration: hasDur ? duration : other.duration,
     colorSpace: new VideoColorSpace(other.colorSpace.toJSON()),
   });
+  // "Assign the result of calling Copy VideoFrame metadata with init's
+  // metadata to frame.[[metadata]]" (Initialize Frame From Other Frame):
+  // the init's, not the other frame's (only an HTMLVideoElement source
+  // falls back to its current frame's).
+  self._metadata = _copyMetadata(init.metadata, W);
   return self;
+}
+
+/**
+ * W3C Copy VideoFrame metadata: StructuredSerialize + StructuredDeserialize
+ * (so a frame's [[metadata]] cannot be changed through the object given
+ * or returned). A missing VideoFrameMetadata dictionary is an empty one;
+ * anything but an object is not a dictionary (TypeError).
+ */
+function _copyMetadata(m, W) {
+  if (m === undefined || m === null) return {};
+  if (typeof m !== 'object' && typeof m !== 'function') throw new TypeError(W + ': metadata must be a dictionary');
+  return structuredClone(m);
 }
 
 /** The frame's slots, as plain attributes (W3C getters' values). */
@@ -680,7 +705,17 @@ VideoFrame.prototype.clone = function () {
     rotation: this._rotation, flip: this._flip, displayWidth: this._displayWidth, displayHeight: this._displayHeight,
     timestamp: this.timestamp, duration: this.duration, colorSpace: new VideoColorSpace(this.colorSpace.toJSON()),
   });
+  c._metadata = this._metadata;  // immutable: metadata() hands out copies
   return c;
+};
+
+/**
+ * metadata() — W3C: InvalidStateError when detached, else a copy of
+ * [[metadata]] (Copy VideoFrame metadata). It was missing.
+ */
+VideoFrame.prototype.metadata = function () {
+  if (this._detached) throw _domex('VideoFrame is closed', 'InvalidStateError');
+  return structuredClone(this._metadata || {});
 };
 
 /**

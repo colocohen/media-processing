@@ -7,7 +7,7 @@ import { initCoder, configureCoder, wireReader, applyCoderPrototype, watchExit, 
   holdCalls, holdingCalls, holdCall, failUnsupported, drainThen, domex } from './base_coder.js';
 import { normalizeCodec } from './utils/codec_strings.js';
 import { EncodedAudioChunk } from './encoded_chunk.js';
-import { getAudioCodec, checkAudioEncoderConfig, audioEncoderConfigSupported } from './codecs.js';
+import { getAudioCodec, checkAudioEncoderConfig, audioEncoderConfigSupported, OPUS_DEFAULT_COMPLEXITY } from './codecs.js';
 import { getDefaultContainer, getContainer, getContainerFormat, getContainerExtra } from './containers.js';
 import { getOpusPacketDurationUs } from './utils/opus_utils.js';
 import { buildAudioSpecificConfig, stripAdts, audioSpecificConfigFromAdts, parseAdtsHeader } from './utils/aac_utils.js';
@@ -246,17 +246,19 @@ AudioEncoder.prototype._configureNow = function (config) {
 };
 
 AudioEncoder.prototype.encode = function (audioData) {
+  // W3C encode() step 1, before the state (step 2): "If the value of data's
+  // [[Detached]] internal slot is true, throw a TypeError." It was checked
+  // after the state.
+  if (!audioData || audioData._closed || !audioData.data) {
+    throw new TypeError('AudioEncoder.encode: audioData is closed or has no data');
+  }
   // W3C: encode() THROWS — InvalidStateError when not "configured", a
   // TypeError for a closed (detached) AudioData. Both went to the error
   // callback as plain Errors, so a caller's try/catch caught nothing.
   // (VideoEncoder and the decoders already throw.)
   if (this._state !== 'configured') {
-    var stErr = new Error('AudioEncoder.encode: state is "' + this._state + '", not "configured"');
-    stErr.name = 'InvalidStateError';
+    var stErr = domex('AudioEncoder.encode: state is "' + this._state + '", not "configured"', 'InvalidStateError');
     throw stErr;
-  }
-  if (!audioData || audioData._closed || !audioData.data) {
-    throw new TypeError('AudioEncoder.encode: audioData is closed or has no data');
   }
 
   // ── Per-frame format consistency check (W3C WebCodecs alignment) ──
@@ -545,7 +547,13 @@ AudioEncoder.prototype._startFFmpeg = function () {
           // Reader pts are positions in this run's stream (from 0) —
           // mapped back to the input timeline (_inputTimestampAt).
           timestamp: self._inputTimestampAt(f.ptsUs - origin),
-          duration: f.durationUs, data: payload,
+          // An Opus chunk lasts what its packet holds (the TOC, RFC 6716
+          // §3.1). The Ogg reader's duration is the granule's: the end of
+          // stream trims the last packet to the input plus the pre-skip
+          // (10 ms of input in a 20 ms packet came out as 16500 µs; the
+          // crate's engine and WPT audio-encoder "Reconfiguring
+          // AudioEncoder flushes buffered data ..." say 20000).
+          duration: cfg.codec === 'opus' ? getOpusPacketDurationUs(f.payload) : f.durationUs, data: payload,
         }), meta);
       },
     });
@@ -634,11 +642,14 @@ function _rawBytesPerSecond(cfg) {
  * the AAC AudioSpecificConfig) on the first output's
  * EncodedAudioChunkMetadata.decoderConfig. Consumers like the fMP4 writer
  * need `description` to build the `esds` box; TS ignores it because ADTS
- * carries the same parameters inline. Returns undefined after the first
- * call, so subsequent chunks carry no metadata (matching the browser).
+ * carries the same parameters inline. Returns an empty metadata after the
+ * first call: W3C Output EncodedAudioChunks always invokes the output
+ * callback with an EncodedAudioChunkMetadata, decoderConfig absent from
+ * it when unchanged (it was `undefined`, so `metadata.decoderConfig`
+ * threw in the caller's callback).
  */
 AudioEncoder.prototype._takeFirstChunkMetadata = function (firstFrame) {
-  if (this._decoderConfigSent) return undefined;
+  if (this._decoderConfigSent) return {};
   this._decoderConfigSent = true;
 
   var cfg = this._config;
@@ -708,14 +719,31 @@ function _cloneAudioEncoderConfig(config) {
     if (config[k] === undefined) continue;
     // Nested dictionaries are cloned with their own members (Clone
     // Configuration).
-    if (k === 'aac' && config.aac) out.aac = config.aac.format !== undefined ? { format: config.aac.format } : {};
+    // A nested dictionary's members with IDL defaults are there after the
+    // WebIDL conversion, so the clone has them (AacEncoderConfig format
+    // 'aac'; OpusEncoderConfig format 'opus', signal 'auto', application
+    // 'audio', frameDuration 20000, packetlossperc 0, useinbandfec /
+    // usedtx false), and Opus' complexity is the one the encoder uses
+    // when none is given (OPUS_DEFAULT_COMPLEXITY): an isConfigSupported()
+    // answer had none of them.
+    if (k === 'aac' && config.aac) out.aac = { format: config.aac.format !== undefined ? config.aac.format : 'aac' };
     else if (k === 'opus' && config.opus) {
       out.opus = {};
       var om = ['application', 'complexity', 'format', 'frameDuration', 'packetlossperc', 'signal', 'usedtx', 'useinbandfec'];
-      for (var j = 0; j < om.length; j++) if (config.opus[om[j]] !== undefined) out.opus[om[j]] = config.opus[om[j]];
+      for (var j = 0; j < om.length; j++) {
+        var v = config.opus[om[j]];
+        out.opus[om[j]] = v !== undefined ? v : OPUS_CONFIG_DEFAULTS[om[j]];
+      }
     } else out[k] = config[k];
   }
   return out;
 }
+
+// OpusEncoderConfig's IDL defaults (Opus registration §6.1), and the
+// complexity the registration asks for when none is given: "User Agents
+// SHOULD set a default of 5 for mobile platforms, and a default of 9 for
+// all other platforms" (codecs.js gives libopus 9; its own default is 10).
+var OPUS_CONFIG_DEFAULTS = { application: 'audio', complexity: OPUS_DEFAULT_COMPLEXITY, format: 'opus',
+  frameDuration: 20000, packetlossperc: 0, signal: 'auto', usedtx: false, useinbandfec: false };
 
 export default AudioEncoder;

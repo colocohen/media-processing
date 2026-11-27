@@ -151,6 +151,16 @@ function TSWriter(opts) {
   this._iFramePlaylistEnabled = false;
   this._lastIFrameRange = null;
 
+  // The audio encoder's delay (priming), in 90 kHz ticks: see
+  // setAudioEncoderDelay. 0 until it is set; fixed once an audio PES is
+  // written. _liftTicks: what every timestamp but the audio's is moved
+  // up by — the delay as it was when the first PES was written, fixed
+  // from then on (the timeline's continuity).
+  this._delayTicks = 0;
+  this._liftTicks = 0;
+  this._started = false;
+  this._audioStarted = false;
+
   // Per-PID continuity counters (4-bit, wraps at 16). PAT and PMT
   // each get their own counter even though they're rarely repeated
   // within a segment — convention is to track them anyway in case a
@@ -175,6 +185,39 @@ function TSWriter(opts) {
   this._cc[PID_PAT] = 0;
   this._cc[PID_PMT] = 0;
 }
+
+/**
+ * The audio encoder's delay: `samples` priming samples at `sampleRate`
+ * (AAC-LC 1024 for FFmpeg's aac, 2048 for HE-AAC; fdk-aac 1600) that a
+ * decoder outputs before the first input sample. MPEG-TS has no edit
+ * list (fMP4's elst skips them, ISO/IEC 14496-12 §8.6.6), so the audio
+ * was late against the video by the delay — 21 ms at 48 kHz. Done as
+ * FFmpeg's mpegts muxer does for a primed AAC stream (its encoder stamps
+ * the first packet at -delay, and avoid_negative_ts make_non_negative
+ * moves the whole timeline up by it; measured on FFmpeg 8.0.1, 48 kHz
+ * aac: the first audio PTS 1920 ticks before the first video PTS): each
+ * audio PTS is the delay earlier, and every timestamp the delay later,
+ * so the audio keeps its ticks and the video, metadata and the PCR on the
+ * video PID get the delay added — the first decoded sample after the
+ * priming lines up with the video, and no PTS goes below the input's.
+ *
+ * Before the first PES as above. After it (the first audio chunk came
+ * after the first segment was written: video went out first) the
+ * timeline already written cannot move (a change would break the
+ * timestamps' continuity, §7.2 of Apple's HLS authoring spec), so the
+ * delay goes on the audio alone — each audio PTS the delay earlier than
+ * its input (never below 0), the same A/V alignment. It used to be
+ * refused then, leaving the audio the delay late for the whole stream.
+ * Only before the first audio PES: returns whether it was taken. Not for
+ * a writer without audio.
+ */
+TSWriter.prototype.setAudioEncoderDelay = function (samples, sampleRate) {
+  if (!this._audio || this._audioStarted) return false;
+  if (!(samples >= 0) || !(sampleRate > 0) || !Number.isFinite(samples) || !Number.isFinite(sampleRate)) return false;
+  this._delayTicks = Math.round(samples * 90000 / sampleRate);
+  if (!this._started) this._liftTicks = this._delayTicks;
+  return true;
+};
 
 /**
  * Enable carriage of timed metadata (ID3v2) in subsequent segments.
@@ -725,6 +768,21 @@ TSWriter.prototype._buildPES = function (streamId, payload, ptsUs, dtsUs, useLen
   // of 1920, and the 1024-sample spacing read 1919/1921/1920 in ffprobe.
   var pts = Math.round(ptsUs * 90 / 1000);
   var dts = (dtsUs !== null && dtsUs !== undefined) ? Math.round(dtsUs * 90 / 1000) : null;
+  // Everything but the audio is the encoder delay later, the audio the
+  // part of it the timeline was not moved by earlier (see
+  // setAudioEncoderDelay).
+  this._started = true;
+  if (streamId !== STREAM_ID_AUDIO) {
+    pts += this._liftTicks;
+    if (dts !== null) dts += this._liftTicks;
+  } else {
+    // (the shift never takes a timestamp below 0: below its input's at
+    // most, for an input already negative)
+    this._audioStarted = true;
+    var shift = this._liftTicks - this._delayTicks;
+    pts = Math.max(Math.min(pts, 0), pts + shift);
+    if (dts !== null) dts = Math.max(Math.min(dts, 0), dts + shift);
+  }
 
   // Only emit a separate DTS field when DTS actually differs from PTS.
   // Saves 5 bytes per video frame in the no-B-frames case.
@@ -909,7 +967,7 @@ TSWriter.prototype._packetizeInto = function (pid, payload, pcrUs, buf, off) {
         buf[p++] = pcrThisPacket ? 0x10 : 0x00;
 
         if (pcrThisPacket) {
-          _encodePCR(buf, p, pcrUs);
+          _encodePCR(buf, p, pcrUs, pid === PID_AUDIO ? 0 : this._liftTicks);
           p += 6;
         }
 
@@ -942,8 +1000,10 @@ TSWriter.prototype._packetizeInto = function (pid, payload, pcrUs, buf, off) {
  * enough precision to populate both — base from the integer 90 kHz
  * portion, ext from the sub-tick remainder.
  */
-function _encodePCR(buf, off, pcrUs) {
-  var pcr27 = pcrUs * 27;
+function _encodePCR(buf, off, pcrUs, delayTicks) {
+  // + the encoder delay on the video PID (setAudioEncoderDelay): the
+  // PCR follows the video DTS it is taken from.
+  var pcr27 = pcrUs * 27 + (delayTicks || 0) * 300;
   var base = Math.floor(pcr27 / 300);
   var ext  = pcr27 - base * 300;
 

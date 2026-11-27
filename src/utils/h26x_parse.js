@@ -74,43 +74,77 @@ function _skipScalingList(r, size) {
 /** An H.264 SPS (NAL unit with its header byte) → what's needed here, or null. */
 export function parseH264Sps(nal) {
   try {
-    var r = new Bits(nalToRbsp(nal), 1);
-    var s = { profile: r.u(8), constraints: r.u(8), level: r.u(8), id: r.ue(), chroma: 1, separateColour: 0 };
-    if (H264_HIGH[s.profile]) {
-      s.chroma = r.ue();
-      if (s.chroma === 3) s.separateColour = r.u(1);
-      r.ue(); r.ue();                 // bit depths
-      r.u(1);                         // qpprime_y_zero_transform_bypass_flag
-      if (r.u(1)) {                   // seq_scaling_matrix_present_flag
-        for (var i = 0; i < (s.chroma !== 3 ? 8 : 12); i++) if (r.u(1)) _skipScalingList(r, i < 6 ? 16 : 64);
-      }
-    }
-    s.log2MaxFrameNum = r.ue() + 4;
-    s.pocType = r.ue();
-    if (s.pocType === 0) s.log2MaxPocLsb = r.ue() + 4;
-    else if (s.pocType === 1) {
-      s.deltaPicOrderAlwaysZero = r.u(1);
-      s.offsetForNonRefPic = r.se();
-      s.offsetForTopToBottomField = r.se();
-      var n = r.ue();
-      s.offsetForRefFrame = [];
-      for (var k = 0; k < n; k++) s.offsetForRefFrame.push(r.se());
-    }
-    r.ue();                           // max_num_ref_frames
-    r.u(1);                           // gaps_in_frame_num_value_allowed_flag
-    var wMbs = r.ue() + 1, hMap = r.ue() + 1;
-    s.frameMbsOnly = r.u(1);
-    if (!s.frameMbsOnly) r.u(1);      // mb_adaptive_frame_field_flag
-    r.u(1);                           // direct_8x8_inference_flag
-    var cl = 0, cr = 0, ct = 0, cb = 0;
-    if (r.u(1)) { cl = r.ue(); cr = r.ue(); ct = r.ue(); cb = r.ue(); }
-    var mono = s.chroma === 0 || s.separateColour;
-    var cx = mono ? 1 : s.chroma === 3 ? 1 : 2;
-    var cy = (mono ? 1 : s.chroma === 1 ? 2 : 1) * (2 - s.frameMbsOnly);
-    s.width = wMbs * 16 - cx * (cl + cr);
-    s.height = (2 - s.frameMbsOnly) * hMap * 16 - cy * (ct + cb);
+    var s = _h264Sps(new Bits(nalToRbsp(nal), 1));
     return _sizeOk(s) ? s : null;
   } catch (e) { return null; }
+}
+
+/**
+ * The colour an H.264 SPS's VUI signals (§E.1.1 video_signal_type:
+ * video_full_range_flag, colour_primaries, transfer_characteristics,
+ * matrix_coefficients — H.273 code points, 2 each when there is no
+ * colour description): { primaries, transfer, matrix, fullRange }, or
+ * null when the SPS has no VUI or no video_signal_type (or does not parse).
+ */
+export function h264VideoSignal(nal) {
+  try {
+    var r = new Bits(nalToRbsp(nal), 1);
+    return _sizeOk(_h264Sps(r)) ? _videoSignal(r) : null;
+  } catch (e) { return null; }
+}
+
+// The SPS up to vui_parameters_present_flag (§7.3.2.1.1); throws when cut short.
+function _h264Sps(r) {
+  var s = { profile: r.u(8), constraints: r.u(8), level: r.u(8), id: r.ue(), chroma: 1, separateColour: 0, bitDepth: 8 };
+  if (H264_HIGH[s.profile]) {
+    s.chroma = r.ue();
+    if (s.chroma === 3) s.separateColour = r.u(1);
+    s.bitDepth = r.ue() + 8;        // bit_depth_luma_minus8
+    r.ue();                         // bit_depth_chroma_minus8
+    r.u(1);                         // qpprime_y_zero_transform_bypass_flag
+    if (r.u(1)) {                   // seq_scaling_matrix_present_flag
+      for (var i = 0; i < (s.chroma !== 3 ? 8 : 12); i++) if (r.u(1)) _skipScalingList(r, i < 6 ? 16 : 64);
+    }
+  }
+  s.log2MaxFrameNum = r.ue() + 4;
+  s.pocType = r.ue();
+  if (s.pocType === 0) s.log2MaxPocLsb = r.ue() + 4;
+  else if (s.pocType === 1) {
+    s.deltaPicOrderAlwaysZero = r.u(1);
+    s.offsetForNonRefPic = r.se();
+    s.offsetForTopToBottomField = r.se();
+    var n = r.ue();
+    s.offsetForRefFrame = [];
+    for (var k = 0; k < n; k++) s.offsetForRefFrame.push(r.se());
+  }
+  r.ue();                           // max_num_ref_frames
+  r.u(1);                           // gaps_in_frame_num_value_allowed_flag
+  var wMbs = r.ue() + 1, hMap = r.ue() + 1;
+  s.frameMbsOnly = r.u(1);
+  if (!s.frameMbsOnly) r.u(1);      // mb_adaptive_frame_field_flag
+  r.u(1);                           // direct_8x8_inference_flag
+  var cl = 0, cr = 0, ct = 0, cb = 0;
+  if (r.u(1)) { cl = r.ue(); cr = r.ue(); ct = r.ue(); cb = r.ue(); }
+  var mono = s.chroma === 0 || s.separateColour;
+  var cx = mono ? 1 : s.chroma === 3 ? 1 : 2;
+  var cy = (mono ? 1 : s.chroma === 1 ? 2 : 1) * (2 - s.frameMbsOnly);
+  s.width = wMbs * 16 - cx * (cl + cr);
+  s.height = (2 - s.frameMbsOnly) * hMap * 16 - cy * (ct + cb);
+  return s;
+}
+
+// The start of vui_parameters() (H.264 §E.1.1, H.265 §E.2.1, the same
+// fields) from vui_parameters_present_flag on: the video signal type.
+function _videoSignal(r) {
+  if (!r.u(1)) return null;                         // vui_parameters_present_flag
+  if (r.u(1) && r.u(8) === 255) r.skip(32);         // aspect_ratio_info: aspect_ratio_idc, EXTENDED_SAR sar_width / sar_height
+  if (r.u(1)) r.u(1);                               // overscan_info_present_flag, overscan_appropriate_flag
+  if (!r.u(1)) return null;                         // video_signal_type_present_flag
+  r.u(3);                                           // video_format
+  var full = !!r.u(1);                              // video_full_range_flag
+  if (!r.u(1)) return { primaries: 2, transfer: 2, matrix: 2, fullRange: full };   // colour_description_present_flag
+  var p = r.u(8), t = r.u(8), m = r.u(8);
+  return { primaries: p, transfer: t, matrix: m, fullRange: full };
 }
 
 /** An H.264 PPS → { id, spsId, bottomFieldPicOrder } or null. */
@@ -209,30 +243,89 @@ export function h264Poc(h, st) {
 /** An H.265 SPS → what's needed here, or null. */
 export function parseH265Sps(nal) {
   try {
-    var r = new Bits(nalToRbsp(nal), 2);
-    r.u(4);                                         // sps_video_parameter_set_id
-    var maxSub = r.u(3);
-    r.u(1);                                         // sps_temporal_id_nesting_flag
-    r.skip(96);                                     // general profile / tier / level
-    var subProfile = [], subLevel = [];
-    for (var i = 0; i < maxSub; i++) { subProfile.push(r.u(1)); subLevel.push(r.u(1)); }
-    if (maxSub > 0) for (var k = maxSub; k < 8; k++) r.skip(2);
-    for (var m = 0; m < maxSub; m++) { if (subProfile[m]) r.skip(88); if (subLevel[m]) r.skip(8); }
-    var s = { id: r.ue(), chroma: r.ue(), separateColour: 0 };
-    if (s.chroma === 3) s.separateColour = r.u(1);
-    var w = r.ue(), h = r.ue();
-    var cl = 0, cr = 0, ct = 0, cb = 0;
-    if (r.u(1)) { cl = r.ue(); cr = r.ue(); ct = r.ue(); cb = r.ue(); }
-    var sw = s.chroma === 1 || s.chroma === 2 ? 2 : 1, sh = s.chroma === 1 ? 2 : 1;
-    s.width = w - sw * (cl + cr);
-    s.height = h - sh * (ct + cb);
-    r.ue(); r.ue();                                 // bit depths
-    s.log2MaxPocLsb = r.ue() + 4;
-    var all = r.u(1);
-    s.maxNumReorder = 0;
-    for (var j = all ? 0 : maxSub; j <= maxSub; j++) { r.ue(); s.maxNumReorder = r.ue(); r.ue(); }
+    var s = _h265Sps(new Bits(nalToRbsp(nal), 2));
     return _sizeOk(s) ? s : null;
   } catch (e) { return null; }
+}
+
+/**
+ * The colour an H.265 SPS's VUI signals (§E.2.1 video_signal_type, as
+ * h264VideoSignal): { primaries, transfer, matrix, fullRange }, or null.
+ */
+export function h265VideoSignal(nal) {
+  try {
+    var r = new Bits(nalToRbsp(nal), 2);
+    var s = _h265Sps(r);
+    if (!_sizeOk(s)) return null;
+    r.ue(); r.ue(); r.ue(); r.ue();                 // log2_min_luma_coding_block_size_minus3 … log2_diff_max_min_luma_transform_block_size
+    r.ue(); r.ue();                                 // max_transform_hierarchy_depth_inter / _intra
+    if (r.u(1) && r.u(1)) _skipH265ScalingListData(r);   // scaling_list_enabled_flag, sps_scaling_list_data_present_flag
+    r.u(1); r.u(1);                                 // amp_enabled_flag, sample_adaptive_offset_enabled_flag
+    if (r.u(1)) { r.u(8); r.ue(); r.ue(); r.u(1); } // pcm_enabled_flag: bit depths (4 + 4), log2 sizes, loop filter
+    var n = r.ue(), deltaPocs = [];                 // num_short_term_ref_pic_sets
+    for (var i = 0; i < n; i++) deltaPocs.push(_skipH265StRps(r, i, deltaPocs));
+    if (r.u(1)) {                                   // long_term_ref_pics_present_flag
+      var lt = r.ue();
+      for (var k = 0; k < lt; k++) { r.skip(s.log2MaxPocLsb); r.u(1); }   // lt_ref_pic_poc_lsb_sps, used_by_curr_pic_lt_sps_flag
+    }
+    r.u(1); r.u(1);                                 // sps_temporal_mvp_enabled_flag, strong_intra_smoothing_enabled_flag
+    return _videoSignal(r);
+  } catch (e) { return null; }
+}
+
+// scaling_list_data() (§7.3.4).
+function _skipH265ScalingListData(r) {
+  for (var size = 0; size < 4; size++) {
+    for (var m = 0; m < 6; m += size === 3 ? 3 : 1) {
+      if (!r.u(1)) { r.ue(); continue; }            // scaling_list_pred_mode_flag 0: scaling_list_pred_matrix_id_delta
+      var coefs = Math.min(64, 1 << (4 + (size << 1)));
+      if (size > 1) r.se();                         // scaling_list_dc_coef_minus8
+      for (var c = 0; c < coefs; c++) r.se();       // scaling_list_delta_coef
+    }
+  }
+}
+
+// st_ref_pic_set(idx) (§7.3.7) in an SPS: its NumDeltaPocs. A predicted
+// set (inter_ref_pic_set_prediction_flag, from the one before it) has an
+// entry for each j <= NumDeltaPocs of that one whose used_by_curr_pic_flag
+// or use_delta_flag is set (libavcodec's count).
+function _skipH265StRps(r, idx, deltaPocs) {
+  if (idx !== 0 && r.u(1)) {                        // inter_ref_pic_set_prediction_flag
+    r.u(1); r.ue();                                 // delta_rps_sign, abs_delta_rps_minus1
+    var count = 0;
+    for (var j = 0; j <= deltaPocs[idx - 1]; j++) if (r.u(1) || r.u(1)) count++;   // used_by_curr_pic_flag, use_delta_flag
+    return count;
+  }
+  var neg = r.ue(), pos = r.ue();                   // num_negative_pics, num_positive_pics
+  for (var k = 0; k < neg + pos; k++) { r.ue(); r.u(1); }   // delta_poc_sX_minus1, used_by_curr_pic_sX_flag
+  return neg + pos;
+}
+
+// The SPS up to sps_max_latency_increase (§7.3.2.2); throws when cut short.
+function _h265Sps(r) {
+  r.u(4);                                         // sps_video_parameter_set_id
+  var maxSub = r.u(3);
+  r.u(1);                                         // sps_temporal_id_nesting_flag
+  r.skip(96);                                     // general profile / tier / level
+  var subProfile = [], subLevel = [];
+  for (var i = 0; i < maxSub; i++) { subProfile.push(r.u(1)); subLevel.push(r.u(1)); }
+  if (maxSub > 0) for (var k = maxSub; k < 8; k++) r.skip(2);
+  for (var m = 0; m < maxSub; m++) { if (subProfile[m]) r.skip(88); if (subLevel[m]) r.skip(8); }
+  var s = { id: r.ue(), chroma: r.ue(), separateColour: 0 };
+  if (s.chroma === 3) s.separateColour = r.u(1);
+  var w = r.ue(), h = r.ue();
+  var cl = 0, cr = 0, ct = 0, cb = 0;
+  if (r.u(1)) { cl = r.ue(); cr = r.ue(); ct = r.ue(); cb = r.ue(); }
+  var sw = s.chroma === 1 || s.chroma === 2 ? 2 : 1, sh = s.chroma === 1 ? 2 : 1;
+  s.width = w - sw * (cl + cr);
+  s.height = h - sh * (ct + cb);
+  s.bitDepth = r.ue() + 8;                        // bit_depth_luma_minus8
+  r.ue();                                         // bit_depth_chroma_minus8
+  s.log2MaxPocLsb = r.ue() + 4;
+  var all = r.u(1);
+  s.maxNumReorder = 0;
+  for (var j = all ? 0 : maxSub; j <= maxSub; j++) { r.ue(); s.maxNumReorder = r.ue(); r.ue(); }
+  return s;
 }
 
 /** An H.265 PPS → { id, spsId, dependentSlices, outputFlag, extraBits } or null. */

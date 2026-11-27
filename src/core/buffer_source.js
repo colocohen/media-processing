@@ -16,6 +16,10 @@
  * intent: copyTo writes into caller-provided memory.
  */
 
+function _isShared(x) {
+  return typeof SharedArrayBuffer !== 'undefined' && x instanceof SharedArrayBuffer;
+}
+
 /**
  * @returns {boolean} true if x is any BufferSource (ArrayBuffer /
  * TypedArray / DataView / Node Buffer).
@@ -23,6 +27,10 @@
 export function isBufferSource(x) {
   if (x == null) return false;
   if (x instanceof ArrayBuffer) return true;
+  // W3C WebCodecs takes AllowSharedBufferSource everywhere (chunk / frame /
+  // AudioData data, copyTo destinations, descriptions): a SharedArrayBuffer
+  // or a view on one is accepted (WebIDL [AllowShared]).
+  if (_isShared(x)) return true;
   // ArrayBuffer.isView covers every TypedArray, DataView, and Node Buffer.
   if (ArrayBuffer.isView(x)) return true;
   return false;
@@ -40,7 +48,7 @@ export function isBufferSource(x) {
  */
 export function toUint8Array(x) {
   if (x instanceof Uint8Array) return x;               // includes Node Buffer
-  if (x instanceof ArrayBuffer) return new Uint8Array(x);
+  if (x instanceof ArrayBuffer || _isShared(x)) return new Uint8Array(x);
   if (ArrayBuffer.isView(x)) {
     return new Uint8Array(x.buffer, x.byteOffset, x.byteLength);
   }
@@ -65,4 +73,22 @@ export function requireBufferSource(x, errorPrefix) {
     );
   }
   return toUint8Array(x);
+}
+
+/**
+ * A copy of a BufferSource, of the same kind (ArrayBuffer stays an
+ * ArrayBuffer, a view a view of the same type over new memory). W3C
+ * Clone Configuration "assign[s] a copy of config[m]" — the description
+ * of an isConfigSupported() answer is the caller's bytes copied, not the
+ * caller's object.
+ */
+export function copyBufferSource(x) {
+  if (x instanceof ArrayBuffer || _isShared(x)) return x.slice(0);
+  if (ArrayBuffer.isView(x)) {
+    var b = x.buffer.slice(x.byteOffset, x.byteOffset + x.byteLength);
+    if (x instanceof DataView) return new DataView(b);
+    if (typeof Buffer !== 'undefined' && Buffer.isBuffer(x)) return Buffer.from(b);
+    return new x.constructor(b);
+  }
+  return x;
 }

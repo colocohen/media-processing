@@ -22,6 +22,8 @@
  */
 
 import { isBufferSource as _isBufferSource, toUint8Array as _toBuffer } from './core/buffer_source.js';
+import { takeBufferSource } from './core/take_buffer.js';
+var _hasBuffer = typeof Buffer !== 'undefined';
 import { domException as _domex } from './core/dom_exception.js';
 import { readS16LE, readS32LE, readF32LE, writeU16LE, writeU32LE, writeF32LE } from './core/bytes.js';
 import { enforceRange } from './core/webidl.js';
@@ -100,8 +102,13 @@ function AudioData(init) {
       frames + ' frames x ' + channels + ' channels of ' +
       format + ' need ' + (frames * channels * bps));
   }
-  this.data = new Uint8Array(_src.length);
-  this.data.set(_src);
+  // W3C: init.transfer is checked (DataCloneError), the data copied (or
+  // taken over when its buffer is listed), and every listed buffer
+  // detached — after the TypeErrors above, so a throwing constructor
+  // detaches nothing. `transfer` was ignored: the caller's buffers stayed
+  // usable.
+  this.data = takeBufferSource('AudioData: data', init.data, init.transfer);
+  if (_hasBuffer && Buffer.isBuffer(this.data)) this.data = new Uint8Array(this.data.buffer, this.data.byteOffset, this.data.byteLength);
   this.format = format;
   this.sampleRate = sampleRate;
   this.numberOfChannels = channels;

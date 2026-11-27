@@ -3,7 +3,9 @@
  * Browser-compatible subset of navigator.mediaCapabilities.
  */
 
-import { getVideoCodec, getAudioCodec, getSupportedVideoCodecs, getSupportedAudioCodecs } from './codecs.js';
+import {
+  parseWebCodecsCodec, videoEncoderConfigSupported, videoDecoderConfigSupported, audioEncoderConfigSupported, audioDecoderCodecSupported,
+} from './codecs.js';
 import { selectEncoder } from './hw_accel.js';
 import { parseCodecString } from './utils/codec_strings.js';
 
@@ -17,19 +19,42 @@ var mediaCapabilities = {
   // reported supported — and the audio half overwrote the video half's
   // smooth/powerEfficient. W3C: supported only if every configured part
   // is; smooth/powerEfficient likewise hold only if they hold for all.
+  // decodingInfo asks the decoders (CONFIG_CAPS.videoDecoder /
+  // audioDecoder: what VideoDecoder / AudioDecoder take), not the
+  // encoders: it answered from the encoders' codec list, so 'pcm-s16'
+  // — which AudioDecoder decodes and no encoder makes — was "not
+  // supported" (Media Capabilities §2.5: whether the user agent can
+  // decode it). The PCM codec strings (WebCodecs' registry) are named by
+  // parseWebCodecsCodec, which parseCodecString does not know.
+  //
+  // `supported` is the coders' Check Configuration Support (codecs.js,
+  // what isConfigSupported() and configure() run): the codec string's
+  // profile / bit depth / chroma against the coder's caps, and the
+  // FFmpeg on this machine (codec_availability.js). W3C Media
+  // Capabilities: supported is whether "the user agent is able to"
+  // decode / encode the configuration (§2.5 Create a
+  // MediaCapabilitiesDecodingInfo / EncodingInfo: "If the user agent is
+  // able to decode the media represented by configuration, set supported
+  // to true"). It answered from the tables alone: supported: true for
+  // H.265 encoding on an FFmpeg without libx265, while
+  // VideoEncoder.isConfigSupported() said false and configure() closed
+  // with NotSupportedError; the encoding half ignored the scalabilityMode
+  // ('L3T3'), hasAlphaChannel, an odd or oversized frame, AAC's object
+  // type (HE-AAC 'mp4a.40.5', which no encoder here makes); the decoding
+  // half the channel count.
   decodingInfo: function (config) {
     config = _checkConfiguration(config, 'decodingInfo', _DECODING_TYPES);
     return _combine(config,
       function (v) {
-        var codec = _parseCodecString(v.contentType || '');
-        if (!codec || getSupportedVideoCodecs().indexOf(codec) < 0) return null;
+        var codec = _coderCodec(v.contentType || '', true);
+        if (!codec || !videoDecoderConfigSupported({ codec: codec })) return null;
         var w = v.width || 1920, h = v.height || 1080, fps = v.framerate || 30;
         // decoding via FFmpeg is always CPU
         return { smooth: (w * h * fps) < (3840 * 2160 * 60), powerEfficient: false };
       },
       function (a) {
-        var acodec = _parseCodecString(a.contentType || '');
-        if (!acodec || getSupportedAudioCodecs().indexOf(acodec) < 0) return null;
+        var acodec = _coderCodec(a.contentType || '', true);
+        if (!acodec || !audioDecoderCodecSupported(acodec, _channelCount(a.channels))) return null;
         return { smooth: true, powerEfficient: true };   // audio decode is cheap
       });
   },
@@ -38,8 +63,19 @@ var mediaCapabilities = {
     config = _checkConfiguration(config, 'encodingInfo', _ENCODING_TYPES);
     return _combine(config,
       function (v) {
-        var codec = _parseCodecString(v.contentType || '');
-        if (!codec || !getVideoCodec(codec, {})) return null;
+        var cs = _coderCodec(v.contentType || '', false);
+        var info = cs && parseWebCodecsCodec(cs);
+        // the VideoEncoderConfig the configuration describes (a 0 size
+        // as the 1920x1080 assumed below, a 0 bitrate as none: both are
+        // invalid in a VideoEncoderConfig)
+        var ec = { codec: cs, width: v.width || 1920, height: v.height || 1080, framerate: v.framerate };
+        if (v.bitrate > 0) ec.bitrate = v.bitrate;
+        if (v.scalabilityMode !== undefined) ec.scalabilityMode = v.scalabilityMode;
+        // a track with alpha: kept (VideoEncoderConfig alpha 'keep'),
+        // which the encoders cannot (no alpha side data)
+        if (v.hasAlphaChannel) ec.alpha = 'keep';
+        if (!info || !videoEncoderConfigSupported(ec)) return null;
+        var codec = info.name;
         var w = v.width || 1920, h = v.height || 1080, fps = v.framerate || 30;
         var pixelsPerSec = w * h * fps, smooth;
         if (codec === 'av1') smooth = pixelsPerSec < (1280 * 720 * 30);
@@ -55,12 +91,27 @@ var mediaCapabilities = {
         return { smooth: smooth, powerEfficient: !!sel.isHardware };
       },
       function (a) {
-        var acodec = _parseCodecString(a.contentType || '');
-        if (!acodec || getSupportedAudioCodecs().indexOf(acodec) < 0) return null;
+        var acodec = _coderCodec(a.contentType || '', false);
+        // The rate and channel count, when given ('webrtc'), as
+        // isConfigSupported checks them: AAC's 7 channels, Opus at 44.1
+        // kHz were supported here (only the codec name was looked at).
+        // Not given: not checked.
+        if (!acodec || !audioEncoderConfigSupported({ codec: acodec, sampleRate: a.samplerate, numberOfChannels: _channelCount(a.channels) })) return null;
         return { smooth: true, powerEfficient: true };
       });
   },
 };
+
+// audio.channels is a DOMString whose form the spec leaves open (§2.1.8:
+// "a placeholder" — a count, or a layout such as 5.1): a whole number is
+// that many channels, 'N.M' N + M ('5.1': 6, '6.1': 7, '7.1': 8); any
+// other string is not checked.
+function _channelCount(s) {
+  if (s === undefined) return undefined;
+  var m = /^(\d+)(?:\.(\d+))?$/.exec(s);
+  if (!m) return undefined;
+  return m[2] !== undefined ? Number(m[1]) + Number(m[2]) : Number(m[1]);
+}
 
 // ── W3C validity (Media Capabilities §2.1, §2.5) ──
 //
@@ -172,18 +223,48 @@ function _combine(config, videoInfo, audioInfo) {
   return result;
 }
 
-/**
- * Parse codec name from a MIME contentType string.
- *   'video/mp4; codecs="avc1.42E01E"'  → 'h264'
- *   'video/webm; codecs="vp9"'         → 'vp9'
- *   'audio/mp4; codecs="mp4a.40.2"'    → 'aac'
- *
- * Delegates to codec_strings.parseCodecString for the actual codec
- * identification (via regex patterns on full strings). The previous
- * implementation used indexOf substring matching, which gave false
- * positives like 'avp9' or 'lvp9' → vp9 (MP-28).
- */
-function _parseCodecString(contentType) {
+// The WebCodecs codec string the coders' checks take for a contentType:
+// the codecs= entry (or bare string) itself when it is one ('avc1.42E01E',
+// 'mp4a.40.2', 'pcm-s16'), else the short name parseCodecString gives it
+// ('video/VP8' → 'vp8', 'audio/PCMU' → 'g711-ulaw', 'H264' → 'h264'), when
+// that is one; or null. `decoding`: the decoders' names (the PCM strings),
+// else the encoders' (the library's 'pcm').
+function _coderCodec(contentType, decoding) {
+  var part = _codecPart(contentType);
+  if (part === null) return null;
+  var name = decoding ? _decodingCodec(contentType) : _encodingCodec(contentType);
+  if (!name) return null;
+  if (parseWebCodecsCodec(part)) return part;
+  return parseWebCodecsCodec(name) ? name : null;
+}
+
+// The decoders' name for a contentType's codec: parseCodecString's, or a
+// WebCodecs PCM string ('pcm-s16', 'audio/pcm-f32') as it is.
+function _decodingCodec(contentType) {
+  var part = _codecPart(contentType);
+  if (part === null) return null;
+  var name = parseCodecString(part);
+  if (name) return name;
+  var info = parseWebCodecsCodec(part);
+  return info && /^pcm-/.test(info.name) ? info.name : null;
+}
+
+// The audio encoders' name for a contentType's codec: parseCodecString's,
+// or the library's 'pcm' (s16), which AudioEncoder takes (codecs.js
+// _SHORT_NAMES, parseWebCodecsCodec) and parseCodecString does not know:
+// encodingInfo said 'pcm' was unsupported while AudioEncoder encoded it.
+function _encodingCodec(contentType) {
+  var part = _codecPart(contentType);
+  if (part === null) return null;
+  var name = parseCodecString(part);
+  if (name) return name;
+  var info = parseWebCodecsCodec(part);
+  return info && info.name === 'pcm' ? 'pcm' : null;
+}
+
+// The codec string a contentType names (its first codecs= entry, else
+// the bare string, else a bare MIME type's subtype), or null.
+function _codecPart(contentType) {
   if (!contentType) return null;
   var str = String(contentType);
 
@@ -205,7 +286,7 @@ function _parseCodecString(contentType) {
     if (slash > 0 && !parseCodecString(codecPart)) codecPart = codecPart.slice(slash + 1);
   }
 
-  return parseCodecString(codecPart);
+  return codecPart;
 }
 
 export default mediaCapabilities;

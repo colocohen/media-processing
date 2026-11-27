@@ -7,7 +7,7 @@
  */
 
 import EventEmitter from './core/events.js';
-import { randomBytes } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { domException as _domex } from './core/dom_exception.js';
 import { resolveConstraint, overconstrainedError } from './core/constraints.js';
 import VideoFrame from './video_frame.js';
@@ -255,6 +255,10 @@ MediaStreamTrack.prototype.clone = function () {
     settings: settingsCopy,
     _source: ended ? detached : this._source,
   });
+  // W3C "clone a track": "Set trackClone's [[Capabilities]] to a clone of
+  // track's [[Capabilities]]" — a clone's getCapabilities() was {}, and
+  // its applyConstraints() checked nothing.
+  if (this._capabilities) cloned._capabilities = this._capabilities;
   cloned.enabled = this.enabled;
   // muted is the source's state.
   cloned.muted = this.muted;
@@ -295,8 +299,9 @@ MediaStreamTrack.prototype._deliver = function (data) {
   // frame's geometry and timing; the original is released here.
   if (!this.enabled) {
     var blank = _blankLike(this.kind, data);
-    if (!blank) return;
+    // Released also when it cannot be imitated (it was kept open).
     try { if (data && typeof data.close === 'function') data.close(); } catch (e) {}
+    if (!blank) return;
     data = blank;
   }
   this._ee.emit(this.kind === 'video' ? 'frame' : 'data', data);
@@ -337,10 +342,18 @@ function _blankLike(kind, src) {
   } catch (e) { return null; }
 }
 
+// W3C getSettings(): [[Settings]], the constrainable properties' values;
+// once ended, only "the list of inherent constrainable track properties"
+// (deviceId, facingMode, groupId) "with the value at the time track was
+// ended". It also gave kind, label and enabled (no MediaTrackSettings
+// members: the track's own attributes) and every setting after the end.
+var _INHERENT = { deviceId: true, facingMode: true, groupId: true };
 MediaStreamTrack.prototype.getSettings = function () {
-  var s = { kind: this.kind, label: this.label, enabled: this.enabled };
+  var s = {}, ended = this.readyState === 'ended';
   for (var k in this._settings) {
-    if (Object.prototype.hasOwnProperty.call(this._settings, k)) s[k] = this._settings[k];
+    if (!Object.prototype.hasOwnProperty.call(this._settings, k)) continue;
+    if (ended && !_INHERENT[k]) continue;
+    s[k] = this._settings[k];
   }
   return s;
 };
@@ -367,9 +380,10 @@ MediaStreamTrack.prototype.getConstraints = function () {
  * @returns {Promise<void>}
  */
 MediaStreamTrack.prototype.applyConstraints = function (constraints) {
-  if (this.readyState === 'ended') {
-    return Promise.reject(_domex('Track is ended', 'InvalidStateError'));
-  }
+  // W3C applyConstraints(): "If track's [[ReadyState]] is "ended", ...
+  // resolve p with undefined" — nothing changes. It rejected with an
+  // InvalidStateError.
+  if (this.readyState === 'ended') return Promise.resolve();
   // W3C: applyConstraints() with no argument removes every constraint.
   if (!constraints) { this._constraints = {}; return Promise.resolve(); }
   // W3C (apply constraints algorithm): a REQUIRED constraint — exact,
@@ -379,25 +393,34 @@ MediaStreamTrack.prototype.applyConstraints = function (constraints) {
   // getSettings(), so width:{exact:3840} on a source that only does
   // 1280x720 reported 3840. Checked against getCapabilities(); a
   // property with no known capability is not constrained here.
+  //
+  // A numeric constraint is also checked against itself: {min: 30, max:
+  // 10}, or {exact: 5, min: 10}, can be met by no settings dictionary at
+  // all (W3C fitness distance: infinity), capability known or not — both
+  // were accepted (the first unless a capability range was known). An
+  // empty list is no constraint ("If an empty list has been given as the
+  // value for a constraint, it MUST be interpreted as if the constraint
+  // were not specified"): {exact: []} was rejected.
   var caps = this._capabilities || {};
   for (var ck in constraints) {
     if (!Object.prototype.hasOwnProperty.call(constraints, ck) || ck === 'advanced') continue;
     var c = constraints[ck], cap = caps[ck];
-    if (!c || typeof c !== 'object' || Array.isArray(c) || cap === undefined) continue;
-    if (cap && typeof cap === 'object' && !Array.isArray(cap) &&
-        (typeof cap.min === 'number' || typeof cap.max === 'number')) {
-      var lo = typeof cap.min === 'number' ? cap.min : -Infinity;
-      var hi = typeof cap.max === 'number' ? cap.max : Infinity;
-      if ((typeof c.exact === 'number' && (c.exact < lo || c.exact > hi)) ||
-          (typeof c.min === 'number' && c.min > hi) ||
-          (typeof c.max === 'number' && c.max < lo) ||
-          (typeof c.min === 'number' && typeof c.max === 'number' && c.min > c.max)) {
+    if (!c || typeof c !== 'object' || Array.isArray(c)) continue;
+    var capRange = cap && typeof cap === 'object' && !Array.isArray(cap) &&
+        (typeof cap.min === 'number' || typeof cap.max === 'number');
+    var numeric = typeof c.exact === 'number' || typeof c.min === 'number' || typeof c.max === 'number';
+    if (capRange || (cap === undefined && numeric)) {
+      var lo = capRange && typeof cap.min === 'number' ? cap.min : -Infinity;
+      var hi = capRange && typeof cap.max === 'number' ? cap.max : Infinity;
+      if (typeof c.min === 'number') lo = Math.max(lo, c.min);
+      if (typeof c.max === 'number') hi = Math.min(hi, c.max);
+      if (lo > hi || (typeof c.exact === 'number' && (c.exact < lo || c.exact > hi))) {
         return Promise.reject(overconstrainedError(ck));
       }
-    } else if (c.exact !== undefined) {
+    } else if (cap !== undefined && c.exact !== undefined) {
       var allowed = Array.isArray(cap) ? cap : [cap];
       var want = Array.isArray(c.exact) ? c.exact : [c.exact];
-      if (!want.some(function (w) { return allowed.indexOf(w) >= 0; })) {
+      if (want.length && !want.some(function (w) { return allowed.indexOf(w) >= 0; })) {
         return Promise.reject(overconstrainedError(ck));
       }
     }
@@ -568,11 +591,6 @@ function MediaStream(arg) {
     }
   }
 
-  // Watch tracks supplied to the constructor too — a stream built from
-  // an existing track list must fire `inactive` when that list ends,
-  // not only one built up through addTrack().
-  Object.defineProperty(this, '_trackWatchers', {
-    value: [], writable: true, enumerable: false, configurable: true });
   // A track appears once in a stream's track set (W3C: a set) —
   // new MediaStream([t, t]) kept both.
   var _seen = {};
@@ -581,12 +599,6 @@ function MediaStream(arg) {
     _seen[t.id] = true;
     return true;
   });
-  // active = some track not ended. It was "has tracks", so a stream of
-  // ended tracks started out 'active' and addTrack(live) fired nothing.
-  Object.defineProperty(this, '_lastActive', {
-    value: this._tracks.some(function (t) { return t.readyState !== 'ended'; }),
-    writable: true, enumerable: false, configurable: true });
-  for (var w = 0; w < this._tracks.length; w++) this._watchTrack(this._tracks[w]);
 }
 
 MediaStream.prototype.on = function (ev, fn) { this._ee.on(ev, fn); };
@@ -630,25 +642,49 @@ Object.defineProperty(MediaStream.prototype, 'onremovetrack', {
   },
 });
 
-Object.defineProperty(MediaStream.prototype, 'onactive', {
-  get: function () { return this._onactive || null; },
-  set: function (fn) {
-    if (this._onactive) this._ee.off('active', this._onactive);
-    this._onactive = fn;
-    if (fn) this._ee.on('active', fn);
-  },
-});
+// No onactive / oninactive, and no 'active' / 'inactive' events: they are
+// not in mediacapture-main (Chrome's legacy; WPT historical.https.html:
+// "MediaStream.onactive should not exist"). The stream had them, fired
+// from a '_stopped' watcher on each track; `active` is derived from the
+// tracks when read.
 
-Object.defineProperty(MediaStream.prototype, 'oninactive', {
-  get: function () { return this._oninactive || null; },
-  set: function (fn) {
-    if (this._oninactive) this._ee.off('inactive', this._oninactive);
-    this._oninactive = fn;
-    if (fn) this._ee.on('inactive', fn);
-  },
-});
-
+// addTrack() / removeTrack() are the SCRIPT's: they change the track set
+// and fire nothing. mediacapture-main, the event table: addtrack — "Note
+// that this event is not fired when the script directly modifies the
+// tracks of a MediaStream" (WPT MediaStream-add-audio-track /
+// MediaStream-removetrack: "onaddtrack is not fired when the script
+// directly modified the track of a mediastream"). They fired 'addtrack' /
+// 'removetrack' like the User Agent's own algorithms below.
 MediaStream.prototype.addTrack = function (track) {
+  this._addToTrackSet(track, false);
+};
+
+MediaStream.prototype.removeTrack = function (track) {
+  this._removeFromTrackSet(track, false);
+};
+
+/**
+ * The User Agent's "add a track" (mediacapture-main §4.3.1): for an
+ * implementation acting as the User Agent — webrtc-server adding a remote
+ * peer's track to its streams (webrtc-pc, setRemoteDescription's "add
+ * track to stream" steps). Adds the track and fires 'addtrack' (a
+ * MediaStreamTrackEvent). Not for application code: a script uses
+ * addTrack(), which fires nothing.
+ */
+MediaStream.prototype._addTrackFromUA = function (track) {
+  this._addToTrackSet(track, true);
+};
+
+/**
+ * The User Agent's "remove a track": webrtc-pc §4.4.1.6 "process the
+ * removal of a remote track". Removes it and fires 'removetrack'. Not
+ * for application code (removeTrack() fires nothing).
+ */
+MediaStream.prototype._removeTrackFromUA = function (track) {
+  this._removeFromTrackSet(track, true);
+};
+
+MediaStream.prototype._addToTrackSet = function (track, fire) {
   // DUCK-TYPED (not instanceof): under node --preserve-symlinks, sibling
   // packages (webrtc-server, stable-webrtc) resolve media-processing via
   // DIFFERENT module paths and therefore hold DIFFERENT class identities
@@ -664,23 +700,23 @@ MediaStream.prototype.addTrack = function (track) {
     if (this._tracks[i].id === track.id) return;
   }
   this._tracks.push(track);
-  this._watchTrack(track);
-  this._syncActive();
+  // Internal: the track set changed, by anyone (MediaRecorder's
+  // InvalidModificationError watches it).
+  this._ee.emit('_trackset', track);
   // W3C dispatches a MediaStreamTrackEvent — an object carrying `type`
   // and `track` — not the bare track. Emitting the track itself meant
   // spec-shaped handler code (`e.track.id`) threw TypeError, and because
   // core/events.js catches listener exceptions and only logs them, the
   // symptom was an event that appeared never to have fired at all.
-  this._ee.emit('addtrack', _trackEvent('addtrack', track));
+  if (fire) this._ee.emit('addtrack', _trackEvent('addtrack', track));
 };
 
-MediaStream.prototype.removeTrack = function (track) {
+MediaStream.prototype._removeFromTrackSet = function (track, fire) {
   for (var i = 0; i < this._tracks.length; i++) {
     if (this._tracks[i].id === track.id) {
       this._tracks.splice(i, 1);
-      this._unwatchTrack(track);
-      this._ee.emit('removetrack', _trackEvent('removetrack', track));
-      this._syncActive();
+      this._ee.emit('_trackset', track);
+      if (fire) this._ee.emit('removetrack', _trackEvent('removetrack', track));
       return;
     }
   }
@@ -711,58 +747,6 @@ MediaStream.prototype.getTrackById = function (id) {
   return null;
 };
 
-/**
- * Fire `active` / `inactive` when the derived active state flips.
- *
- * W3C defines a MediaStream as active while at least one of its tracks
- * has not ended, and requires an `active` / `inactive` event on each
- * transition. The `active` getter below already computed the state
- * correctly — but nothing ever observed it. A stream whose last track
- * ended went quietly from active to inactive, and the `oninactive`
- * handler this class exposes could never be called.
- *
- * Unlike `mute` / `unmute`, this needs no guesswork: the state is a
- * pure function of the tracks, so the events can be derived exactly.
- *
- * Latched on the transition, not on the trigger, so stop() ending five
- * tracks fires `inactive` once rather than five times.
- */
-MediaStream.prototype._syncActive = function () {
-  var now = this.active;
-  if (this._lastActive === undefined) this._lastActive = now;
-  if (now === this._lastActive) return;
-  this._lastActive = now;
-  this._ee.emit(now ? 'active' : 'inactive', _event(now ? 'active' : 'inactive', this));
-};
-
-/** Observe a track so its ending can flip the stream's active state. */
-MediaStream.prototype._watchTrack = function (track) {
-  if (!track || typeof track.on !== 'function') return;
-  if (!this._trackWatchers) this._trackWatchers = [];
-  for (var i = 0; i < this._trackWatchers.length; i++) {
-    if (this._trackWatchers[i].track === track) return;
-  }
-  var self = this;
-  var fn = function () { self._syncActive(); };
-  this._trackWatchers.push({ track: track, fn: fn });
-  // '_stopped', not 'ended': a stop() ends the track too (and fires no
-  // 'ended'), and the stream's active state follows its tracks.
-  track.on('_stopped', fn);
-};
-
-MediaStream.prototype._unwatchTrack = function (track) {
-  if (!this._trackWatchers) return;
-  for (var i = 0; i < this._trackWatchers.length; i++) {
-    if (this._trackWatchers[i].track === track) {
-      if (typeof track.off === 'function') {
-        track.off('_stopped', this._trackWatchers[i].fn);
-      }
-      this._trackWatchers.splice(i, 1);
-      return;
-    }
-  }
-};
-
 Object.defineProperty(MediaStream.prototype, 'active', {
   get: function () {
     for (var i = 0; i < this._tracks.length; i++) {
@@ -790,7 +774,11 @@ MediaStream.prototype.clone = function () {
   return new MediaStream({ tracks: tracks });
 };
 
-function _generateId() { return randomBytes(16).toString('hex'); }
+// W3C MediaStream.id: "A good practice is to use a UUID [rfc4122] ...
+// implementations SHOULD use the forms in section 4.4 or 4.5 of RFC 4122"
+// (MediaStreamTrack.id follows the same guidelines). It was 32 hex digits
+// (WPT MediaStream-id checks the 36 characters of a UUID's form).
+function _generateId() { return randomUUID(); }
 
 
 // ═══════════════════════════════════════════════════════════════════

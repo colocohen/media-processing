@@ -44,17 +44,81 @@ function _domex(msg, name) {
 function scheduleDequeue(self) {
   if (self._dequeueEventScheduled) return;
   self._dequeueEventScheduled = true;
+  setImmediate(function () { fireDequeue(self); });
+}
+
+// The dequeue task's steps — unless a flush's resolution fired the event
+// already (resolveAfterDequeue).
+function fireDequeue(self) {
+  if (!self._dequeueEventScheduled) return;
+  try {
+    if (self.dispatchEvent) self.dispatchEvent('dequeue', { type: 'dequeue', target: self });
+  } finally {
+    self._dequeueEventScheduled = false;
+  }
+}
+
+// The queue size once a flush / drain is done: the calls held behind it.
+// What the run had not yet counted out (the AudioEncoder counts its
+// queue down per OUTPUT, and 10 ms inputs give 20 ms packets) goes at
+// once — with a dequeue event for it (W3C: every decrement runs Schedule
+// Dequeue Event; it was set silently, so a caller waiting for the event
+// of an empty queue never got one).
+function settleQueue(self) {
+  var before = self._queueSize;
+  self._queueSize = self._heldWork || 0;
+  if (self._queueSize < before) scheduleDequeue(self);
+}
+
+// A flush's promise is resolved by a task queued after the outputs'
+// tasks (W3C "Running a control message to flush": queue a task to output
+// and resolve), and the dequeue events of those outputs were queued
+// before it (decode/encode control messages decrement the queue size and
+// Schedule Dequeue Event first). Resolved synchronously, the promise's
+// reactions ran before the last outputs' dequeue event: a caller awaiting
+// flush() saw decodeQueueSize 0 but no event for it yet. When an event is
+// pending, it fires now, then the promise resolves (the resolution itself
+// is not deferred: the calls queued after the flush — a configure that
+// closes the coder — come after it).
+function resolveAfterDequeue(self, resolve) {
+  fireDequeue(self);
+  resolve();
+}
+
+// An empty chunk reaching the codec (decode(), in its turn): W3C has no
+// check for it at the call — decode() threw a TypeError — and "If decoding
+// results in an error, queue a task to run the Close … algorithm with
+// EncodingError". FFmpeg reads nothing from 0 bytes, so the error is
+// raised here, as a queued task (dropped if the coder was reset,
+// reconfigured or closed meanwhile).
+function failEmptyChunk(self, what) {
+  var err = _domex(what + ': the chunk is empty (0 bytes): nothing to decode', 'EncodingError');
+  // The chunks before it decode first: the running FFmpeg's input ends and
+  // its outputs come out (drainThen), then the close.
+  if (self._ffmpeg && self._ffmpeg.running) {
+    drainThen(self, function () { failCoder(self, err); });
+    return;
+  }
+  // Nothing running: the close is a queued task, and the calls after the
+  // chunk wait for it (a flush() made now is rejected with the error).
+  var epoch = self._configEpoch;
+  holdCalls(self);
   setImmediate(function () {
-    try {
-      if (self.dispatchEvent) self.dispatchEvent('dequeue', { type: 'dequeue', target: self });
-    } finally {
-      self._dequeueEventScheduled = false;
-    }
+    if (self._configEpoch !== epoch || self._state !== 'configured') return;
+    failCoder(self, err);
   });
 }
 
 function initCoder(self, init) {
-  var userOutput = (init && init.output) || function () {};
+  // W3C: VideoEncoderInit / VideoDecoderInit / AudioEncoderInit /
+  // AudioDecoderInit have `required` output and error callbacks (WebIDL:
+  // a missing one, or one that is not callable, is a TypeError at the
+  // constructor). Both were replaced by no-ops, so `new VideoEncoder({})`
+  // built a coder whose outputs and errors went nowhere.
+  if (!init || typeof init !== 'object' && typeof init !== 'function') throw new TypeError('init must be a dictionary with output and error callbacks');
+  if (typeof init.output !== 'function') throw new TypeError('init.output must be a function (required)');
+  if (typeof init.error !== 'function') throw new TypeError('init.error must be a function (required)');
+  var userOutput = init.output;
   // Wrap output to fire 'dequeue' event + forward metadata arg.
   // W3C WebCodecs §encodeQueueSize: "decreases when an output() callback fires."
   // (NOT when raw FFmpeg stdout bytes arrive — those are bytes, not frames.)
@@ -64,19 +128,26 @@ function initCoder(self, init) {
     // A coder whose outputs do not map one-to-one to its inputs (the
     // AudioDecoder: 10 ms outputs from 20 ms packets) sets _queueByInput
     // and decrements per input consumed instead.
-    if (!self._queueByInput && self._queueSize > 0) self._queueSize--;
+    var dropped = false;
+    if (!self._queueByInput && self._queueSize > 0) { self._queueSize--; dropped = true; }
     self._stats.outputCount++;
     userOutput(chunk, metadata);
     // W3C WebCodecs fires a plain Event named "dequeue" on the codec
-    // (Schedule Dequeue Event, below: one at a time, as a task).
-    scheduleDequeue(self);
+    // (Schedule Dequeue Event, below: one at a time, as a task) when the
+    // queue size DROPS: "Decrement [[decodeQueueSize]] / [[encodeQueueSize]]
+    // and run the Schedule Dequeue Event algorithm". It was scheduled after
+    // every output, so the AudioDecoder (10 ms outputs, queue counted per
+    // input) fired dequeue events with the size unchanged, at 0 too (WPT
+    // audioDecoder-codec-specific ?pcm_alaw: "Dequeue event after queue
+    // empty"). A coder counting by input schedules it where it decrements.
+    if (dropped) scheduleDequeue(self);
   };
   // Wrap the user's error callback so _stats.errorCount is real.
   // It was declared in _stats below and never incremented anywhere in
   // the codebase, so `encoder.stats.errorCount` always read 0 — which
   // is worse than not exposing it, because it looks like a healthy
   // signal. Wrapping here catches every _error() call site at once.
-  var userError = (init && init.error) || function () {};
+  var userError = init.error;
   self._error = function (e) {
     self._stats.errorCount++;
     userError(e);
@@ -94,11 +165,9 @@ function initCoder(self, init) {
     encodeCount: 0,      // total encode() calls
     outputCount: 0,      // total output callbacks fired
     errorCount: 0,       // total errors
-    droppedCount: 0,     // frames dropped due to queue overflow
     startTime: 0,        // Date.now() of first encode()
     lastEncodeTime: 0,   // Date.now() of last encode()
   };
-  self._maxQueueSize = (init && init.maxQueueSize) || 0;  // 0 = unlimited
   self._flushTimeout = (init && init.flushTimeout) || FLUSH_TIMEOUT;
 }
 
@@ -245,7 +314,7 @@ function flushCoder(self, cb) {
       if (err) { if (cb) cb(err); return; }   // rejected: state is failCoder's/close()'s
       if (stopProcess) self._ffmpeg.stop();
       self._state = 'configured';
-      self._queueSize = self._heldWork || 0;
+      settleQueue(self);
       if (cb) cb();
       releaseCalls(self);
     }
@@ -369,7 +438,7 @@ function drainThen(self, fn) {
   var epoch = self._configEpoch;
   proc.on('close', function (code, signal) {
     if (exitError(code, signal) || self._configEpoch !== epoch || self._state !== 'configured') return;
-    self._queueSize = self._heldWork || 0;
+    settleQueue(self);
     releaseCalls(self);
   });
   proc.endInput();
@@ -492,7 +561,7 @@ function applyCoderPrototype(Ctor, options) {
       return;
     }
     return new Promise(function (resolve, reject) {
-      var done = function (err) { if (err) reject(err); else resolve(); };
+      var done = function (err) { if (err) reject(err); else resolveAfterDequeue(self, resolve); };
       if (holdingCalls(self)) holdFlush(self, run, done); else run(done);
     });
   };
@@ -526,7 +595,7 @@ function applyCoderPrototype(Ctor, options) {
 
   /**
    * Production monitoring stats. Non-standard.
-   * @returns {{ encodeCount, outputCount, errorCount, droppedCount, startTime, lastEncodeTime }}
+   * @returns {{ encodeCount, outputCount, errorCount, startTime, lastEncodeTime }}
    */
   Object.defineProperty(Ctor.prototype, 'stats', {
     get: function () { return Object.assign({}, this._stats); },
@@ -570,7 +639,7 @@ function applyCoderPrototype(Ctor, options) {
 
 export {
   holdCalls, holdingCalls, holdCall, holdFlush, releaseCalls, dropCalls, failUnsupported, resetQueue, drainThen, _domex as domex,
-  scheduleDequeue,
+  scheduleDequeue, resolveAfterDequeue, settleQueue,
   initCoder, configureCoder, flushCoder, closeCoder, resetCoder, wireReader, applyCoderPrototype,
-  exitError, failCoder, watchExit, detachCoderListeners, notConfiguredError, addPendingFlush, removePendingFlush, rejectPendingFlushes,
+  exitError, failCoder, failEmptyChunk, watchExit, detachCoderListeners, notConfiguredError, addPendingFlush, removePendingFlush, rejectPendingFlushes,
 };

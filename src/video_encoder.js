@@ -13,14 +13,15 @@
 import {
   initCoder, configureCoder, resetCoder, wireReader, applyCoderPrototype,
   exitError, failCoder, notConfiguredError, detachCoderListeners, addPendingFlush, removePendingFlush, rejectPendingFlushes,
-  holdCalls, holdingCalls, holdCall, holdFlush, releaseCalls, failUnsupported, resetQueue, domex,
+  holdCalls, holdingCalls, holdCall, holdFlush, releaseCalls, failUnsupported, resetQueue, domex, resolveAfterDequeue, settleQueue,
 } from './base_coder.js';
 import FFmpegProcess from './ffmpeg_process.js';
 import { frameByteSize, formatPlanes } from './core/frame_size.js';
 import { EncodedVideoChunk } from './encoded_chunk.js';
 import { getVideoCodec, checkVideoEncoderConfig, videoEncoderConfigSupported } from './codecs.js';
 import { markEncoderFailed } from './hw_accel.js';
-import { normalizeCodec, parseCodecDetails, buildCodecString } from './utils/codec_strings.js';
+import { normalizeCodec, parseCodecDetails, buildCodecString, codecStringFromAv1C, vp9Level } from './utils/codec_strings.js';
+import { av1CFromTemporalUnit } from './utils/av1_utils.js';
 import { getEncoderContainer, getContainer, getContainerFormat, getContainerExtra } from './containers.js';
 import { splitNALUs, buildAvcCFromAnnexB, buildHvcCFromAnnexB, annexbToAvccSample } from './utils/nalu_utils.js';
 
@@ -59,6 +60,13 @@ var _BITSTREAM_FORMATS = {
 //   TID:    0  2  1  2  0  2  1  2
 //   Drop TID≥2 → 15fps, all keyframes ✅
 //   Drop TID≥1 → 7.5fps, all keyframes ✅
+//
+// That is the fallback for encoders with no temporal scalability of
+// their own. libvpx (VP8 / VP9) layers for real (codecs.js
+// _vpxTemporalArgs; the codec definition's `temporalLayers`): key frames
+// only by the usual rules, each frame referencing lower layers only, and
+// the pattern starting again at every key frame (a key frame is layer 0,
+// as Chromium's VpxVideoEncoder labels it).
 
 var SVC_PATTERNS = {
   'L1T1': null,
@@ -310,7 +318,7 @@ VideoEncoder.prototype.flush = function (cb) {
     return;
   }
   return new Promise(function (resolve, reject) {
-    var done = function (err) { if (err) reject(err); else resolve(); };
+    var done = function (err) { if (err) reject(err); else resolveAfterDequeue(self, resolve); };
     if (holdingCalls(self)) holdFlush(self, run, done); else run(done);
   });
 };
@@ -332,7 +340,7 @@ VideoEncoder.prototype._flushImpl = function (cb) {
       self0._flushAllReaders();
       self0._releaseTransitionForFlush();
       self0._state = 'configured';
-      self0._queueSize = self0._heldWork || 0;
+      settleQueue(self0);
       cb();
       releaseCalls(self0);
     });
@@ -373,7 +381,7 @@ VideoEncoder.prototype._flushImpl = function (cb) {
       try { self._oldProcesses[k]._stoppedByCoder = true; self._oldProcesses[k].stop(); } catch (e) {}
     }
     self._state = 'configured';
-    self._queueSize = self._heldWork || 0;
+    settleQueue(self);
     self._oldProcesses = [];
     removePendingFlush(self, onFail);
     if (cb) cb();
@@ -392,7 +400,7 @@ VideoEncoder.prototype._flushImpl = function (cb) {
       self._flushAllReaders();
       self._releaseTransitionForFlush();
       self._state = 'configured';
-      self._queueSize = self._heldWork || 0;
+      settleQueue(self);
       self._oldProcesses = [];
       removePendingFlush(self, onFail);
       if (cb) cb();
@@ -513,7 +521,7 @@ VideoEncoder.prototype.close = function () {
   if (typeof DOMException !== 'undefined') {
     rejectPendingFlushes(this, new DOMException('Aborted due to close()', 'AbortError'));
   } else {
-    var abortErr = new Error('Aborted due to close()'); abortErr.name = 'AbortError';
+    var abortErr = domex('Aborted due to close()', 'AbortError');
     rejectPendingFlushes(this, abortErr);
   }
   // Stop old processes
@@ -882,6 +890,14 @@ VideoEncoder.prototype._configureNow = function (config) {
 };
 
 VideoEncoder.prototype.encode = function (frame, options) {
+  // W3C encode() step 1, before the state (step 2): "If the value of
+  // frame's [[Detached]] internal slot is true, throw a TypeError." (A
+  // missing frame is WebIDL's TypeError, earlier still.) It was checked
+  // after the state: a closed frame on an unconfigured encoder threw
+  // InvalidStateError.
+  if (!frame || (!(frame.data instanceof Uint8Array))) {
+    throw new TypeError('VideoEncoder.encode: frame.data must be a Uint8Array/Buffer');
+  }
   // Per W3C WebCodecs §6.5: encode() throws InvalidStateError
   // synchronously when [[state]] is not "configured", and TypeError for
   // an unusable frame. Reporting these through the error callback
@@ -892,15 +908,9 @@ VideoEncoder.prototype.encode = function (frame, options) {
   // "MP-19's fix for VideoEncoder" — but the encoder side either never
   // landed or regressed. This restores the symmetry.
   if (this._state !== 'configured') {
-    var stateErr = new Error(
-      'VideoEncoder.encode: state is "' + this._state + '", not "configured"'
-    );
-    stateErr.name = 'InvalidStateError';
+    var stateErr = domex(
+      'VideoEncoder.encode: state is "' + this._state + '", not "configured"', 'InvalidStateError');
     throw stateErr;
-  }
-  if (!frame || (!(frame.data instanceof Uint8Array))) {
-    var inputErr = new TypeError('VideoEncoder.encode: frame.data must be a Uint8Array/Buffer');
-    throw inputErr;
   }
 
   // W3C WebCodecs §6.5 [[active orientation]]: the first frame after
@@ -916,22 +926,18 @@ VideoEncoder.prototype.encode = function (frame, options) {
     this._activeOrientation = { rotation: frameRot, flip: frameFlip };
   } else if (this._activeOrientation.rotation !== frameRot ||
              this._activeOrientation.flip !== frameFlip) {
-    var orientErr = new Error(
+    var orientErr = domex(
       'VideoEncoder.encode: frame orientation (rotation=' + frameRot +
       ', flip=' + frameFlip + ') does not match the active orientation ' +
       '(rotation=' + this._activeOrientation.rotation +
       ', flip=' + this._activeOrientation.flip + ') established by the ' +
-      'first frame after configure()'
-    );
-    orientErr.name = 'DataError';
+      'first frame after configure()', 'DataError');
     throw orientErr;
   }
 
-  // Production: frame dropping when queue exceeds limit
-  if (this._maxQueueSize > 0 && this._queueSize >= this._maxQueueSize) {
-    this._stats.droppedCount++;
-    return;  // drop frame silently
-  }
+  // No frame is dropped here: W3C encode() always enqueues (the non-W3C
+  // init.maxQueueSize, which dropped frames silently past a limit, is
+  // gone — a caller bounds its queue by encodeQueueSize / 'dequeue').
   this._queueSize++;
 
   if (holdingCalls(this)) {
@@ -1223,8 +1229,8 @@ VideoEncoder.prototype._encodeNow = function (frame, options) {
   // here (assigning encodeQueueSize throws "has only a getter").
   // We only count write()=false occurrences; for video each frame
   // (~1.4MB I420 at 720p) exceeds Node's highWaterMark (16KB) so
-  // this fires often even under healthy operation. The existing
-  // _maxQueueSize gate above is the real memory bound.
+  // this fires often even under healthy operation. The memory bound is
+  // the caller's (encodeQueueSize / 'dequeue', W3C's backpressure).
   // queue input PTS per-FFmpeg instance and replay them onto outputs.
   //
   // The queue is keyed on `this._ffmpeg` so old FFmpegs keep their
@@ -1530,7 +1536,7 @@ VideoEncoder.prototype._buildFFmpegArgs = function (codecDef) {
   }
 
   // SVC: force keyframes at pattern positions for drop-safe temporal layers
-  if (self._svcPattern) {
+  if (self._svcPattern && !codecDef.temporalLayers) {
     args.push('-force_key_frames', 'expr:' + self._svcPattern.keyExpr);
   }
 
@@ -1629,6 +1635,9 @@ VideoEncoder.prototype._wireReader = function (codecDef) {
       // reference the kept frames need.
       if (svcPat) {
         var svcIdx = producingFfmpeg._svcFrameIndex || 0;
+        // real temporal layers (libvpx): the pattern starts at each key
+        // frame — FFmpeg's libvpxenc resets its layer index there
+        if (codecDef && codecDef.temporalLayers && f.isKeyframe) svcIdx = 0;
         var tid = svcPat.tid[svcIdx % svcPat.tid.length];
         metadata.svc = { temporalLayerId: tid };
         chunk.metadata = metadata;
@@ -1725,8 +1734,8 @@ VideoEncoder.prototype._wireReader = function (codecDef) {
 /**
  * decoderConfig.codec: the caller's full codec string when it is one;
  * for a short name ('h264') derive the real string — for H.264 straight
- * from the SPS (profile_idc, constraint flags, level_idc), otherwise from
- * the configured profile/level.
+ * from the SPS (profile_idc, constraint flags, level_idc), for AV1 from
+ * the sequence header, otherwise from the configured profile/level.
  */
 function _outputCodecString(cfg, keyframeAnnexB) {
   if (cfg.codecString.indexOf('.') >= 0 || cfg.codec === 'vp8' || cfg.codec === 'opus') return cfg.codecString;
@@ -1739,7 +1748,46 @@ function _outputCodecString(cfg, keyframeAnnexB) {
       }
     }
   }
+  // 'av1': the key frame's sequence header (seq_profile, seq_level_idx[0],
+  // seq_tier[0], the bit depth: AV1-ISOBMFF §5's fields). It was built
+  // from the config's profile / level, which the short name has none of:
+  // 'av01.0.00M.08' (level 2.0) for every stream — libaom writes level
+  // 3.1 for 1280x720 at 30 fps.
+  if (cfg.codec === 'av1') {
+    var av1 = av1CFromTemporalUnit(keyframeAnnexB);
+    var fromSeq = av1 && codecStringFromAv1C(av1.av1C);
+    if (fromSeq) return fromSeq;
+  }
+  if (cfg.codec === 'vp9') {
+    var vp9 = _vp9CodecString(keyframeAnnexB, cfg);
+    if (vp9) return vp9;
+  }
   return buildCodecString({ name: cfg.codec, profile: cfg.profile, level: cfg.level }) || cfg.codecString;
+}
+
+// 'vp9': vp09.PP.LL.DD (the VP codec ISO-BMFF binding's codecs parameter)
+// from the key frame's uncompressed header — its profile and, from
+// profile 2, ten_or_twelve_bit (VP9 bitstream specification §6.2,
+// color_config) — and the level of the configured size and frame rate
+// (the webmproject.org level table: the stream carries none). It was built
+// from the config's profile / level, which the short name has none of:
+// 'vp09.00.10.08' (level 1) for every size.
+function _vp9CodecString(frame, cfg) {
+  if (!frame || frame.length < 5) return null;
+  var bit = function (i) { return (frame[i >> 3] >> (7 - (i & 7))) & 1; };
+  if (bit(0) !== 1 || bit(1) !== 0) return null;          // frame_marker 2
+  var profile = bit(2) | (bit(3) << 1);
+  var i = 4 + (profile === 3 ? 1 : 0);
+  if (bit(i) === 1 || bit(i + 1) !== 0) return null;      // show_existing_frame, frame_type
+  i += 4;
+  var sync = 0;
+  for (var k = 0; k < 24; k++) sync = (sync << 1) | bit(i + k);
+  if (sync !== 0x498342) return null;
+  i += 24;
+  if (profile >= 2 && (i >> 3) >= frame.length) return null;
+  var depth = profile >= 2 ? (bit(i) ? 12 : 10) : 8;
+  var pad = function (n) { return (n < 10 ? '0' : '') + n; };
+  return 'vp09.' + pad(profile) + '.' + pad(vp9Level(cfg.width, cfg.height, cfg.framerate)) + '.' + pad(depth);
 }
 
 function _hex2(n) { return (n < 16 ? '0' : '') + n.toString(16); }

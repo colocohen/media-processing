@@ -50,9 +50,26 @@ function MediaStreamTrackProcessor(init) {
   }
 
   var track = init.track;
+  // A track that has ended can deliver nothing and will never end again:
+  // the stream stayed open and every read() waited forever. Spec: "If
+  // init.track is a MediaStreamTrack that is not valid, throw a
+  // TypeError" (Chromium: "Input track cannot be ended").
+  if (track.readyState === 'ended') {
+    throw new TypeError('MediaStreamTrackProcessor: track is ended');
+  }
   // mediacapture-transform: maxBufferSize starts at 1 and takes the
-  // application's value only when it is an integer > 1.
-  var maxBuffer = (Number.isInteger(init.maxBufferSize) && init.maxBufferSize > 1) ? init.maxBufferSize : 1;
+  // application's value only when it is more than 1. The member is
+  // `[EnforceRange] unsigned short`: WebIDL converts it (ToNumber, a
+  // TypeError when not finite or outside 0..65535, then truncated), so
+  // 2.5 is 2 and "5" is 5 — both were taken as 1.
+  var maxBuffer = 1;
+  if (init.maxBufferSize !== undefined) {
+    var mb = Number(init.maxBufferSize);
+    if (!Number.isFinite(mb)) throw new TypeError('MediaStreamTrackProcessor: maxBufferSize is not a finite number');
+    mb = Math.trunc(mb);
+    if (mb < 0 || mb > 65535) throw new TypeError('MediaStreamTrackProcessor: maxBufferSize is outside the range of unsigned short');
+    if (mb > 1) maxBuffer = mb;
+  }
   var eventName = track.kind === 'video' ? 'frame' : 'data';
   var handler = null, onEnded = null;
   var queue = [];            // [[queue]]: owned clones, oldest first
@@ -60,6 +77,7 @@ function MediaStreamTrackProcessor(init) {
   var ctl = null;
   var self = this;
   this.discardedFrames = 0;  // [[numDiscardedFrames]]
+  this.totalFrames = 0;      // [[numTotalFrames]]: every frame received, the discarded ones too (it was missing)
 
   // The queue is the spec's own, not the ReadableStream's. When it was the
   // stream's (CountQueuingStrategy, default 15), a full queue DROPPED THE
@@ -77,6 +95,15 @@ function MediaStreamTrackProcessor(init) {
     if (handler) { track.off(eventName, handler); handler = null; }
     if (onEnded) { track.off('_stopped', onEnded); onEnded = null; }
   }
+  // processorClose: "Empty processor.[[queue]]" — the frames still queued
+  // are our clones: release them. On the track's end they stayed queued,
+  // unreadable (the stream is closed) and holding their buffers.
+  function emptyQueue() {
+    while (queue.length) {
+      var f = queue.shift();
+      try { if (f && typeof f.close === 'function') f.close(); } catch (e) {}
+    }
+  }
 
   this.readable = new ReadableStream({
     start: function (controller) {
@@ -86,12 +113,18 @@ function MediaStreamTrackProcessor(init) {
         // AudioData object to every listener, all sharing one ref-counted
         // buffer; a sibling listener may close() it before our reader pulls.
         // clone() only bumps the refcount (W3C), so this is cheap.
-        var owned = (typeof data.clone === 'function') ? data.clone() : data;
+        // Media only: a dispatchEvent({type: 'frame'}) reaches this
+        // listener too, and its Event object was queued and read as if it
+        // were a frame (mediacapture-transform: the chunks are VideoFrame /
+        // AudioData objects).
+        if (!data || typeof data.clone !== 'function') return;
+        var owned = data.clone();
         if (queue.length >= maxBuffer) {
           var dropped = queue.shift();
           try { if (dropped && typeof dropped.close === 'function') dropped.close(); } catch (e) {}
           self.discardedFrames++;
         }
+        self.totalFrames++;
         queue.push(owned);
         deliver();
       };
@@ -107,7 +140,9 @@ function MediaStreamTrackProcessor(init) {
       // can remove it — it leaked one 'ended' listener per processor.
       onEnded = function () {
         detach();
+        pendingPull = null;
         try { controller.close(); } catch (e) {}
+        emptyQueue();
       };
       // '_stopped' covers the track's own stop(), which fires no 'ended'
       // (mediacapture-main) but ends the processor's stream all the same.
@@ -122,10 +157,7 @@ function MediaStreamTrackProcessor(init) {
       pendingPull = null;
       // Frames still queued are ours (clones): release them. They were
       // left holding their buffers' refcounts.
-      while (queue.length) {
-        var f = queue.shift();
-        try { if (f && typeof f.close === 'function') f.close(); } catch (e) {}
-      }
+      emptyQueue();
     },
   }, { highWaterMark: 0 });
 }
@@ -159,13 +191,40 @@ function MediaStreamTrackGenerator(init) {
   /**
    * WritableStream that accepts VideoFrame (video) or AudioData (audio).
    * Each write() pushes the data through the track to any connected sinks.
+   *
+   * As the spec's writeFrame (VideoTrackGenerator; the AudioData case the
+   * same): "If frame is not a VideoFrame object, return a promise rejected
+   * with a TypeError. If the value of frame's [[Detached]] internal slot is
+   * true, return a promise rejected with a TypeError", then a clone to each
+   * live track and "Run the Close VideoFrame algorithm with frame" — the
+   * writer's object is closed once written. Before: anything was pushed (an
+   * AudioData down a video track, a closed frame), and the writer's own
+   * object was the one the last track's consumers got, still open in the
+   * writer's hands.
+   *
+   * The source ends when its last track does ("When the last track sourced
+   * from a VideoTrackGenerator ends, that VideoTrackGenerator's writable is
+   * closed"): writes then fail. They failed as soon as the generator
+   * itself was stopped, also while a clone of it was live.
    */
   this.writable = new WritableStream({
     write: function (data) {
-      if (self.readyState === 'ended') {
-        throw new Error('MediaStreamTrackGenerator: track is ended');
+      var isVideo = !!data && typeof data === 'object' && typeof data.codedWidth === 'number' &&
+        typeof data.numberOfFrames !== 'number' && typeof data.clone === 'function';
+      var isAudio = !!data && typeof data === 'object' && typeof data.numberOfFrames === 'number' &&
+        typeof data.sampleRate === 'number' && typeof data.clone === 'function';
+      if (kind === 'video' ? !isVideo : !isAudio) {
+        throw new TypeError('MediaStreamTrackGenerator: expected ' + (kind === 'video' ? 'a VideoFrame' : 'an AudioData'));
       }
-      self._push(data);
+      if (data.format == null) {
+        throw new TypeError('MediaStreamTrackGenerator: ' + (kind === 'video' ? 'VideoFrame' : 'AudioData') + ' is closed');
+      }
+      if (self._source ? self._source.stopped : self.readyState === 'ended') {
+        throw new TypeError('MediaStreamTrackGenerator: track is ended');
+      }
+      var copy = data.clone();
+      data.close();
+      self._push(copy);
     },
     // Closing (or aborting) the writable ends the generator's source:
     // the track and its clones end and fire 'ended' (mediacapture-

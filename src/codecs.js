@@ -7,6 +7,7 @@
  */
 
 import { selectEncoder, registerEncoderArgs } from './hw_accel.js';
+import { coderCodecAvailable } from './codec_availability.js';
 import { cpus } from 'node:os';
 import { enforceRange } from './core/webidl.js';
 
@@ -90,6 +91,69 @@ function _addBitrateArgs(args, cfg, defaultCrf) {
   }
 }
 
+// libx264 / libx265: with -crf the encoder takes no -b:v at all (FFmpeg's
+// libx264.c / libx265.c switch to CRF and drop the bitrate), so 'variable'
+// with a bitrate was CRF alone: 1.37 Mb/s for a 640x360 test source
+// whether 100 kb/s or 3 Mb/s was asked (measured, FFmpeg 8.0.1). The
+// bitrate is now the VBV cap of the CRF (-maxrate, a 2 s -bufsize, as CBR's
+// buffer): x264's / x265's capped CRF, the constrained quality libvpx and
+// libaom get from -b:v with -crf.
+function _addX26xRateCap(args, cfg) {
+  var mode = cfg.bitrateMode || 'variable';
+  if (mode === 'variable' && cfg.bitrate) {
+    args.push('-maxrate', String(cfg.bitrate), '-bufsize', String(cfg.bitrate * 2));
+  }
+}
+
+// ── libvpx (VP8 / VP9) ──
+//
+// Threads by the frame area, Chromium's GetNumberOfThreadsForSoftwareEncoding
+// (media/base/video_encoder.cc; its VpxVideoEncoder gives it libvpx's
+// g_threads): 1 under 640x480, 2 from it, 4 from 1280x720, 8 from
+// 1920x1080, 16 from 3840x2160, never more than the cores. Every encoder
+// took all the cores, which a machine running many small encodes (a
+// simulcast ladder, an SFU's transcodes) pays for in thread overhead.
+function _vpxThreads(cfg) {
+  if (typeof cfg.threads === 'number') return cfg.threads;
+  var area = (cfg.width || 0) * (cfg.height || 0);
+  var t = area >= 3840 * 2160 ? 16 : area >= 1920 * 1080 ? 8 : area >= 1280 * 720 ? 4 : area >= 640 * 480 ? 2 : 1;
+  return Math.min(t, getCpuCount());
+}
+
+// Temporal layers (WebCodecs scalabilityMode, W3C WebRTC-SVC L1T2 / L1T3)
+// for real, on libvpx's temporal scalability: FFmpeg's -ts-parameters
+// with its preset patterns (libvpxenc.c set_temporal_layer_pattern: mode
+// 2, layers {0, 1}; mode 3, layers {0, 2, 1, 2}, each frame referencing
+// only lower layers — the specification's figures), the layers'
+// cumulative rates Chromium's (VpxVideoEncoder: 60 / 100 %, 50 / 70 /
+// 100 % of the stream's kb/s; libvpx's default 256 with no bitrate), error
+// resilient as Chromium and libwebrtc encode layers (a dropped frame must
+// not carry entropy state the kept ones read). Key frames only by the
+// usual rules: libvpx's own placement off (kf_min_dist = kf_max_dist, so
+// no scene-cut key frame lands inside the pattern) and the gop forced
+// instead — FFmpeg starts its pattern again at a forced key frame, not at
+// one libvpx places. It was a key frame at every even frame and layer ids
+// written over a stream that had no layers: twice the bytes, or more.
+var _VPX_TEMPORAL = {
+  L1T2: { layers: 2, mode: 2, pct: [60, 100] },
+  L1T3: { layers: 3, mode: 3, pct: [50, 70, 100] },
+};
+function _vpxTemporalArgs(args, cfg) {
+  var t = _VPX_TEMPORAL[cfg.scalabilityMode];
+  if (!t) return false;
+  var kbps = cfg.bitrate ? Math.round(cfg.bitrate / 1000) : 256;
+  var rates = t.pct.map(function (p) { return Math.floor(p * kbps / 100); });
+  var gi = args.indexOf('-g');
+  if (gi >= 0) args.splice(gi, 2);
+  args.push(
+    '-g', '2147483647', '-keyint_min', '2147483647',
+    '-force_key_frames', 'expr:eq(mod(n,' + (cfg.gopSize || 30) + '),0)',
+    // ts_layering_mode last: it sets the pattern over the others
+    '-ts-parameters', 'ts_number_layers=' + t.layers + ':ts_target_bitrate=' + rates.join(',') +
+      ':ts_layering_mode=' + t.mode);
+  return true;
+}
+
 var ENCODER_ARGS = {
 
   // ════════════════ H.264 ════════════════
@@ -98,15 +162,22 @@ var ENCODER_ARGS = {
     var preset = cfg.latencyMode === 'quality' ? 'medium' : 'veryfast';
     var threads = (typeof cfg.threads === 'number') ? cfg.threads : getCpuCount();
     var profile = _ffmpegH264Profile(cfg.profile);
-    var level = cfg.level || '3.1';
     var args = [
       '-c:v', 'libx264', '-threads', String(threads),
       '-preset', preset, '-tune', 'zerolatency',
-      '-profile:v', profile, '-level', level,
+      '-profile:v', profile,
       '-x264-params', 'repeat-headers=1:aud=1:scenecut=0:open_gop=0',
       '-g', String(cfg.gopSize || 30),
     ];
+    // The codec string's level; for the short name 'h264' libx264's own
+    // choice (the lowest that holds the size, rate and VBV — Annex A). It
+    // was '3.1' for every short-name stream: a 1080p30 stream said level
+    // 3.1 (x264 warns "frame MB size (120x68) > level limit (3600)" and
+    // writes level_idc 31 anyway), and so did its decoderConfig.codec
+    // ('avc1.42c01f'), which a decoder may hold it to.
+    if (cfg.level) args.push('-level', cfg.level);
     _addBitrateArgs(args, cfg, 23);
+    _addX26xRateCap(args, cfg);
     return { preInput: [], args: args };
   },
   h264_nvenc: function (cfg) {
@@ -190,6 +261,7 @@ var ENCODER_ARGS = {
     ];
     if (cfg.level) args.push('-level', cfg.level);
     _addBitrateArgs(args, cfg, 28);
+    _addX26xRateCap(args, cfg);
     return { preInput: [], args: args };
   },
   hevc_nvenc: function (cfg) {
@@ -245,7 +317,7 @@ var ENCODER_ARGS = {
   // ════════════════ VP8 ════════════════
 
   libvpx: function (cfg) {
-    var threads = (typeof cfg.threads === 'number') ? cfg.threads : getCpuCount();
+    var threads = _vpxThreads(cfg);
     var args = [
       '-c:v', 'libvpx',
       '-threads', String(threads),
@@ -257,8 +329,9 @@ var ENCODER_ARGS = {
     // 10' in every mode, so 'constant' was libvpx's constrained quality,
     // not CBR, and 'quantizer' still capped the quality at the bitrate).
     _addBitrateArgs(args, cfg, 10);
-    if (cfg.errorResilient) args.push('-error-resilient', '1');
-    return { preInput: [], args: args };
+    var layered = _vpxTemporalArgs(args, cfg);
+    if (cfg.errorResilient || layered) args.push('-error-resilient', '1');
+    return { preInput: [], args: args, temporalLayers: layered };
   },
 
   // ════════════════ VP9 ════════════════
@@ -282,7 +355,7 @@ var ENCODER_ARGS = {
 
     var tileCols = (typeof cfg.tileColumns === 'number') ? cfg.tileColumns : defaultTileCols;
     var tileRows = (typeof cfg.tileRows === 'number') ? cfg.tileRows : (w >= 1280 ? 1 : 0);
-    var threads = (typeof cfg.threads === 'number') ? cfg.threads : cores;
+    var threads = _vpxThreads(cfg);
 
     var args = [
       '-c:v', 'libvpx-vp9',
@@ -294,8 +367,9 @@ var ENCODER_ARGS = {
       '-g', String(cfg.gopSize || 30),
     ];
     _addBitrateArgs(args, cfg, 32);
-    if (cfg.errorResilient) args.push('-error-resilient', '1');
-    return { preInput: [], args: args };
+    var layered = _vpxTemporalArgs(args, cfg);
+    if (cfg.errorResilient || layered) args.push('-error-resilient', '1');
+    return { preInput: [], args: args, temporalLayers: layered };
   },
   vp9_vaapi: function (cfg) {
     return { preInput: ['-init_hw_device', 'vaapi=hw:/dev/dri/renderD128', '-filter_hw_device', 'hw'], args: [
@@ -520,6 +594,9 @@ function getVideoCodec(name, cfg) {
     args: result.args,
     encoder: selected.encoder,
     isHardware: selected.isHardware,
+    // The encoder layers L1T2 / L1T3 itself (libvpx): no forced key frames
+    // for the pattern, which starts again at each key frame.
+    temporalLayers: !!result.temporalLayers,
   };
 }
 
@@ -555,6 +632,9 @@ function _validateG711SampleRate(cfg, codecName) {
     console.warn(msg);
   }
 }
+
+// OpusEncoderConfig.complexity when none is given (Opus registration §6.1).
+var OPUS_DEFAULT_COMPLEXITY = 9;
 
 var AUDIO_CODECS = {
   aac: function (cfg) {
@@ -662,12 +742,16 @@ var AUDIO_CODECS = {
     }
 
     // Complexity (MP-11) — libopus computational complexity, 0..10.
-    // Higher = better quality but more CPU. libopus default is 9 for
-    // realtime use. Maps to FFmpeg's -compression_level. Spec field
-    // OpusEncoderConfig.complexity (W3C webcodecs-opus-codec-registration).
+    // Higher = better quality but more CPU. Maps to FFmpeg's
+    // -compression_level. Spec field OpusEncoderConfig.complexity (W3C
+    // webcodecs-opus-codec-registration §6.1): without one, "User Agents
+    // SHOULD set a default of 5 for mobile platforms, and a default of 9
+    // for all other platforms" — FFmpeg's own default is 10.
     if (typeof cfg.complexity === 'number' &&
         cfg.complexity >= 0 && cfg.complexity <= 10) {
       args.push('-compression_level', String(cfg.complexity | 0));
+    } else {
+      args.push('-compression_level', String(OPUS_DEFAULT_COMPLEXITY));
     }
 
     // Signal (MP-11) — OpusEncoderConfig.signal: 'auto' | 'voice' | 'music'.
@@ -891,10 +975,16 @@ function parseWebCodecsCodec(codec) {
     if (ad === 12 && ap !== 2) return null;       // 12 bit: Professional
     var mono = m[5] !== undefined ? _num2(m[5]) : 0;
     if (mono > 1 || (mono && ap === 1)) return null;
-    var cs = m[6] !== undefined ? m[6] : (mono ? '111' : (ap === 1 ? '000' : '110'));
+    // Professional at 8 / 10 bits is 4:2:2 or mono (AV1 §5.5.2
+    // color_config: subsampling_x = 1, subsampling_y = 0 unless 12-bit):
+    // its default subsampling is 4:2:2, as High's is 4:4:4. It took 4:2:0
+    // ('av01.2.08M.10' parsed as a 10-bit 4:2:0 stream, which no
+    // profile-2 sequence header can describe).
+    var cs = m[6] !== undefined ? m[6] : (mono ? '111' : (ap === 1 ? '000' : (ap === 2 && ad !== 12) ? '100' : '110'));
     if (['110', '111', '112', '100', '000'].indexOf(cs) < 0) return null;
     if (ap === 0 && cs.slice(0, 2) !== '11') return null;   // Main: 4:2:0 / mono
     if (ap === 1 && cs !== '000') return null;               // High: 4:4:4
+    if (ap === 2 && ad !== 12 && !mono && cs !== '100') return null;   // Professional 8 / 10 bit: 4:2:2
     if (mono && cs.slice(0, 2) !== '11') return null;
     if (m[7] !== undefined && _COLOUR_PRIMARIES.indexOf(_num2(m[7])) < 0) return null;
     if (m[8] !== undefined && _TRANSFER.indexOf(_num2(m[8])) < 0) return null;
@@ -930,7 +1020,13 @@ var CONFIG_CAPS = {
     h265: { profiles: [1, 2, 3, 4] },
   },
   audioEncoder: {
-    aac:  { objectTypes: [2], sampleRates: _ADTS_RATES, maxChannels: 8 },
+    // AAC: the channel counts an ADTS channel configuration names (ISO/IEC
+    // 14496-3 Table 1.19: 1-6 and 8). FFmpeg's aac encodes 7 (6.1) with a
+    // PCE in the bitstream (channel configuration 0), but the description
+    // made from the ADTS header is then '1180' — channelConfiguration 0
+    // without the program_config_element its GASpecificConfig must carry
+    // (§4.4.1): not a valid AudioSpecificConfig. Supported said yes.
+    aac:  { objectTypes: [2], sampleRates: _ADTS_RATES, channels: [1, 2, 3, 4, 5, 6, 8] },
     opus: { sampleRates: [8000, 12000, 16000, 24000, 48000], maxChannels: 8 },
     mp3:  { sampleRates: [8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000], maxChannels: 2 },
     flac: { maxRate: 655350, maxChannels: 8 },
@@ -940,7 +1036,7 @@ var CONFIG_CAPS = {
   audioDecoder: {
     aac:  { objectTypes: [2, 5, 29, 0x67] },
     opus: { maxChannels: 255 },
-    mp3: {}, flac: {}, vorbis: { needsDescription: true },
+    mp3: {}, flac: { needsDescription: true }, vorbis: { needsDescription: true },
     alaw: {}, ulaw: {}, 'g711-alaw': {}, 'g711-ulaw': {},
     'pcm-u8': {}, 'pcm-s16': {}, 'pcm-s24': {}, 'pcm-s32': {}, 'pcm-f32': {},
   },
@@ -969,7 +1065,24 @@ function videoEncoderConfigSupported(config) {
   if (caps.even && ((config.width & 1) || (config.height & 1))) return false;
   if (config.scalabilityMode !== undefined && SCALABILITY_MODES.indexOf(config.scalabilityMode) < 0) return false;
   if (config.alpha === 'keep') return false;      // no alpha side data from FFmpeg
-  try { return !!getVideoCodec(info.name, config); } catch (e) { return false; }
+  var v;
+  try { v = getVideoCodec(info.name, config); } catch (e) { return false; }
+  if (!v) return false;
+  // The encoder has to be in this FFmpeg (see _inThisFFmpeg). A hardware
+  // encoder selectEncoder picked has passed its test encode.
+  return v.isHardware || _inThisFFmpeg('video', 'encode', info.name);
+}
+
+// Check Configuration Support (WebCodecs §7.1): "If the User Agent can
+// provide a codec to support all entries of the config ... return true";
+// the tables above say what the library has arguments for, not what the
+// FFmpeg on this machine was built with. A build without libx265 answered
+// isConfigSupported() supported: true for H.265 and failed at the first
+// frame (EncodingError); configure() now closes with NotSupportedError, as
+// for any unsupported config. Unknown (raw PCM, an FFmpeg whose listing
+// could not be read) keeps the table's answer; no FFmpeg at all is false.
+function _inThisFFmpeg(kind, way, name) {
+  return coderCodecAvailable(kind, way, name) !== false;
 }
 
 /** Check Configuration Support for a (valid) VideoDecoderConfig. */
@@ -978,7 +1091,26 @@ function videoDecoderConfigSupported(config, descriptionOk) {
   if (!info) return false;
   var caps = CONFIG_CAPS.videoDecoder[info.name];
   if (!_videoCaps(caps, info)) return false;
-  return descriptionOk !== false;
+  return descriptionOk !== false && _inThisFFmpeg('video', 'decode', info.name);
+}
+
+/**
+ * Whether the audio encoder of a codec (its short name) takes this sample
+ * rate and channel count; an undefined one is not checked
+ * (MediaCapabilities' optional members).
+ */
+function audioEncoderCapsAllow(name, sampleRate, channels) {
+  var caps = CONFIG_CAPS.audioEncoder[name];
+  if (!caps) return false;
+  if (sampleRate !== undefined) {
+    if (caps.sampleRates && caps.sampleRates.indexOf(sampleRate) < 0) return false;
+    if (caps.maxRate && sampleRate > caps.maxRate) return false;
+  }
+  if (channels !== undefined) {
+    if (caps.maxChannels && channels > caps.maxChannels) return false;
+    if (caps.channels && caps.channels.indexOf(channels) < 0) return false;
+  }
+  return true;
 }
 
 /** Check Configuration Support for a (valid) AudioEncoderConfig. */
@@ -988,23 +1120,34 @@ function audioEncoderConfigSupported(config) {
   var caps = CONFIG_CAPS.audioEncoder[info.name];
   if (!caps) return false;
   if (info.objectType !== null && caps.objectTypes && caps.objectTypes.indexOf(info.objectType) < 0) return false;
-  if (caps.sampleRates && caps.sampleRates.indexOf(config.sampleRate) < 0) return false;
-  if (caps.maxRate && config.sampleRate > caps.maxRate) return false;
-  if (caps.maxChannels && config.numberOfChannels > caps.maxChannels) return false;
+  if (!audioEncoderCapsAllow(info.name, config.sampleRate, config.numberOfChannels)) return false;
   if (info.name === 'opus' && config.opus && config.opus.format === 'ogg') return false;   // raw packets only
-  try { return !!getAudioCodec(info.name, config); } catch (e) { return false; }
+  try { if (!getAudioCodec(info.name, config)) return false; } catch (e) { return false; }
+  return _inThisFFmpeg('audio', 'encode', info.name);
 }
 
 /** Check Configuration Support for a (valid) AudioDecoderConfig. */
 function audioDecoderConfigSupported(config, descriptionOk) {
-  var info = parseWebCodecsCodec(config.codec);
+  if (!audioDecoderCodecSupported(config.codec, config.numberOfChannels)) return false;
+  var caps = CONFIG_CAPS.audioDecoder[parseWebCodecsCodec(config.codec).name];
+  if (caps.needsDescription && !config.description) return false;
+  return descriptionOk !== false;
+}
+
+/**
+ * The part of audioDecoderConfigSupported that is the codec's, not one
+ * stream's: the codec string, the channel count (undefined: not checked)
+ * and this FFmpeg — what MediaCapabilities.decodingInfo asks (it has no
+ * description: a FLAC or Vorbis stream carries its own).
+ */
+function audioDecoderCodecSupported(codec, numberOfChannels) {
+  var info = parseWebCodecsCodec(codec);
   if (!info) return false;
   var caps = CONFIG_CAPS.audioDecoder[info.name];
   if (!caps) return false;
   if (info.objectType !== null && caps.objectTypes && caps.objectTypes.indexOf(info.objectType) < 0) return false;
-  if (caps.maxChannels && config.numberOfChannels > caps.maxChannels) return false;
-  if (caps.needsDescription && !config.description) return false;
-  return descriptionOk !== false;
+  if (caps.maxChannels && numberOfChannels > caps.maxChannels) return false;
+  return _inThisFFmpeg('audio', 'decode', info.name);
 }
 
 // ── WebIDL conversion and validity ──
@@ -1116,6 +1259,15 @@ function checkVideoEncoderConfig(config, prefix) {
   return c;
 }
 
+// "If config.description is [detached], return false" (valid
+// VideoDecoderConfig / AudioDecoderConfig): a transferred ArrayBuffer, or
+// a view on one, is a TypeError. It went on as an empty description.
+function _detached(d) {
+  if (d === undefined || d === null) return false;
+  var b = (d instanceof ArrayBuffer) ? d : (ArrayBuffer.isView(d) ? d.buffer : null);
+  return !!(b && b instanceof ArrayBuffer && b.detached === true);
+}
+
 /** Conversion + "valid VideoDecoderConfig" (§7.6). */
 function checkVideoDecoderConfig(config, prefix) {
   if (!config || typeof config !== 'object') throw new TypeError(prefix + ': config required');
@@ -1125,6 +1277,7 @@ function checkVideoDecoderConfig(config, prefix) {
   if (c.codedWidth === 0 || c.codedHeight === 0) throw new TypeError(prefix + ': codedWidth and codedHeight must not be 0');
   if ((c.displayAspectWidth === undefined) !== (c.displayAspectHeight === undefined)) throw new TypeError(prefix + ': displayAspectWidth and displayAspectHeight must be given together');
   if (c.displayAspectWidth === 0 || c.displayAspectHeight === 0) throw new TypeError(prefix + ': displayAspectWidth and displayAspectHeight must not be 0');
+  if (_detached(c.description)) throw new TypeError(prefix + ': description is detached');
   return c;
 }
 
@@ -1156,13 +1309,15 @@ function checkAudioDecoderConfig(config, prefix) {
   var c = _convertDict(config, AUDIO_DECODER_CONFIG_IDL, prefix, '');
   if (_emptyCodec(c.codec)) throw new TypeError(prefix + ': codec required');
   if (c.sampleRate === 0 || c.numberOfChannels === 0) throw new TypeError(prefix + ': sampleRate and numberOfChannels must not be 0');
+  if (_detached(c.description)) throw new TypeError(prefix + ': description is detached');
   return c;
 }
 
 export {
+  OPUS_DEFAULT_COMPLEXITY,
   parseWebCodecsCodec, CONFIG_CAPS, SCALABILITY_MODES,
   videoEncoderConfigSupported, videoDecoderConfigSupported,
-  audioEncoderConfigSupported, audioDecoderConfigSupported,
+  audioEncoderConfigSupported, audioDecoderConfigSupported, audioDecoderCodecSupported, audioEncoderCapsAllow,
   checkVideoEncoderConfig, checkVideoDecoderConfig, checkAudioEncoderConfig, checkAudioDecoderConfig,
   getVideoCodec, getAudioCodec,
   getSupportedVideoCodecs, getSupportedAudioCodecs,

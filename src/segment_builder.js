@@ -620,6 +620,21 @@ SegmentBuilder.prototype.hasPendingBoundary = function () {
 };
 
 /**
+ * Audio is on its way: the caller has fed AudioData to its audio encoder
+ * (HLSEncoder, at every feed). From now on a boundary waits for an audio
+ * chunk at or past it, as once audio has arrived — before, a boundary
+ * that came before the first audio chunk (an encoder answering later,
+ * all input fed at once) was sealed with no audio, and the audio of
+ * those segments, arriving after, was dropped as late. Ignored after
+ * disableAudio().
+ */
+SegmentBuilder.prototype.expectAudio = function () {
+  if (this._audioDisabled || this._audioStarted) return;
+  this._audioStarted = true;
+  this._maybeSealPending();
+};
+
+/**
  * True once the init segment has gone out (and until reset()): from then
  * on the tracks are fixed, so disableAudio() can no longer drop one.
  */

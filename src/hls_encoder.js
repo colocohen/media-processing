@@ -2273,6 +2273,10 @@ HLSEncoder.prototype._encodeAudioData = function (audioData, ptsUsOverride) {
     this._configureAudioEncoderForInput(audioData);
   }
 
+  // Its chunks are on their way: segment boundaries wait for them (they
+  // were sealed without audio when video came out first, and the audio
+  // dropped as late).
+  if (this._segmentBuilder && !this._audioDropped) this._segmentBuilder.expectAudio();
   this._audioEncoder.encode(audioData);
 };
 
@@ -2524,6 +2528,13 @@ HLSEncoder.prototype._onAudioChunk = function (chunk, metadata) {
       var aacCs = (this._opts.audio && this._opts.audio.codecString) || _defaultAudioCodecString('aac');
       this._audioPtsStepUs  = _aacSamplesPerFrame(aacCs) * 1000000 / sampleRate;
       this._audioDurationUs = Math.round(this._audioPtsStepUs);
+      // MPEG-TS has no edit list: the writer puts the audio the encoder's
+      // priming earlier (and the timeline that much later), as FFmpeg's
+      // mpegts muxer does — see TSWriter.setAudioEncoderDelay. The audio
+      // was the priming (21 ms at 48 kHz) late against the video.
+      if (this._format === 'ts' && this._writer && this._writer.setAudioEncoderDelay) {
+        this._writer.setAudioEncoderDelay(_aacEncoderDelay(aacCs), sampleRate);
+      }
     }
   }
   var ptsUs = this._audioFirstChunkPtsUs +

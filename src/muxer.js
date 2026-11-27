@@ -260,6 +260,10 @@ Muxer.prototype._writePipe = function (st, bytes) {
 };
 
 Muxer.prototype._maybeStart = function () {
+  // After close() nothing starts again: the next chunk restarted FFmpeg
+  // and wrote a new output over the closed one (finalize() already
+  // checked _stopped; this path did not).
+  if (this._stopped) return;
   var v = this._tracks.video, a = this._tracks.audio;
   if ((v && !v.header) || (a && !a.header)) return;
   this._start();
@@ -433,7 +437,9 @@ Muxer.prototype._start = function () {
 // copyTo() (any EncodedVideoChunk / EncodedAudioChunk).
 function _chunkBytes(chunk) {
   if (!chunk) return null;
-  if (chunk.data) return toUint8Array(chunk.data);
+  // An empty chunk is nothing to write (copyTo's path already said so; a
+  // `.data` of length 0 was written as an empty Matroska block).
+  if (chunk.data) { var d = toUint8Array(chunk.data); return d.length ? d : null; }
   if (typeof chunk.copyTo === 'function' && chunk.byteLength) {
     var b = new Uint8Array(chunk.byteLength);
     chunk.copyTo(b);
